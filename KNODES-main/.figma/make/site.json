@@ -1,0 +1,10 @@
+{
+  "description": "Streamline project management by organizing comprehensive project details and case files, enhancing collaboration and efficiency for teams.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

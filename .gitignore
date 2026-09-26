@@ -1,0 +1,21 @@
+.neon
+node_modules/
+.env
+.agents/
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+
+# Build outputs
+dist/
+
+# Python tooling
+.pytest_cache/
+
+# Editor / OS / logs
+.kiro/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log

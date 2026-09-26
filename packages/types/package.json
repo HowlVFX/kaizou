@@ -1,0 +1,13 @@
+{
+  "name": "@kaizou/types",
+  "version": "0.1.0",
+  "description": "Shared TypeScript types for the Kaizou system",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.0"
+  }
+}
