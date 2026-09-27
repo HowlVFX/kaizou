@@ -6,7 +6,7 @@ import ConceptExplorer from "../components/ConceptExplorer"
 import ClusterExplorer from "../components/ClusterExplorer"
 import ExplainOverlay from "../components/ExplainOverlay"
 import PathLearning from "../components/PathLearning"
-import { recallStatus, demoClusters } from "../data/demo"
+import { recallStatus } from "../data/demo"
 import type { MasterCluster } from "../types"
 
 const assetPathPrefix = "/assets"
@@ -40,7 +40,7 @@ type ExplorerLayer =
   | { type: "cluster-path"; clusterId: string }
 
 export default function BrainPage() {
-  const { nodes, edges } = useApp()
+  const { nodes, edges, clusters, graphStatus, graphError, refreshGraph } = useApp()
   const navigate = useNavigate()
   const vw = useVW()
   const isMobile = vw < 640
@@ -57,8 +57,6 @@ export default function BrainPage() {
   const [hoveredBtn, setHoveredBtn] = useState<string | null>(null)
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false)
   const [mobileAttentionOpen, setMobileAttentionOpen] = useState(false)
-
-  const clusters: MasterCluster[] = demoClusters
 
   // Derived stack state
   const topLayer = explorerStack[explorerStack.length - 1]
@@ -79,6 +77,10 @@ export default function BrainPage() {
     }
     return null
   })()
+
+  const pathClusterId = topLayer?.type === "cluster-path"
+    ? (topLayer as Extract<ExplorerLayer, { type: "cluster-path" }>).clusterId
+    : undefined
 
   // Navigation functions
   const openConcept = useCallback((nodeId: string) => {
@@ -302,6 +304,7 @@ export default function BrainPage() {
             onClusterToggle={handleClusterToggle}
             compact={true}
           />
+          <GraphStateOverlay status={graphStatus} error={graphError} isEmpty={nodes.length === 0} onRetry={refreshGraph} onAddNote={() => navigate("/notes")} />
 
           {/* Zoom controls — floating bottom-right */}
           <div style={{
@@ -459,6 +462,7 @@ export default function BrainPage() {
           <PathLearning
             node={pathNode}
             nodes={nodes}
+            clusterId={pathClusterId}
             onBack={hasChild ? goBackLayer : undefined}
             onClose={closeExplorerStack}
           />
@@ -494,6 +498,7 @@ export default function BrainPage() {
           onClusterSelect={handleClusterSelect}
           onClusterToggle={handleClusterToggle}
         />
+        <GraphStateOverlay status={graphStatus} error={graphError} isEmpty={nodes.length === 0} onRetry={refreshGraph} onAddNote={() => navigate("/notes")} />
 
         {/* ── Stats card — top left ── */}
         <div style={{
@@ -818,6 +823,7 @@ export default function BrainPage() {
         <PathLearning
           node={pathNode}
           nodes={nodes}
+          clusterId={pathClusterId}
           onBack={hasChild ? goBackLayer : undefined}
           onClose={closeExplorerStack}
         />
@@ -910,4 +916,41 @@ function MobileStatDot({ value, color }: { value: number; color: string }) {
       <span style={{ fontSize: 12, fontWeight: 700, color }}>{value}</span>
     </div>
   );
+}
+
+function GraphStateOverlay({ status, error, isEmpty, onRetry, onAddNote }: {
+  status: "idle" | "loading" | "ready" | "error"
+  error: string | null
+  isEmpty: boolean
+  onRetry: () => void
+  onAddNote: () => void
+}) {
+  let title: string | null = null
+  let body: string | null = null
+  let action: { label: string; onClick: () => void } | null = null
+  if (status === "loading" && isEmpty) {
+    title = "Loading your Brain…"
+  } else if (status === "error") {
+    title = "Couldn't load your knowledge graph"
+    body = error
+    action = { label: "Retry", onClick: onRetry }
+  } else if (status === "ready" && isEmpty) {
+    title = "Your Brain is empty"
+    body = "Add a note and its concepts will appear here once they're processed."
+    action = { label: "Write a note", onClick: onAddNote }
+  }
+  if (!title) return null
+  return (
+    <div role="status" style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", zIndex: 5 }}>
+      <div style={{ ...panel, borderRadius: 12, padding: "18px 22px", maxWidth: 340, textAlign: "center", pointerEvents: "auto" }}>
+        <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text)", marginBottom: body ? 6 : 0 }}>{title}</div>
+        {body && <div style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.5 }}>{body}</div>}
+        {action && (
+          <button onClick={action.onClick} style={{ marginTop: 12, background: "var(--blue)", color: "#fff", border: "none", borderRadius: 8, padding: "8px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+            {action.label}
+          </button>
+        )}
+      </div>
+    </div>
+  )
 }

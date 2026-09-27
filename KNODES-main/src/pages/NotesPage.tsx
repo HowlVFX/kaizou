@@ -23,7 +23,6 @@ const PIPELINE_STEPS = [
   { id: 6, label: 'Updating your Brain', Icon: Brain },
 ];
 
-const EXTRACTED_CONCEPTS = ['Hoisting', 'Creation Phase', 'var', 'let', 'const', 'TDZ', 'Function Declaration'];
 
 const NEW_NOTE_TEMPLATE = `Write what you know...
 
@@ -43,11 +42,6 @@ interface Source {
   meta: string;
   status: 'attached' | 'reading' | 'extracted' | 'unavailable' | 'failed';
 }
-
-const DEMO_SOURCES: Source[] = [
-  { id: 's1', type: 'file', title: 'JavaScript Fundamentals.pdf', meta: '2.4 MB · PDF', status: 'extracted' },
-  { id: 's2', type: 'link', title: 'MDN — JavaScript Execution Context', meta: 'developer.mozilla.org', status: 'extracted' },
-];
 
 function sourceIcon(type: SourceType) {
   if (type === 'file') return '📄';
@@ -87,7 +81,7 @@ export default function NotesPage() {
   // Source state
   const [sources, setSources] = useState<Record<string, Source[]>>(() => {
     const init: Record<string, Source[]> = {};
-    if (notes[0]) init[notes[0].id] = DEMO_SOURCES;
+    // No sources endpoint yet: sources are local-only attachments for this session.
     return init;
   });
   const [sourcesExpanded, setSourcesExpanded] = useState(true);
@@ -103,7 +97,6 @@ export default function NotesPage() {
   const [processingNoteId, setProcessingNoteId] = useState<string | null>(null);
   const [pipelineStep, setPipelineStep] = useState(0);
   const [pipelineDone, setPipelineDone] = useState(false);
-  const [extractedVisible, setExtractedVisible] = useState(0);
   const processingRef = useRef(false);
 
   // Dirty tracking
@@ -144,7 +137,6 @@ export default function NotesPage() {
     setProcessingNoteId(noteId);
     setPipelineStep(0);
     setPipelineDone(false);
-    setExtractedVisible(0);
     updateNoteStatus(noteId, 'processing');
 
     let step = 0;
@@ -155,16 +147,10 @@ export default function NotesPage() {
         setTimeout(advance, 800 + Math.random() * 400);
       } else {
         setTimeout(() => {
+          // Ingestion status is backend-owned; AppContext polls until the note is READY/FAILED.
           setPipelineDone(true);
-          updateNoteStatus(noteId, 'completed');
           processingRef.current = false;
           onComplete();
-          let c = 0;
-          const timer = setInterval(() => {
-            c++;
-            setExtractedVisible(c);
-            if (c >= EXTRACTED_CONCEPTS.length) clearInterval(timer);
-          }, 160);
         }, 500);
       }
     };
@@ -173,7 +159,8 @@ export default function NotesPage() {
 
   const handleProcessNew = () => {
     if (processingRef.current) return;
-    const id = Date.now().toString();
+    // Backend requires a UUID primary key; timestamp ids get rejected on later PUTs.
+    const id = crypto.randomUUID();
     const note: Note = { id, title: newTitle, body: newBody, status: 'processing', updatedAt: 'Just now' };
     addNote(note);
     setSelectedNoteId(id);
@@ -664,8 +651,7 @@ export default function NotesPage() {
               )}
               {(pipelineDone || (selectedNote?.status === 'completed' && !isProcessing)) && (
                 <ExtractionResults
-                  note={pipelineDone ? null : (selectedNote ?? null)}
-                  extractedVisible={pipelineDone ? extractedVisible : undefined}
+                  note={selectedNote ?? null}
                 />
               )}
             </div>
@@ -762,8 +748,7 @@ export default function NotesPage() {
             {/* Extraction results */}
             {(pipelineDone || (selectedNote?.status === 'completed' && !isProcessing)) && (
               <ExtractionResults
-                note={pipelineDone ? null : (selectedNote ?? null)}
-                extractedVisible={pipelineDone ? extractedVisible : undefined}
+                note={selectedNote ?? null}
               />
             )}
           </div>
@@ -804,35 +789,35 @@ function SourceCard({ source, onRemove }: { source: Source; onRemove: () => void
 }
 
 // ── Extraction Results Panel ──────────────────────────────────────
-function ExtractionResults({ note, extractedVisible }: { note: Note | null; extractedVisible?: number }) {
-  const concepts = note?.concepts ?? EXTRACTED_CONCEPTS;
-  const visibleConcepts = extractedVisible !== undefined ? concepts.slice(0, extractedVisible) : concepts;
-  const claims = note?.claims ?? 8;
-  const connections = note?.connections ?? 5;
-  const justCompleted = extractedVisible !== undefined && extractedVisible >= EXTRACTED_CONCEPTS.length;
+function ExtractionResults({ note }: { note: Note | null }) {
+  const concepts = note?.concepts ?? [];
+  const visibleConcepts = concepts;
+  const isPending = !note || note.status === 'processing';
+  const isFailed = note?.status === 'failed';
+
+  if (isPending || isFailed) {
+    return (
+      <div role="status" style={{
+        padding: '14px', borderRadius: 10, background: 'var(--bg)',
+        border: `1px solid ${isFailed ? 'rgba(255,75,75,0.25)' : 'var(--border)'}`,
+        fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.6,
+      }}>
+        {isFailed
+          ? <><span style={{ color: 'var(--red)', fontWeight: 600 }}>Processing failed.</span> Edit the note and try again.</>
+          : <><span style={{ color: 'var(--blue)', fontWeight: 600 }}>Processing your note…</span> Concepts will appear here once your Brain has finished structuring it.</>}
+      </div>
+    );
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-      {/* "Your Brain just grew" completion message */}
-      {justCompleted && (
-        <div style={{
-          padding: '14px', borderRadius: 10,
-          background: 'rgba(88,204,2,0.07)', border: '1px solid rgba(88,204,2,0.25)',
-          animation: 'fadeUp 0.3s ease',
-        }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--green)', marginBottom: 4 }}>Your Brain just grew.</div>
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>Knowledge added and connected to your graph.</div>
-        </div>
-      )}
 
       {/* Summary stats */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 8 }}>
         {[
           { label: 'Concepts', value: concepts.length, color: 'var(--green)' },
-          { label: 'Key Statements', value: claims, color: 'var(--blue)' },
-          { label: 'Prerequisites', value: 2, color: 'var(--orange)' },
-          { label: 'Connections', value: connections, color: 'var(--text-2)' },
+          { label: 'Key Statements', value: note?.claims ?? '—', color: 'var(--blue)' },
         ].map(({ label, value, color }) => (
           <div key={label} style={{ padding: '10px 8px', borderRadius: 8, background: 'var(--bg)', border: '1px solid var(--border)', textAlign: 'center' }}>
             <div style={{ fontSize: 18, fontWeight: 800, color, letterSpacing: '-0.02em' }}>{value}</div>
@@ -850,58 +835,12 @@ function ExtractionResults({ note, extractedVisible }: { note: Note | null; extr
               padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 500,
               background: 'rgba(88,204,2,0.08)', color: 'var(--green)',
               border: '1px solid rgba(88,204,2,0.2)',
-              animation: extractedVisible !== undefined ? 'fadeUp 0.25s ease' : 'none',
+
             }}>{c}</span>
           ))}
-          {visibleConcepts.length === 0 && extractedVisible !== undefined && (
-            <span style={{ fontSize: 12, color: 'var(--text-dim)' }}>Finding concepts…</span>
+          {visibleConcepts.length === 0 && (
+            <span style={{ fontSize: 12, color: 'var(--text-dim)' }}>No concepts linked to this note yet.</span>
           )}
-        </div>
-      </div>
-
-      {/* Key statements */}
-      <div>
-        <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 8 }}>Key Statements</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {[
-            { text: 'var is initialized to undefined during creation.', status: 'structured' },
-            { text: 'let and const remain uninitialized until execution.', status: 'structured' },
-            { text: '"Hoisting happens first."', status: 'incomplete' },
-          ].map(({ text, status }) => (
-            <div key={text} style={{
-              display: 'flex', gap: 8, alignItems: 'flex-start', padding: '8px 10px', borderRadius: 7,
-              background: 'var(--bg)', border: `1px solid ${status === 'structured' ? 'rgba(88,204,2,0.15)' : 'rgba(255,150,0,0.15)'}`,
-            }}>
-              <span style={{ fontSize: 13, flexShrink: 0, marginTop: 1, color: status === 'structured' ? 'var(--green)' : 'var(--orange)' }}>
-                {status === 'structured' ? '✓' : '△'}
-              </span>
-              <div>
-                <div style={{ fontSize: 11, color: 'var(--text-2)', lineHeight: 1.5 }}>{text}</div>
-                <div style={{ fontSize: 10, color: status === 'structured' ? 'var(--green)' : 'var(--orange)', marginTop: 2, fontWeight: 500 }}>
-                  {status === 'structured' ? 'Structured' : 'Incomplete'}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Prerequisites */}
-      <div>
-        <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 8 }}>Prerequisites</div>
-        <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--bg)', border: '1px solid rgba(255,75,75,0.2)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-            <span style={{ fontSize: 13 }}>🔒</span>
-            <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-2)' }}>Missing prerequisite</span>
-          </div>
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, marginBottom: 8 }}>
-            Creation Phase was identified as a prerequisite for Hoisting, but it isn't established in your Brain yet.
-          </div>
-          <button style={{
-            padding: '5px 12px', borderRadius: 6, background: 'none',
-            border: '1px solid var(--border)', color: 'var(--text-muted)',
-            fontSize: 11, fontFamily: 'inherit', cursor: 'pointer', fontWeight: 500,
-          }}>Learn this concept</button>
         </div>
       </div>
 

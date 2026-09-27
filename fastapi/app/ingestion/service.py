@@ -4,23 +4,35 @@ Full pipeline for a note:
   1. Classify: track, shape, category, Bloom level
   2. Extract claims from the note body
   3. Compute embeddings for the concept label and each claim
-  4. Resolve concept identity (new vs existing, §4.6)
-  5. Deduplicate claims against existing concept claims
-  6. Create/update concept in DB
-  7. Extract prerequisites and wikilinks
-  8. Create edges (WIKILINK, SEMANTIC, REQUIRES)
-  9. Compute structural complexity
-  10. Update note status to READY
+  4. Resolve concept identity (new vs existing vs ambiguous, §4.6);
+     an UNRESOLVED_PREREQUISITE placeholder that matches is promoted
+  5. Extract prerequisites and resolve them to existing concepts or
+     placeholder (UNRESOLVED_PREREQUISITE) concepts
+  6. Compute prerequisite depth, structural complexity, N_req
+  7. Create / promote / version-bump the concept
+  8. Write the complete claim set for the concept's current version
+  9. Create edges (REQUIRES with cycle check, MERGE_CANDIDATE, WIKILINK,
+     SEMANTIC)
+  10. Update note status to READY and enqueue a per-learner recluster job
+
+Claim versioning contract (D-04): every concept version holds its full
+claim set. Readers select ``claims WHERE concept_id = X AND concept_version
+= V`` with V = ``concepts.version`` (current) or the version pinned on a
+probe/attempt.
+
+REQUIRES direction: ``source_id REQUIRES target_id`` (target is the
+prerequisite). See app.graph.prerequisites.build_requires_forward.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import psycopg
 from psycopg.rows import dict_row
 
+from app.grading.coverage import as_vector
 from app.ingestion.classifier import NoteClassifier, ClassificationResult
 from app.ingestion.embedding import EmbeddingService
 from app.ingestion.extractor import ClaimExtractor, extract_wikilinks
@@ -29,13 +41,68 @@ from app.ingestion.identity import (
     deduplicate_claims,
 )
 from app.graph.linking import find_semantic_neighbours
+from app.graph.prerequisites import build_requires_forward, plan_requires_edges
 from app.memory.mastery import (
+    calculate_required_streak,
     compute_structural_complexity,
     compute_initial_complexity,
 )
 from app.memory.decay import calculate_initial_half_life
 
 logger = logging.getLogger(__name__)
+
+UNRESOLVED = "UNRESOLVED_PREREQUISITE"
+VERIFIED = "VERIFIED_CONCEPT"
+
+# Placeholder concepts need values for the NOT NULL enum columns; they are
+# overwritten when a real note promotes the placeholder.
+PLACEHOLDER_TRACK = "SELF_AUTHORED"
+PLACEHOLDER_SHAPE = "DEFINITION"
+PLACEHOLDER_CATEGORY = "DETERMINISTIC_MECHANISM"
+
+
+def _vector_literal(vec) -> str | None:
+    """pgvector text literal for a list/str vector (None passes through)."""
+    if vec is None:
+        return None
+    if isinstance(vec, str):
+        return vec
+    return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+
+def compose_claim_version(
+    previous_claims: list[dict],
+    new_claims: list[dict],
+    replace: bool,
+) -> list[dict]:
+    """Build the complete claim set for a new concept version (D-04).
+
+    ``replace`` is True when the note being ingested is the concept's only
+    source: its fresh extraction supersedes the previous version entirely.
+    Otherwise (the concept is shared with other notes) every previous claim
+    is carried forward and only new claims that are not duplicates (sim >= τ)
+    are appended, with order_index offset after the carried ones.
+
+    Each returned dict has: text, embedding, order_index, is_transition,
+    is_load_bearing, branch_id, weight, aliases, carried (bool).
+    """
+    if replace and new_claims:
+        return [{**c, "carried": False} for c in new_claims]
+
+    carried = [{**c, "carried": True} for c in previous_claims]
+    unique = deduplicate_claims(new_claims, previous_claims)
+
+    existing_orders = [c["order_index"] for c in previous_claims if c.get("order_index") is not None]
+    base = (max(existing_orders) + 1) if existing_orders else 0
+    appended = []
+    for c in unique:
+        order = c.get("order_index")
+        appended.append({
+            **c,
+            "order_index": (base + order) if order is not None else None,
+            "carried": False,
+        })
+    return carried + appended
 
 
 class IngestionService:
@@ -47,17 +114,27 @@ class IngestionService:
         classifier: NoteClassifier | None = None,
         extractor: ClaimExtractor | None = None,
         embedding_service: EmbeddingService | None = None,
+        enqueue_recluster: bool = True,
     ):
         self._conn = conn
-        self._classifier = classifier
-        self._extractor = extractor
-        self._embedding = embedding_service
+        # Self-provision guarded (budget + cache) clients from the connection
+        # when not supplied. This is what lets the background worker build
+        # IngestionService(conn) with no extra wiring.
+        from app.ingestion.embedding import create_embedding_service
+        self._classifier = classifier or NoteClassifier(conn=conn)
+        self._extractor = extractor or ClaimExtractor(conn=conn)
+        self._embedding = embedding_service or create_embedding_service(conn=conn)
+        self._enqueue_recluster = enqueue_recluster
 
     async def ingest_note(self, note_id: str, learner_id: str) -> dict:
         """Run the full ingestion pipeline for a note.
-        
-        Returns dict with concept_id, claims_count, status.
+
+        Returns dict with concept_id, claims_count, status, is_new_concept,
+        concept_version, prerequisites_count, placeholders_created.
         """
+        note_id = str(note_id)
+        learner_id = str(learner_id)
+
         # 1. Fetch the note
         async with self._conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -69,7 +146,7 @@ class IngestionService:
         if not note:
             raise ValueError(f"Note {note_id} not found for learner {learner_id}")
 
-        body = note["body_md"] or note.get("body", "")
+        body = note["body_md"] or note.get("body", "") or ""
         title = note["title"]
 
         try:
@@ -77,6 +154,13 @@ class IngestionService:
             content_hash = hashlib.sha256(body.encode()).hexdigest()
             if note.get("markdown_hash") == content_hash:
                 logger.info("Note %s unchanged, skipping ingestion", note_id)
+                # Express set PENDING on save; restore READY so the UI doesn't spin forever.
+                async with self._conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE notes SET ingestion_status = 'READY' WHERE id = %s",
+                        (note_id,),
+                    )
+                await self._conn.commit()
                 return {"concept_id": None, "claims_count": 0, "status": "UNCHANGED"}
 
             # 3. Classify the note
@@ -86,132 +170,101 @@ class IngestionService:
             claims = await self._extractor.extract_claims(body, classification.shape)
 
             # 5. Compute embeddings
-            label_embedding = await self._embedding.compute_embedding(title)
-            claim_texts = [c.text for c in claims]
-            claim_embeddings = await self._embedding.compute_batch_embeddings(claim_texts)
-
-            # 6. Resolve concept identity
-            async with self._conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT id, canonical_label AS label, label_embedding AS embedding "
-                    "FROM concepts WHERE learner_id = %s AND label_embedding IS NOT NULL",
-                    (learner_id,),
-                )
-                existing_concepts = await cur.fetchall()
-
-            identity = resolve_concept_identity(
-                label_embedding,
-                [dict(c) for c in existing_concepts],
+            label_embedding = as_vector(await self._embedding.compute_embedding(title))
+            claim_embeddings = await self._embedding.compute_batch_embeddings(
+                [c.text for c in claims]
             )
-
-            # 7. Create or update concept
-            if identity.is_new:
-                concept_id = str(uuid4())
-                # Compute complexity
-                token_count = len(body.split())
-                c_struct = compute_structural_complexity(len(claims), 0, token_count)
-                c_0 = compute_initial_complexity(c_struct, classification.bloom_level)
-                h_0 = calculate_initial_half_life(c_0)
-
-                async with self._conn.cursor() as cur:
-                    await cur.execute(
-                        """
-                        INSERT INTO concepts (
-                            id, learner_id, canonical_label, label_embedding,
-                            track, shape, category, status, version,
-                            c_struct, c_bloom, c_0, c_current, solo_level,
-                            source_trust_tier
-                        ) VALUES (
-                            %s, %s, %s, %s::vector,
-                            %s, %s, %s, 'VERIFIED_CONCEPT', 1,
-                            %s, %s, %s, %s, 'Prestructural',
-                            NULL
-                        )
-                        """,
-                        (
-                            concept_id, learner_id, title, str(label_embedding),
-                            classification.track, classification.shape,
-                            classification.category,
-                            c_struct, classification.bloom_level, c_0, c_0,
-                        ),
-                    )
-
-                    # Create initial memory state
-                    await cur.execute(
-                        """
-                        INSERT INTO memory_states (concept_id, learner_id, half_life)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT DO NOTHING
-                        """,
-                        (concept_id, learner_id, h_0),
-                    )
-            else:
-                concept_id = identity.concept_id
-                # Bump version
-                async with self._conn.cursor() as cur:
-                    await cur.execute(
-                        "UPDATE concepts SET version = version + 1 WHERE id = %s RETURNING version",
-                        (concept_id,),
-                    )
-                    row = await cur.fetchone()
-                    version = row[0] if row else 1
-
-            # 8. Insert claims (deduplicated)
-            async with self._conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT text, embedding FROM claims WHERE concept_id = %s",
-                    (concept_id,),
-                )
-                existing_claims_raw = await cur.fetchall()
-
-            existing_claim_dicts = [
-                {"text": c["text"], "embedding": c["embedding"]}
-                for c in existing_claims_raw
-            ]
             new_claim_dicts = [
-                {"text": c.text, "embedding": emb}
+                {
+                    "text": c.text,
+                    "embedding": as_vector(emb),
+                    "order_index": c.order_index,
+                    "is_transition": c.is_transition,
+                    "is_load_bearing": c.is_load_bearing,
+                    "branch_id": c.branch_id,
+                    "weight": 1.0,
+                    "aliases": c.aliases or [],
+                }
                 for c, emb in zip(claims, claim_embeddings)
             ]
-            unique_claims = deduplicate_claims(new_claim_dicts, existing_claim_dicts)
 
-            # Get current version
-            async with self._conn.cursor() as cur:
+            # 6. Resolve concept identity
+            existing_concepts = await self._load_learner_concepts(learner_id)
+            identity = resolve_concept_identity(label_embedding, existing_concepts)
+            by_id = {c["id"]: c for c in existing_concepts}
+
+            if identity.is_new:
+                # A placeholder created from an earlier note's prerequisite list
+                # with the same label is this concept: promote, don't duplicate.
+                placeholder = next(
+                    (c for c in existing_concepts
+                     if c["status"] == UNRESOLVED
+                     and c["label"].strip().lower() == title.strip().lower()),
+                    None,
+                )
+                if placeholder:
+                    mode, concept_id = "promote", placeholder["id"]
+                else:
+                    mode, concept_id = "new", str(uuid4())
+            else:
+                concept_id = str(identity.concept_id)
+                matched = by_id.get(concept_id)
+                mode = "promote" if matched and matched["status"] == UNRESOLVED else "update"
+
+            # A note maps to one concept; drop links left by an earlier
+            # version of this note that resolved to a different concept.
+            async with self._conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
-                    "SELECT version FROM concepts WHERE id = %s", (concept_id,)
+                    "DELETE FROM note_concepts WHERE note_id = %s AND concept_id <> %s",
+                    (note_id, concept_id),
+                )
+                await cur.execute(
+                    "SELECT COUNT(*) AS n FROM note_concepts WHERE concept_id = %s AND note_id <> %s",
+                    (concept_id, note_id),
                 )
                 row = await cur.fetchone()
-                version = row[0] if row else 1
+                other_notes = int(row["n"]) if row else 0
+            # Sole source of the concept → this note's content replaces the
+            # previous version's claims and prerequisite edges.
+            sole_source = other_notes == 0
 
-            # Insert unique claims
-            for claim_dict in unique_claims:
-                claim_obj = next(
-                    (c for c in claims if c.text == claim_dict["text"]), None
+            # 7. Prerequisites → concept ids (existing or placeholder)
+            prereq_labels = await self._extractor.extract_prerequisites(
+                body,
+                # Placeholder labels are included so the model reuses them.
+                [c["label"] for c in existing_concepts if c["id"] != concept_id],
+                concept_label=title,
+            )
+            prereq_ids, placeholders_created = await self._resolve_prerequisites(
+                learner_id, prereq_labels,
+                [c for c in existing_concepts if c["id"] != concept_id],
+            )
+
+            # 8. REQUIRES plan with cycle check (D-15) → prerequisite depth
+            replace_requires = sole_source and mode != "new"
+            requires_edges = await self._load_requires_edges(
+                learner_id, exclude_source=concept_id if replace_requires else None,
+            )
+            forward = build_requires_forward(requires_edges)
+            planned_edges, prereq_depth = plan_requires_edges(concept_id, prereq_ids, forward)
+
+            # 9. Create / promote / version-bump the concept
+            if mode in ("new", "promote"):
+                version = await self._write_verified_concept(
+                    mode, concept_id, learner_id, title, label_embedding,
+                    classification, len(claims), prereq_depth, len(body.split()),
                 )
-                if not claim_obj:
-                    continue
+                previous_claims: list[dict] = []
+            else:
+                version = await self._bump_version(concept_id)
+                previous_claims = await self._load_claims(concept_id, version - 1)
 
-                async with self._conn.cursor() as cur:
-                    await cur.execute(
-                        """
-                        INSERT INTO claims (
-                            id, concept_id, concept_version, text, embedding,
-                            order_index, is_transition, is_load_bearing,
-                            branch_id, weight, aliases
-                        ) VALUES (
-                            gen_random_uuid(), %s, %s, %s, %s::vector,
-                            %s, %s, %s, %s, 1.0, %s
-                        )
-                        """,
-                        (
-                            concept_id, version, claim_obj.text,
-                            str(claim_dict["embedding"]),
-                            claim_obj.order_index, claim_obj.is_transition,
-                            claim_obj.is_load_bearing, claim_obj.branch_id,
-                            claim_obj.aliases,
-                        ),
-                    )
+            # 10. Write the complete claim set for this version
+            claim_set = compose_claim_version(previous_claims, new_claim_dicts, sole_source)
+            await self._insert_claims(concept_id, version, claim_set)
+            new_claims_count = sum(1 for c in claim_set if not c["carried"])
 
-            # 9. Link note to concept
+            # 11. Link note to concept
             async with self._conn.cursor() as cur:
                 await cur.execute(
                     """
@@ -222,7 +275,25 @@ class IngestionService:
                     (note_id, concept_id),
                 )
 
-            # 10. Extract wikilinks and create edges
+            # 12. REQUIRES edges (flagged CYCLE_CONFLICT when they would close a cycle)
+            await self._write_requires_edges(learner_id, concept_id, planned_edges, replace_requires)
+
+            # 13. MERGE_CANDIDATE for the ambiguous identity band (§4.6)
+            if (identity.is_merge_candidate and identity.best_match_id
+                    and str(identity.best_match_id) != concept_id):
+                async with self._conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO edges (id, learner_id, source_id, target_id, type, weight, confidence, flag)
+                        VALUES (gen_random_uuid(), %s, %s, %s, 'SEMANTIC', %s, %s, 'MERGE_CANDIDATE')
+                        ON CONFLICT (source_id, target_id, type)
+                        DO UPDATE SET flag = 'MERGE_CANDIDATE', confidence = EXCLUDED.confidence
+                        """,
+                        (learner_id, concept_id, str(identity.best_match_id),
+                         identity.similarity, identity.similarity),
+                    )
+
+            # 14. Wikilink edges
             wikilinks = extract_wikilinks(body)
             for target_label in wikilinks:
                 async with self._conn.cursor(row_factory=dict_row) as cur:
@@ -231,20 +302,21 @@ class IngestionService:
                         (learner_id, target_label),
                     )
                     target = await cur.fetchone()
-                    if target:
+                    if target and str(target["id"]) != concept_id:
                         await cur.execute(
                             """
                             INSERT INTO edges (id, learner_id, source_id, target_id, type, weight)
                             VALUES (gen_random_uuid(), %s, %s, %s, 'WIKILINK', 1.0)
                             ON CONFLICT (source_id, target_id, type) DO NOTHING
                             """,
-                            (learner_id, concept_id, target["id"]),
+                            (learner_id, concept_id, str(target["id"])),
                         )
 
-            # 11. Create semantic edges
+            # 15. Semantic edges (placeholders are not semantic neighbours)
             semantic_neighbours = find_semantic_neighbours(
                 label_embedding,
-                [dict(c) for c in existing_concepts if c["id"] != concept_id],
+                [c for c in existing_concepts
+                 if c["id"] != concept_id and c["status"] == VERIFIED],
             )
             for neighbour in semantic_neighbours:
                 async with self._conn.cursor() as cur:
@@ -260,7 +332,7 @@ class IngestionService:
                         ),
                     )
 
-            # 12. Update note status
+            # 16. Update note status
             async with self._conn.cursor() as cur:
                 await cur.execute(
                     """
@@ -273,18 +345,29 @@ class IngestionService:
                     (content_hash, note_id),
                 )
 
+            # 17. Graph changed → per-learner recluster (deduped), same transaction
+            if self._enqueue_recluster:
+                from app.jobs.repository import JobRepository
+                await JobRepository(self._conn).enqueue_recluster(learner_id)
+
             await self._conn.commit()
 
             return {
                 "concept_id": concept_id,
-                "claims_count": len(unique_claims),
+                "claims_count": new_claims_count,
                 "status": "READY",
-                "is_new_concept": identity.is_new,
+                "is_new_concept": mode != "update",
+                "concept_version": version,
+                "prerequisites_count": len(planned_edges),
+                "placeholders_created": placeholders_created,
             }
 
         except Exception as e:
             # Mark note as failed
             logger.error("Ingestion failed for note %s: %s", note_id, e, exc_info=True)
+            # Discard partial writes (and clear an aborted transaction) before
+            # recording the failure, otherwise this UPDATE itself would fail.
+            await self._conn.rollback()
             async with self._conn.cursor() as cur:
                 await cur.execute(
                     "UPDATE notes SET ingestion_status = 'FAILED' WHERE id = %s",
@@ -292,3 +375,254 @@ class IngestionService:
                 )
             await self._conn.commit()
             raise
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _load_learner_concepts(self, learner_id: str) -> list[dict]:
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT id, canonical_label AS label, label_embedding AS embedding, "
+                "status::text AS status "
+                "FROM concepts WHERE learner_id = %s AND label_embedding IS NOT NULL",
+                (learner_id,),
+            )
+            rows = await cur.fetchall()
+        # psycopg returns uuid.UUID / pgvector text; normalise once so identity
+        # results, neighbour comparisons and the JSON response share one type.
+        return [
+            {
+                "id": str(r["id"]),
+                "label": r["label"],
+                "embedding": as_vector(r["embedding"]),
+                "status": r.get("status") or VERIFIED,
+            }
+            for r in rows
+        ]
+
+    async def _resolve_prerequisites(
+        self, learner_id: str, labels: list[str], candidates: list[dict],
+    ) -> tuple[list[str], int]:
+        """Map prerequisite labels to concept ids, creating placeholders.
+
+        Resolution order: exact (case-insensitive) label → identity
+        resolution on the label embedding (sim >= τ_identity) → new
+        UNRESOLVED_PREREQUISITE placeholder.
+        """
+        if not labels:
+            return [], 0
+        candidates = list(candidates)  # placeholders created here are appended
+        embeddings = await self._embedding.compute_batch_embeddings(labels)
+        ids: list[str] = []
+        created = 0
+        for label, emb in zip(labels, embeddings):
+            emb = as_vector(emb)
+            exact = next(
+                (c for c in candidates if c["label"].strip().lower() == label.strip().lower()),
+                None,
+            )
+            if exact:
+                ids.append(exact["id"])
+                continue
+            res = resolve_concept_identity(emb, candidates)
+            if not res.is_new and res.concept_id:
+                ids.append(str(res.concept_id))
+                continue
+            pid = str(uuid4())
+            async with self._conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO concepts (
+                        id, learner_id, canonical_label, label_embedding,
+                        track, shape, category, status, version, probe_eligible
+                    ) VALUES (
+                        %s, %s, %s, %s::vector,
+                        %s, %s, %s, 'UNRESOLVED_PREREQUISITE', 1, false
+                    )
+                    """,
+                    (pid, learner_id, label, _vector_literal(emb),
+                     PLACEHOLDER_TRACK, PLACEHOLDER_SHAPE, PLACEHOLDER_CATEGORY),
+                )
+            candidates.append({"id": pid, "label": label, "embedding": emb, "status": UNRESOLVED})
+            ids.append(pid)
+            created += 1
+        return ids, created
+
+    async def _load_requires_edges(self, learner_id: str, exclude_source: str | None) -> list[dict]:
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT source_id, target_id, flag::text AS flag FROM edges "
+                "WHERE learner_id = %s AND type = 'REQUIRES'",
+                (learner_id,),
+            )
+            rows = await cur.fetchall()
+        return [
+            r for r in rows
+            if exclude_source is None or str(r["source_id"]) != exclude_source
+        ]
+
+    async def _write_verified_concept(
+        self,
+        mode: str,
+        concept_id: str,
+        learner_id: str,
+        title: str,
+        label_embedding: list[float],
+        classification: ClassificationResult,
+        claim_count: int,
+        prereq_depth: int,
+        token_count: int,
+    ) -> int:
+        """Insert a new concept or promote a placeholder. Returns its version."""
+        c_struct = compute_structural_complexity(claim_count, prereq_depth, token_count)
+        c_0 = compute_initial_complexity(c_struct, classification.bloom_level)
+        h_0 = calculate_initial_half_life(c_0)
+        # N_req is frozen from C_0 (D-05); C_0 is fixed at first ingest, so
+        # computing it here is equivalent to "at first probe".
+        n_req = calculate_required_streak(c_0, classification.shape == "PROCEDURAL")
+
+        version = 1
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            if mode == "new":
+                await cur.execute(
+                    """
+                    INSERT INTO concepts (
+                        id, learner_id, canonical_label, label_embedding,
+                        track, shape, category, status, version,
+                        c_struct, c_bloom, c_0, c_current, n_req, solo_level,
+                        source_trust_tier
+                    ) VALUES (
+                        %s, %s, %s, %s::vector,
+                        %s, %s, %s, 'VERIFIED_CONCEPT', 1,
+                        %s, %s, %s, %s, %s, 'Prestructural',
+                        NULL
+                    )
+                    """,
+                    (
+                        concept_id, learner_id, title, _vector_literal(label_embedding),
+                        classification.track, classification.shape,
+                        classification.category,
+                        c_struct, classification.bloom_level, c_0, c_0, n_req,
+                    ),
+                )
+            else:
+                # Promotion keeps the id (existing REQUIRES edges point at it)
+                # and the version (a placeholder never had claims or probes).
+                await cur.execute(
+                    """
+                    UPDATE concepts
+                    SET canonical_label = %s, label_embedding = %s::vector,
+                        track = %s, shape = %s, category = %s,
+                        status = 'VERIFIED_CONCEPT', probe_eligible = true,
+                        c_struct = %s, c_bloom = %s, c_0 = %s, c_current = %s,
+                        n_req = %s
+                    WHERE id = %s
+                    RETURNING version
+                    """,
+                    (
+                        title, _vector_literal(label_embedding),
+                        classification.track, classification.shape,
+                        classification.category,
+                        c_struct, classification.bloom_level, c_0, c_0, n_req,
+                        concept_id,
+                    ),
+                )
+                row = await cur.fetchone()
+                version = int(row["version"]) if row else 1
+
+            await cur.execute(
+                """
+                INSERT INTO memory_states (concept_id, learner_id, half_life)
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (concept_id, learner_id, h_0),
+            )
+        return version
+
+    async def _bump_version(self, concept_id: str) -> int:
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "UPDATE concepts SET version = version + 1 WHERE id = %s "
+                "RETURNING version, c_0, shape::text AS shape, n_req",
+                (concept_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                raise ValueError(f"Concept {concept_id} disappeared during ingestion")
+            # Concepts created before N_req was persisted get it once (frozen).
+            if row.get("n_req") is None and row.get("c_0") is not None:
+                await cur.execute(
+                    "UPDATE concepts SET n_req = %s WHERE id = %s AND n_req IS NULL",
+                    (calculate_required_streak(row["c_0"], row.get("shape") == "PROCEDURAL"),
+                     concept_id),
+                )
+        return int(row["version"])
+
+    async def _load_claims(self, concept_id: str, version: int) -> list[dict]:
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """SELECT text, embedding, order_index, is_transition, is_load_bearing,
+                          branch_id, weight, aliases
+                   FROM claims
+                   WHERE concept_id = %s AND concept_version = %s
+                   ORDER BY order_index ASC NULLS LAST, created_at ASC""",
+                (concept_id, version),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "text": r["text"],
+                "embedding": as_vector(r["embedding"]) if r.get("embedding") is not None else None,
+                "order_index": r.get("order_index"),
+                "is_transition": bool(r.get("is_transition")),
+                "is_load_bearing": bool(r.get("is_load_bearing")),
+                "branch_id": r.get("branch_id"),
+                "weight": r.get("weight") if r.get("weight") is not None else 1.0,
+                "aliases": list(r.get("aliases") or []),
+            }
+            for r in rows
+        ]
+
+    async def _insert_claims(self, concept_id: str, version: int, claim_set: list[dict]) -> None:
+        for c in claim_set:
+            async with self._conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO claims (
+                        id, concept_id, concept_version, text, embedding,
+                        order_index, is_transition, is_load_bearing,
+                        branch_id, weight, aliases
+                    ) VALUES (
+                        gen_random_uuid(), %s, %s, %s, %s::vector,
+                        %s, %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        concept_id, version, c["text"], _vector_literal(c.get("embedding")),
+                        c.get("order_index"), bool(c.get("is_transition")),
+                        bool(c.get("is_load_bearing")), c.get("branch_id"),
+                        float(c.get("weight") or 1.0), list(c.get("aliases") or []),
+                    ),
+                )
+
+    async def _write_requires_edges(
+        self, learner_id: str, concept_id: str, planned: list[dict], replace: bool,
+    ) -> None:
+        async with self._conn.cursor() as cur:
+            if replace:
+                # Sole-source re-ingest: the new prerequisite list supersedes the old one.
+                await cur.execute(
+                    "DELETE FROM edges WHERE source_id = %s AND type = 'REQUIRES'",
+                    (concept_id,),
+                )
+            for e in planned:
+                await cur.execute(
+                    """
+                    INSERT INTO edges (id, learner_id, source_id, target_id, type, weight, flag)
+                    VALUES (gen_random_uuid(), %s, %s, %s, 'REQUIRES', 1.0, %s::edge_flag)
+                    ON CONFLICT (source_id, target_id, type) DO NOTHING
+                    """,
+                    (learner_id, e["source_id"], e["target_id"], e["flag"]),
+                )

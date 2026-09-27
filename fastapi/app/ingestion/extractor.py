@@ -11,7 +11,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from app.providers.generation import GenerationClient, get_generation_client, strict_object
+from app.providers.generation import GenerationClient, strict_object
 
 logger = logging.getLogger(__name__)
 
@@ -79,14 +79,29 @@ For each claim provide:
 
 Return JSON: {"claims": [{"text": "...", "order_index": ..., "is_transition": ..., "is_load_bearing": ..., "branch_id": ..., "aliases": [...]}]}"""
 
-    PREREQ_PROMPT = """Given this text and a list of existing concept labels, identify which concepts are prerequisites (required prior knowledge) for understanding this text.
+    PREREQ_PROMPT = """Identify the concepts that are prerequisites (required prior knowledge) for understanding this text about "{label}".
+
+Rules:
+- List at most {max_items} prerequisites, most fundamental first.
+- When an existing concept label below fits, return that label exactly.
+- Otherwise return a short canonical concept name (2-5 words, no explanation).
+- Do not list "{label}" itself or concepts the text merely mentions in passing.
+- Return an empty list if the text needs no prior knowledge.
 
 Return JSON: {"prerequisites": ["concept_label_1", "concept_label_2"]}
 
 Existing concepts: {concepts}"""
 
-    def __init__(self, client: GenerationClient | None = None):
-        self._client = client or get_generation_client()
+    # Cache variant for prerequisite extraction so it never shares an entry
+    # with another generation call on the same text.
+    PREREQ_VARIANT = "prerequisites-v2"
+    MAX_PREREQUISITES = 5
+
+    def __init__(self, client: GenerationClient | None = None, *, conn=None):
+        if client is None:
+            from app.providers.generation import get_guarded_generation_client
+            client = get_guarded_generation_client(conn=conn)
+        self._client = client
 
     async def extract_claims(self, text: str, shape: str = "DEFINITION") -> list[ExtractedClaim]:
         """Extract structured claims from note text."""
@@ -109,19 +124,43 @@ Existing concepts: {concepts}"""
         ]
 
     async def extract_prerequisites(
-        self, text: str, existing_concepts: list[str],
+        self, text: str, existing_concepts: list[str], concept_label: str = "",
     ) -> list[str]:
-        """Extract prerequisite concept labels from text."""
-        if not existing_concepts:
+        """Extract prerequisite concept labels from text.
+
+        Labels may name existing concepts or new ones; the caller resolves
+        them (existing concept or UNRESOLVED_PREREQUISITE placeholder).
+        """
+        if not text.strip():
             return []
 
-        concepts_str = ", ".join(existing_concepts[:100])
+        # Sorted so the prompt (and so the cache key) is stable for the same graph.
+        concepts_str = ", ".join(sorted(set(existing_concepts))[:100]) or "(none)"
+        label = concept_label.strip() or "this note"
         # str.replace, not str.format: the prompt contains literal JSON braces.
-        prompt = self.PREREQ_PROMPT.replace("{concepts}", concepts_str)
+        prompt = (
+            self.PREREQ_PROMPT
+            .replace("{concepts}", concepts_str)
+            .replace("{label}", label)
+            .replace("{max_items}", str(self.MAX_PREREQUISITES))
+        )
 
         result = await self._client.generate_structured(
             system=prompt,
             prompt=text[:4000],
             schema=PREREQUISITES_SCHEMA,
+            variant=self.PREREQ_VARIANT,
         )
-        return [p for p in result.data.get("prerequisites", []) if isinstance(p, str)]
+        own = label.lower()
+        out: list[str] = []
+        seen: set[str] = set()
+        for p in result.data.get("prerequisites", []):
+            if not isinstance(p, str):
+                continue
+            cleaned = " ".join(p.split())[:120]
+            key = cleaned.lower()
+            if not cleaned or key == own or key in seen:
+                continue
+            seen.add(key)
+            out.append(cleaned)
+        return out[: self.MAX_PREREQUISITES]

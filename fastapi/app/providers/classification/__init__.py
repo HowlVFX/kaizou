@@ -10,6 +10,7 @@ from app.providers.classification.jev import (
     ScoreAnswer,
     check_classification_provider,
     get_classification_client,
+    get_guarded_classification_client,
 )
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "ScoreAnswer",
     "check_classification_provider",
     "get_classification_client",
+    "get_guarded_classification_client",
 ]

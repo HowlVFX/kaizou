@@ -1,39 +1,48 @@
-import React, { useEffect, useState } from 'react';
-import { fetchApi } from '../api/client';
+import React from 'react';
+import { useManagementData } from '../api/useManagementData';
+import type { GraphResponse } from '../api/types';
+import { fmtLabel, fmtNum, fmtPct } from '../api/format';
 import { MetricCard } from '../components/MetricCard';
 import { DataTable } from '../components/DataTable';
+import { CardRow, ErrorMessage, Loading, PageTitle, SectionTitle, SuppressedNotice, TwoColumns } from '../components/PageState';
+
+const EMPTY = '[below privacy threshold or no data]';
 
 export const GraphPage: React.FC = () => {
-  const [data, setData] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { data, loading, error } = useManagementData<GraphResponse>('/graph');
 
-  useEffect(() => {
-    fetchApi('/graph').then(setData).catch(e => setError(e.message)).finally(() => setLoading(false));
-  }, []);
-
-  if (loading) return <div style={{ color: '#e0e0e0' }}>Loading...</div>;
-  if (error) return <div style={{ color: '#e06060' }}>Error: {error}</div>;
-
-  const edgeTypeRows = data?.edge_type_distribution ? Object.entries(data.edge_type_distribution).map(([type, count]) => [type, count as number]) : [];
+  if (loading) return <Loading />;
+  if (error || !data) return <ErrorMessage message={error || 'No data'} />;
 
   return (
     <div>
-      <h1 style={{ color: '#e0e0e0', marginBottom: '1.5rem' }}>Knowledge Graph</h1>
-      <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginBottom: '2rem' }}>
-        <MetricCard title="Total Nodes" value={data?.total_nodes ?? 0} />
-        <MetricCard title="Total Edges" value={data?.total_edges ?? 0} />
-        <MetricCard title="Avg Degree" value={data?.avg_degree?.toFixed(2) ?? 0} />
-        <MetricCard title="Modularity" value={data?.modularity?.toFixed(3) ?? 0} />
-        <MetricCard title="Connected Components" value={data?.connected_components_count ?? 0} />
-      </div>
-      
-      <h3 style={{ color: '#a0a0a0', marginBottom: '1rem' }}>Edge Type Distribution</h3>
-      {edgeTypeRows.length > 0 ? (
-        <DataTable headers={['Edge Type', 'Count']} rows={edgeTypeRows} />
-      ) : (
-        <p style={{ color: '#808080', fontStyle: 'italic' }}>[below privacy threshold]</p>
-      )}
+      <PageTitle>Knowledge Graph</PageTitle>
+      <SuppressedNotice envelope={data} />
+      <CardRow>
+        <MetricCard title="Total Nodes" value={fmtNum(data.total_nodes)} />
+        <MetricCard title="Total Edges" value={fmtNum(data.total_edges)} />
+        <MetricCard title="Avg Degree" value={fmtNum(data.avg_degree, 2)} />
+        <MetricCard title="Isolated Nodes" value={fmtPct(data.isolated_node_rate)} />
+        <MetricCard title="Avg Modularity" value={fmtNum(data.avg_modularity, 3)} subtitle="active clusters" />
+      </CardRow>
+      <TwoColumns>
+        <div>
+          <SectionTitle>Edge Type Distribution</SectionTitle>
+          <DataTable
+            headers={['Edge Type', 'Count', 'Avg Weight']}
+            rows={data.edge_type_distribution.map((r) => [fmtLabel(r.type), r.count, fmtNum(r.avg_weight, 3)])}
+            emptyMessage={EMPTY}
+          />
+        </div>
+        <div>
+          <SectionTitle>Flagged Edges</SectionTitle>
+          <DataTable
+            headers={['Flag', 'Count']}
+            rows={data.flag_distribution.map((r) => [fmtLabel(r.flag), r.count])}
+            emptyMessage={EMPTY}
+          />
+        </div>
+      </TwoColumns>
     </div>
   );
 };

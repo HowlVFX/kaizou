@@ -160,6 +160,10 @@ export default function KnowledgeGraph({
       const cluster = clusters.find((c) => c.id === cid)
       if (cluster) cluster.nodeIds.forEach((id) => visibleNodeIds.add(id))
     })
+    // Concepts that belong to no cluster (e.g. clustering not computed yet) stay visible
+    const clustered = new Set<string>()
+    clusters.forEach((c) => c.nodeIds.forEach((id) => clustered.add(id)))
+    nodes.forEach((n) => { if (!clustered.has(n.id)) visibleNodeIds.add(n.id) })
     // Also show active path nodes and selected node
     activePathNodeIds.forEach((id) => visibleNodeIds.add(id))
     if (selectedNodeId) visibleNodeIds.add(selectedNodeId)

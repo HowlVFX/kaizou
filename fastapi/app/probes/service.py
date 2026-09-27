@@ -1,147 +1,256 @@
-"""Probe service — orchestrates probe lifecycle (§8).
+"""Probe service — orchestrates probe lifecycle (§6.7, §8).
 
-Coordinates probe generation, leakage checking, grading,
-and SOLO level advancement.
+Coordinates probe type selection, process templates, generation, leakage
+checking with a bounded retry loop, hand-authored fallback, persistence
+(with the frozen answer-key snapshot), and SOLO level advancement.
 """
 from __future__ import annotations
 
 import logging
+import random
 from typing import Optional
 
 import psycopg
+import psycopg.types.json
 from psycopg.rows import dict_row
 
-from app.probes.generation import ProbeGenerator
-from app.probes.leakage import validate_probe
+from app.grading.answer_key import PROBE_TYPES, build_snapshot
+from app.grading.coverage import as_vector
 from app.memory.telemetry import evaluate_solo_advancement
+from app.probes.generation import (
+    ORDER_DEPENDENT_TYPES,
+    GeneratedProbe,
+    ProbeGenerator,
+    ProbeValidationError,
+    fallback_probe,
+)
+from app.probes.leakage import validate_probe
+from app.providers.shared.errors import ProviderError
 
 logger = logging.getLogger(__name__)
 
-MAX_LEAKAGE_RETRIES = 3
+MAX_LEAKAGE_RETRIES = 3  # default; Settings.probe_leakage_max_retries overrides
+
+
+class ProbeServiceError(Exception):
+    """Maps to an HTTP error in the router."""
+
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(detail)
 
 
 class ProbeService:
-    """Orchestrates probe generation, validation, and grading."""
+    """Orchestrates probe generation, validation, and SOLO advancement."""
 
     def __init__(
         self,
         conn: psycopg.AsyncConnection,
         generator: ProbeGenerator | None = None,
         embedding_service=None,
+        template_manager=None,
+        settings=None,
     ):
         self._conn = conn
         self._generator = generator
         self._embedding = embedding_service
+        self._templates = template_manager
+        if settings is None:
+            from app.config import get_settings
+            settings = get_settings()
+        self._s = settings
+
+    # -- lazy collaborators (no provider client is built unless needed) -----
+
+    def _get_generator(self) -> ProbeGenerator:
+        if self._generator is None:
+            self._generator = ProbeGenerator(conn=self._conn)
+        return self._generator
+
+    def _get_templates(self):
+        if self._templates is None:
+            from app.probes.templates import ProcessTemplateManager
+            self._templates = ProcessTemplateManager(conn=self._conn)
+        return self._templates
+
+    def _get_embedding(self):
+        if self._embedding is None:
+            from app.ingestion.embedding import create_embedding_service
+            self._embedding = create_embedding_service(self._s, conn=self._conn)
+        return self._embedding
+
+    # -- generation ---------------------------------------------------------
 
     async def generate_probe_for_concept(
         self,
         concept_id: str,
         learner_id: str,
         probe_type: str | None = None,
+        concept_version: int | None = None,
     ) -> dict:
-        """Generate a probe for a concept with leakage retry logic.
+        """Generate, validate, persist and return a probe (§6.7).
 
         Pipeline:
-            1. Fetch concept + claims
-            2. Select probe type based on SOLO level
-            3. Generate prompt via LLM
-            4. Check for leakage
-            5. Retry up to 3 times if leaked
-            6. Persist and return
+            1. Validate probe_type (before any paid call)
+            2. Fetch concept (ownership, eligibility) + current-version claims
+            3. Select probe type by SOLO level if not given
+            4. Process template for order-dependent types
+            5. Generate → validate → leakage check, up to N attempts, each a
+               fresh sample (variant leak-retry-{n}) with the violation
+               report appended
+            6. Hand-authored fallback if every attempt fails or the provider
+               is unavailable / over budget
+            7. Persist with answer_key_snapshot and return
         """
-        # Fetch concept
+        if probe_type is not None:
+            probe_type = probe_type.strip().upper()
+            if probe_type not in PROBE_TYPES:
+                raise ProbeServiceError(
+                    422, f"Invalid probe_type '{probe_type}'. Valid: {sorted(PROBE_TYPES)}",
+                )
+
         async with self._conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                'SELECT * FROM concepts WHERE id = %s', (concept_id,),
-            )
+            await cur.execute('SELECT * FROM concepts WHERE id = %s', (concept_id,))
             concept = await cur.fetchone()
 
-        if not concept:
-            raise ValueError(f'Concept {concept_id} not found')
+        if not concept or str(concept.get('learner_id')) != str(learner_id):
+            raise ProbeServiceError(404, 'Concept not found')
+        concept = dict(concept)
+        if concept.get('status') == 'UNRESOLVED_PREREQUISITE':
+            raise ProbeServiceError(422, 'Concept is a locked prerequisite; write a note to unlock it')
+        if concept.get('probe_eligible') is False or concept.get('category') == 'OUT_OF_SCOPE':
+            raise ProbeServiceError(422, 'Concept is not probe-eligible')
+        current_version = concept['version']
+        if concept_version is not None and concept_version != current_version:
+            raise ProbeServiceError(
+                409, f'Stale concept_version {concept_version}; current is {current_version}',
+            )
 
-        # Fetch claims
         async with self._conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """SELECT text, embedding, order_index, is_transition,
-                          is_load_bearing, branch_id, aliases
+                """SELECT id, text, embedding, order_index, is_transition,
+                          is_load_bearing, branch_id, weight, aliases
                    FROM claims
                    WHERE concept_id = %s AND concept_version = %s
-                   ORDER BY order_index ASC NULLS LAST""",
-                (concept_id, concept['version']),
+                   ORDER BY order_index ASC NULLS LAST, created_at ASC""",
+                (concept_id, current_version),
             )
-            claims = await cur.fetchall()
+            claims = [dict(c) for c in await cur.fetchall()]
 
         if not claims:
-            raise ValueError(f'No claims for concept {concept_id}')
+            raise ProbeServiceError(422, f'No claims for concept {concept_id} version {current_version}')
 
-        # Select probe type
         if not probe_type:
-            # Get recently attempted types
             async with self._conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
-                    """SELECT DISTINCT p.type FROM probes p
+                    """SELECT p.type::text AS type, MAX(a.submitted_at) AS last_at
+                       FROM probes p
                        JOIN attempts a ON a.probe_id = p.id
                        WHERE a.learner_id = %s AND p.concept_id = %s
-                       ORDER BY p.type
-                       LIMIT 10""",
+                       GROUP BY p.type
+                       ORDER BY last_at DESC""",
                     (learner_id, concept_id),
                 )
                 recent = await cur.fetchall()
-
-            recent_types = [r['type'] for r in recent]
-            probe_type = await self._generator.select_probe_type(
-                concept.get('solo_level', 'Prestructural'),
-                concept.get('shape', 'DEFINITION'),
-                recent_types,
+            probe_type = await self._get_generator().select_probe_type(
+                concept.get('solo_level') or 'Prestructural',
+                concept.get('shape') or 'DEFINITION',
+                [r['type'] for r in recent],
+                track=concept.get('track'),
             )
 
-        # Generate with leakage retry
-        claim_dicts = [dict(c) for c in claims]
-        claim_embeddings = [c['embedding'] for c in claims if c.get('embedding')]
-        claim_texts = [c['text'] for c in claims]
-        claim_token_lists = [t.split() for t in claim_texts]
+        # Process template (order-dependent probe types on structured shapes).
+        template_snapshot = None
+        target_branch = None
+        focus = None
+        if probe_type in ORDER_DEPENDENT_TYPES and concept.get('shape') != 'DEFINITION':
+            template_snapshot = await self._template_for(concept, claims)
+            branches = (template_snapshot or {}).get('branches') or {}
+            if branches:
+                target_branch = random.choice(sorted(branches))
+                focus = f"Focus the question on the '{target_branch}' case/branch only."
 
-        prompt_text = None
-        answer_key = None
-        is_valid = False
-        retries = 0
+        max_attempts = max(1, int(getattr(self._s, 'probe_leakage_max_retries', MAX_LEAKAGE_RETRIES)))
+        claim_embeddings = [as_vector(c['embedding']) for c in claims if c.get('embedding') is not None]
+        claim_token_lists = [c['text'].split() for c in claims]
 
-        for attempt in range(MAX_LEAKAGE_RETRIES):
-            prompt_text, answer_key = await self._generator.generate_probe(
-                concept=dict(concept),
-                claims=claim_dicts,
-                probe_type=probe_type,
-            )
+        chosen: Optional[GeneratedProbe] = None
+        leaked = False
+        attempts_made = 0
+        leakage_check = 'none'
+        fallback_reason = None
+        violation = None
 
-            # Check leakage
-            if self._embedding and claim_embeddings:
-                probe_emb = await self._embedding.compute_embedding(prompt_text)
-                is_valid, _, _ = validate_probe(
-                    probe_emb, prompt_text.split(),
-                    claim_embeddings, claim_token_lists,
+        for attempt in range(max_attempts):
+            attempts_made = attempt + 1
+            try:
+                candidate = await self._get_generator().generate_probe(
+                    concept=concept,
+                    claims=claims,
+                    probe_type=probe_type,
+                    variant=f"leak-retry-{attempt}",
+                    violation=violation,
+                    focus=focus,
                 )
-            else:
-                is_valid = True  # Skip leakage check if no embeddings
-
-            retries = attempt
-            if is_valid:
+            except ProbeValidationError as exc:
+                violation = f"invalid probe: {exc}"
+                logger.info('Probe validation failed (attempt %d): %s', attempt, exc)
+                continue
+            except ProviderError as exc:
+                logger.warning('Probe generation unavailable, using fallback: %s', exc)
+                fallback_reason = f'provider_error: {type(exc).__name__}'
                 break
 
-        # Persist probe
-        import psycopg.types.json
+            is_valid, leakage_check, report = await self._check_leakage(
+                candidate, claim_embeddings, claim_token_lists,
+            )
+            if is_valid:
+                chosen = candidate
+                break
+            violation = report
+
+        if chosen is None:
+            if fallback_reason is None:
+                fallback_reason = 'leakage_or_validation_retries_exhausted'
+            chosen = fallback_probe(probe_type, concept, claims)
+            if chosen.probe_type != 'CLOZE':
+                lex_ok, _, _ = validate_probe(
+                    [], chosen.prompt_text.split(), [], claim_token_lists,
+                    lexical_threshold=self._s.probe_leakage_ngram,
+                    ngram_n=self._s.probe_leakage_ngram_n,
+                )
+                leaked = not lex_ok
+            leakage_check = 'lexical_only'
+
+        snapshot = build_snapshot(
+            concept=concept,
+            claims=claims,
+            probe_type=chosen.probe_type,
+            target_claim_index=chosen.target_claim_index,
+            cloze=chosen.cloze,
+            mcq=chosen.mcq,
+            sort=chosen.sort,
+            template=template_snapshot,
+            target_branch=target_branch,
+        )
+        retries = max(0, attempts_made - 1) if not chosen.fallback else attempts_made
+
         async with self._conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """INSERT INTO probes (
                     id, concept_id, concept_version, type,
-                    prompt_text, answer_key_snapshot, leaked, retries
+                    prompt_text, answer_key_snapshot, payload, leaked, retries
                 ) VALUES (
                     gen_random_uuid(), %s, %s, %s,
-                    %s, %s::jsonb, %s, %s
+                    %s, %s::jsonb, %s::jsonb, %s, %s
                 ) RETURNING id""",
                 (
-                    concept_id, concept['version'], probe_type,
-                    prompt_text, psycopg.types.json.Jsonb(answer_key),
-                    not is_valid, retries,
+                    concept_id, current_version, chosen.probe_type,
+                    chosen.prompt_text,
+                    psycopg.types.json.Jsonb(snapshot),
+                    psycopg.types.json.Jsonb(chosen.payload or {}),
+                    leaked, retries,
                 ),
             )
             row = await cur.fetchone()
@@ -150,58 +259,138 @@ class ProbeService:
 
         return {
             'probe_id': str(row['id']),
-            'prompt_text': prompt_text,
-            'probe_type': probe_type,
-            'leaked': not is_valid,
+            'concept_id': str(concept_id),
+            'concept_version': current_version,
+            'prompt_text': chosen.prompt_text,
+            'probe_type': chosen.probe_type,
+            'requested_probe_type': probe_type,
+            'payload': chosen.payload or {},
+            'leaked': leaked,
             'retries': retries,
+            'fallback': chosen.fallback,
+            'fallback_reason': fallback_reason if chosen.fallback else None,
+            'leakage_check': leakage_check,
+            'target_branch': target_branch,
         }
+
+    async def _template_for(self, concept: dict, claims: list[dict]) -> Optional[dict]:
+        """Fetch or build the Process Template; never fails the probe."""
+        try:
+            template = await self._get_templates().get_or_generate_template(
+                concept_id=str(concept['id']),
+                concept_version=concept['version'],
+                concept_label=concept.get('canonical_label', ''),
+                claims=claims,
+                conn=self._conn,
+            )
+        except ProviderError as exc:
+            logger.warning('Process template unavailable: %s', exc)
+            return None
+        structure = template.get('structure') or {}
+        return {
+            'trunk': list(structure.get('trunk') or []),
+            'branches': dict(structure.get('branches') or {}),
+            'confidence': template.get('confidence'),
+        }
+
+    async def _check_leakage(
+        self,
+        candidate: GeneratedProbe,
+        claim_embeddings: list,
+        claim_token_lists: list[list[str]],
+    ) -> tuple[bool, str, str]:
+        """§5.15 check. Returns (is_valid, check_kind, violation_report).
+
+        CLOZE leakage (answer present in the prompt) is enforced during
+        validation. For other types the stem (+ sort items) is checked
+        lexically always, and semantically when embeddings are available.
+        """
+        if candidate.probe_type == 'CLOZE':
+            return True, 'cloze_answer', ''
+        text = candidate.prompt_text
+        if candidate.probe_type == 'CONCEPT_SORT':
+            text = ' '.join([text, *candidate.payload.get('items', [])])
+
+        probe_embedding = None
+        check = 'lexical_only'
+        if claim_embeddings:
+            try:
+                probe_embedding = await self._get_embedding().compute_embedding(text)
+                check = 'semantic+lexical'
+            except ProviderError as exc:
+                logger.warning('Leakage semantic check skipped: %s', exc)
+
+        is_valid, sem, lex = validate_probe(
+            probe_embedding if probe_embedding is not None else [],
+            text.split(),
+            claim_embeddings if probe_embedding is not None else [],
+            claim_token_lists,
+            semantic_threshold=self._s.probe_leakage_semantic,
+            lexical_threshold=self._s.probe_leakage_ngram,
+            ngram_n=self._s.probe_leakage_ngram_n,
+        )
+        report = f"semantic similarity {sem:.2f}, 4-gram overlap {lex:.2f}"
+        return is_valid, check, report
+
+    # -- SOLO ---------------------------------------------------------------
 
     async def update_solo_level(
         self,
         concept_id: str,
         learner_id: str,
     ) -> str:
-        """Re-evaluate and update SOLO level after grading."""
+        """Re-evaluate and update SOLO level after grading (§5.24.1).
+
+        Evidence, read from this learner's graded attempts on the concept:
+            max claims matched on any single probe      → Uni (>=1) / Multi (>=3)
+            distinct probe types on which every
+            transition claim matched (key had >= 1)      → Relational (>= 2)
+            best passed PERTURBATION delta_score         → Relational (>= 0.70)
+            best passed FAR_TRANSFER composite           → Extended Abstract (>= 0.85)
+        Per-attempt facts come from attempts.gap_report.grading, written by
+        the grader. Levels only advance, never regress.
+        """
         async with self._conn.cursor(row_factory=dict_row) as cur:
-            # Get concept current state
             await cur.execute(
-                'SELECT solo_level FROM concepts WHERE id = %s',
+                'SELECT solo_level::text AS solo_level FROM concepts WHERE id = %s',
                 (concept_id,),
             )
             concept = await cur.fetchone()
-            current_level = concept['solo_level'] if concept else 'Prestructural'
+            current_level = (concept or {}).get('solo_level') or 'Prestructural'
 
-            # Count total claims matched across all attempts
             await cur.execute(
-                """SELECT COUNT(*) as total_matched
-                   FROM attempts a
-                   WHERE a.concept_id = %s AND a.learner_id = %s AND a.passed = true""",
-                (concept_id, learner_id),
-            )
-            row = await cur.fetchone()
-            total_matched = row['total_matched'] if row else 0
-
-            # Check transition claims
-            await cur.execute(
-                """SELECT COUNT(DISTINCT p.type) as distinct_types
+                """SELECT
+                     COALESCE(MAX(COALESCE((a.gap_report->'grading'->>'total_matched')::int, 0)), 0)
+                         AS max_matched,
+                     COUNT(DISTINCT p.type) FILTER (
+                         WHERE a.gap_report->'grading'->>'all_transitions_matched' = 'true'
+                     ) AS transition_types,
+                     MAX(a.delta_score) FILTER (
+                         WHERE p.type = 'PERTURBATION' AND a.passed
+                     ) AS best_perturbation,
+                     MAX(a.composite_score) FILTER (
+                         WHERE p.type = 'FAR_TRANSFER' AND a.passed
+                     ) AS best_far_transfer
                    FROM attempts a
                    JOIN probes p ON p.id = a.probe_id
-                   WHERE a.concept_id = %s AND a.learner_id = %s
-                     AND a.passed = true AND a.coverage >= 0.85""",
+                   WHERE a.concept_id = %s AND a.learner_id = %s""",
                 (concept_id, learner_id),
             )
-            row = await cur.fetchone()
-            distinct_types = row['distinct_types'] if row else 0
+            ev = await cur.fetchone() or {}
+
+        transition_types = int(ev.get('transition_types') or 0)
+        best_pert = ev.get('best_perturbation')
+        best_far = ev.get('best_far_transfer')
 
         new_level = evaluate_solo_advancement(
             current_level=current_level,
-            total_claims_matched=total_matched,
-            transition_claims_all_matched=total_matched >= 3,
-            distinct_probe_types_with_transitions=distinct_types,
-            has_passed_perturbation=False,  # TODO: check from attempts
-            perturbation_delta=0.0,
-            has_passed_far_transfer=False,
-            far_transfer_score=0.0,
+            total_claims_matched=int(ev.get('max_matched') or 0),
+            transition_claims_all_matched=transition_types > 0,
+            distinct_probe_types_with_transitions=transition_types,
+            has_passed_perturbation=best_pert is not None,
+            perturbation_delta=float(best_pert or 0.0),
+            has_passed_far_transfer=best_far is not None,
+            far_transfer_score=float(best_far or 0.0),
         )
 
         if new_level != current_level:

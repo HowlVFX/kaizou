@@ -35,10 +35,10 @@ CREATE TABLE learners (
 );
 
 CREATE TABLE refresh_tokens (
-    id UUID PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     learner_id UUID REFERENCES learners(id) ON DELETE CASCADE,
     token TEXT UNIQUE NOT NULL,
-    created_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     expires_at TIMESTAMPTZ NOT NULL
 );
 
@@ -288,3 +288,39 @@ CREATE INDEX idx_jobs_status_run_after ON jobs(status, run_after) WHERE status =
 CREATE INDEX idx_clusters_learner ON clusters(learner_id);
 CREATE INDEX idx_misconception_events_learner ON misconception_events(learner_id, concept_id);
 CREATE INDEX idx_portal_aggregates_key ON portal_aggregates(metric_key, computed_at);
+
+-- ---------------------------------------------------------------------------
+-- AI provider spend ledger and reuse cache (migration 002).
+-- 🔒 No free-text note/answer/prompt content stored here (D-10-aligned).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE provider_usage (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    task TEXT NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    tokens_estimated BOOLEAN NOT NULL DEFAULT false,
+    est_cost_inr REAL NOT NULL DEFAULT 0,
+    reserved BOOLEAN NOT NULL DEFAULT false,
+    success BOOLEAN NOT NULL DEFAULT true,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_provider_usage_created ON provider_usage(created_at);
+CREATE INDEX idx_provider_usage_task ON provider_usage(task, created_at);
+
+CREATE TABLE ai_cache (
+    kind TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    value_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    hits INTEGER NOT NULL DEFAULT 0,
+    last_used_at TIMESTAMPTZ,
+    PRIMARY KEY (kind, key_hash)
+);
+
+CREATE INDEX idx_ai_cache_created ON ai_cache(created_at);

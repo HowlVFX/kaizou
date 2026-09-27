@@ -17,6 +17,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23.0"]
+# Local NLI (contradiction detection). Kept out of the default install so the
+# web image stays lean and never imports torch. Install on the worker/host
+# that runs NLI:  pip install -e ".[nli]"
+# Use the CPU torch wheel: pip install torch --index-url https://download.pytorch.org/whl/cpu
+nli = [
+    "torch>=2.2",
+    "transformers>=4.40",
+    "sentencepiece>=0.2",
+    "safetensors>=0.4",
+    "tokenizers>=0.19",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]

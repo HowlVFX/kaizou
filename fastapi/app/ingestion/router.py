@@ -32,54 +32,44 @@ async def trigger_ingestion(
 ):
     """Trigger full ingestion pipeline for a note.
 
-    This is the primary entry point called by Express when a note
-    is created or updated. It dispatches a background job.
+    Primary entry point called by Express when a note is created/updated.
+    Behaviour depends on INGEST_MODE:
+      - "job":    enqueue a background job and return status PENDING (a
+                  running worker processes it).
+      - "inline": run the pipeline now and return the concept result.
+    Exactly one of these happens — never both.
     """
-    from app.jobs.dispatcher import JobDispatcher
-
-    dispatcher = JobDispatcher(db)
-    job_id = await dispatcher.dispatch_ingest(
-        request.note_id, request.learner_id,
-    )
-
-    # For now, run synchronously (background job support comes later)
-    from app.ingestion.service import IngestionService
-    from app.ingestion.classifier import NoteClassifier
-    from app.ingestion.extractor import ClaimExtractor
-    from app.ingestion.embedding import create_embedding_service
     from app.config import get_settings
-
     settings = get_settings()
-    service = IngestionService(
-        conn=db,
-        classifier=NoteClassifier(),
-        extractor=ClaimExtractor(),
-        embedding_service=create_embedding_service(settings),
-    )
 
+    if settings.ingest_mode == "job":
+        from app.jobs.dispatcher import JobDispatcher
+        dispatcher = JobDispatcher(db)
+        await dispatcher.dispatch_ingest(request.note_id, request.learner_id)
+        return IngestResponse(concept_id=None, status="PENDING", claims_count=0)
+
+    # inline
+    from app.ingestion.service import IngestionService
+    service = IngestionService(conn=db)  # self-provisions guarded clients
     result = await service.ingest_note(
         str(request.note_id), str(request.learner_id),
     )
-
-    concept_id = result.get("concept_id")
-    if not concept_id:
-        raise HTTPException(status_code=422, detail="Ingestion produced no concept")
-
     return IngestResponse(
-        concept_id=concept_id,
+        concept_id=result.get("concept_id"),
         status=result["status"],
         claims_count=result["claims_count"],
     )
 
 
 @router.post("/extract-claims", response_model=ExtractClaimsResponse)
-async def extract_claims(request: ExtractClaimsRequest):
+async def extract_claims(
+    request: ExtractClaimsRequest,
+    db: psycopg.AsyncConnection = Depends(get_db),
+):
     """Extract claims from raw text (standalone utility endpoint)."""
     from app.ingestion.extractor import ClaimExtractor
-    from app.config import get_settings
 
-    settings = get_settings()
-    extractor = ClaimExtractor()
+    extractor = ClaimExtractor(conn=db)
     claims = await extractor.extract_claims(request.text, request.shape)
 
     return ExtractClaimsResponse(
@@ -99,13 +89,14 @@ async def extract_claims(request: ExtractClaimsRequest):
 
 
 @router.post("/extract-prerequisites", response_model=ExtractPrerequisitesResponse)
-async def extract_prerequisites(request: ExtractPrerequisitesRequest):
+async def extract_prerequisites(
+    request: ExtractPrerequisitesRequest,
+    db: psycopg.AsyncConnection = Depends(get_db),
+):
     """Extract prerequisite concepts from text."""
     from app.ingestion.extractor import ClaimExtractor
-    from app.config import get_settings
 
-    settings = get_settings()
-    extractor = ClaimExtractor()
+    extractor = ClaimExtractor(conn=db)
     prereqs = await extractor.extract_prerequisites(
         request.text, request.existing_concepts,
     )
@@ -124,7 +115,7 @@ async def resolve_identity(
     from app.config import get_settings
 
     settings = get_settings()
-    emb_service = create_embedding_service(settings)
+    emb_service = create_embedding_service(settings, conn=db)
 
     label_embedding = await emb_service.compute_embedding(request.label)
 
@@ -141,7 +132,7 @@ async def resolve_identity(
     )
 
     from uuid import uuid4
-    concept_id = result.concept_id or str(uuid4())
+    concept_id = str(result.concept_id) if result.concept_id else str(uuid4())
 
     return ResolveIdentityResponse(
         concept_id=concept_id,
@@ -151,13 +142,16 @@ async def resolve_identity(
 
 
 @router.post("/embed", response_model=EmbedResponse)
-async def embed(request: EmbedRequest):
+async def embed(
+    request: EmbedRequest,
+    db: psycopg.AsyncConnection = Depends(get_db),
+):
     """Compute embedding for text."""
     from app.ingestion.embedding import create_embedding_service
     from app.config import get_settings
 
     settings = get_settings()
-    emb_service = create_embedding_service(settings)
+    emb_service = create_embedding_service(settings, conn=db)
 
     embedding = await emb_service.compute_embedding(request.text)
 

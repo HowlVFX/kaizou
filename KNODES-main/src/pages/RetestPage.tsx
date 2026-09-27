@@ -1,12 +1,11 @@
-import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { useApp } from '../context/AppContext';
+import { useState, useEffect, useCallback } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { useApp, recallToPercent } from '../context/AppContext';
 import { recallStatus } from '../data/demo';
-import { Zap, Puzzle, PartyPopper, Target, Brain, Check, X as XIcon, RefreshCw } from '../components/Icon';
+import { api, describeApiError } from '../lib/api';
+import { Zap, Puzzle, PartyPopper, Target, Check, X as XIcon, RefreshCw } from '../components/Icon';
 
-type QuestionType = 'abstract' | 'explain' | 'counterfactual' | 'transfer';
 type ReviewMode = 'abstract' | 'understand';
-type SelfRating = 'again' | 'almost' | 'got';
 
 function useVW() {
   const [vw, setVw] = useState(window.innerWidth);
@@ -18,706 +17,477 @@ function useVW() {
   return vw;
 }
 
-const QUESTIONS: Record<string, {
-  type: QuestionType;
-  question: string;
-  cloze?: { before: string; blank: string; after: string };
-  options?: string[];
-  correctIndex?: number;
-  explanation: string;
-}[]> = {
-  hoisting: [
-    {
-      type: 'explain',
-      question: 'Explain how JavaScript hoisting works from creation phase to execution phase. Include what happens to var, let/const, and function declarations.',
-      explanation: 'During the creation phase, the JS engine allocates memory for all var declarations (set to undefined) and function declarations (set to their full definition). let/const are hoisted but not initialized — accessing them before their declaration causes a ReferenceError (Temporal Dead Zone). During execution, code runs top-to-bottom using these pre-allocated values.',
-    },
-    {
-      type: 'abstract',
-      question: 'Complete the following:',
-      cloze: { before: 'var declarations are hoisted and initialized to', blank: 'undefined', after: ', while let/const enter the Temporal Dead Zone.' },
-      explanation: 'var is initialized to undefined during hoisting; let/const are hoisted but not initialized, causing a ReferenceError if accessed early.',
-    },
-    {
-      type: 'counterfactual',
-      question: 'What would change if JavaScript used only let/const and removed var entirely?',
-      options: [
-        'Nothing would change — hoisting still works the same way',
-        'All variable declarations would enter the TDZ, eliminating silent undefined-before-assignment bugs',
-        'Variables would no longer be hoisted at all',
-        'Function declarations would no longer be callable before their declaration line',
-      ],
-      correctIndex: 1,
-      explanation: 'Without var, all variable declarations would be block-scoped and enter the TDZ, making it a ReferenceError to access them before initialization rather than returning undefined silently.',
-    },
-    {
-      type: 'transfer',
-      question: 'You see this code in a codebase:\n\nconsole.log(x);\nvar x = 5;\n\nA colleague says this will throw a ReferenceError. Are they correct? Explain what actually happens.',
-      explanation: "They are incorrect. Because var is hoisted and initialized to undefined, console.log(x) outputs undefined — not an error. The assignment x = 5 happens on the line it appears.",
-    },
-  ],
-  scope: [
-    {
-      type: 'abstract',
-      question: 'Complete the following:',
-      cloze: { before: 'A variable declared with var inside a function is', blank: 'function-scoped', after: ', while let is block-scoped.' },
-      explanation: 'var respects only function boundaries for its scope; let and const respect any block including if, for, and {…} blocks.',
-    },
-    {
-      type: 'explain',
-      question: 'What is the difference between lexical scope and dynamic scope? Which does JavaScript use?',
-      explanation: 'Lexical scope means a variable\'s scope is determined at write time by where it is declared in the source code. Dynamic scope would mean scope is determined at runtime by the call stack. JavaScript uses lexical scope — functions capture their surrounding scope at definition, not at call time.',
-    },
-  ],
-  tdz: [
-    {
-      type: 'explain',
-      question: 'What is the Temporal Dead Zone (TDZ)? When does it start and when does it end for a let declaration?',
-      explanation: 'The TDZ is the period between the start of a block scope and the let/const declaration. During this period, the variable exists in the scope (it is hoisted) but is not initialized — accessing it throws a ReferenceError. The TDZ ends when execution reaches the declaration line and the variable is initialized.',
-    },
-    {
-      type: 'counterfactual',
-      question: 'If let behaved like var (initialized to undefined on hoist), what category of bugs would become harder to detect?',
-      options: [
-        'Infinite loops caused by loop variable reuse',
-        'Accessing a variable before assignment, silently getting undefined instead of an error',
-        'Memory leaks from unclosed closures',
-        'Type coercion errors in arithmetic',
-      ],
-      correctIndex: 1,
-      explanation: 'The TDZ exists precisely to surface use-before-initialization as an explicit ReferenceError. Without it, code accessing let before its declaration would silently get undefined — the same class of subtle bug that var is notorious for.',
-    },
-  ],
-  var: [
-    {
-      type: 'abstract',
-      question: 'Complete the following:',
-      cloze: { before: 'Unlike let and const, var is scoped to the nearest enclosing', blank: 'function', after: 'rather than the nearest block.' },
-      explanation: 'var ignores block boundaries like if-blocks and for-loops; it only respects function scope. This means a var declared inside a for loop leaks out to the enclosing function.',
-    },
-    {
-      type: 'transfer',
-      question: 'Consider:\n\nfor (var i = 0; i < 3; i++) {\n  setTimeout(() => console.log(i), 0);\n}\n\nWhat does this print, and why?',
-      explanation: 'It prints 3, 3, 3. Because var is function-scoped, all three closures capture the same i variable. By the time the callbacks run, the loop has finished and i === 3. With let, each iteration gets its own block-scoped i, printing 0, 1, 2.',
-    },
-  ],
-};
+// ── API shapes (coded defensively; the queue is being revised server-side) ──
+interface QueueItem {
+  conceptId: string;
+  label: string;
+  /** 0..100 or null when never reviewed */
+  recall: number | null;
+  subject?: string;
+  isDetour: boolean;
+  detourReason: string | null;
+  probeId: string | null;
+  prompt: string | null;
+}
 
-const QUEUE = [
-  { nodeId: 'hoisting', label: 'Hoisting', recall: 42, subject: 'JavaScript' },
-  { nodeId: 'tdz', label: 'TDZ', recall: 37, subject: 'JavaScript' },
-  { nodeId: 'scope', label: 'Scope', recall: 64, subject: 'JavaScript' },
-  { nodeId: 'var', label: 'var', recall: 58, subject: 'JavaScript' },
-];
+interface GapHint {
+  hint?: string;
+  category?: string;
+  prerequisite_concept_label?: string | null;
+}
 
-const ratingConfig = {
-  again: { label: "Didn't get it", color: 'var(--red)', bg: 'rgba(255,75,75,0.1)', delta: -5 },
-  almost: { label: 'Almost', color: 'var(--orange)', bg: 'rgba(255,150,0,0.1)', delta: 8 },
-  got: { label: 'Got it', color: 'var(--green)', bg: 'rgba(88,204,2,0.1)', delta: 18 },
-};
+interface GradeResult {
+  band?: string;
+  passed?: boolean;
+  gap_report?: { missing_claims?: GapHint[]; correct?: boolean; misconception_tag?: string | null; empty_answer?: boolean };
+  mastery?: { mastered?: boolean; newly_mastered?: boolean } | null;
+  solo_level?: string | null;
+  next_review_at?: string | null;
+}
+
+/** A probe served by POST /api/review/probe (learner-visible fields only). */
+interface Probe {
+  probeId: string;
+  prompt: string;
+  type: string;
+  /** MCQ: options[]; CONCEPT_SORT: items[] */
+  options: string[];
+  items: string[];
+}
+
+interface SessionResult {
+  label: string;
+  /** Understanding band (Full / Shallow / Incomplete / Not yet engaged); null if not graded */
+  band: string | null;
+  passed: boolean | null;
+  before: number | null;
+}
+
+const SORT_GROUPS = ['A', 'B', 'C'];
+
+function bandLabel(band: string | null | undefined): string {
+  if (!band) return '';
+  return band === 'Not_Yet_Engaged' ? 'Not yet engaged' : band.replace(/_/g, ' ');
+}
+
+function bandColor(band: string | null): string {
+  if (band === 'Full') return '#58CC02';
+  if (band === 'Shallow') return '#1CB0F6';
+  if (band === 'Incomplete') return '#FF9600';
+  if (band) return '#FF4B4B';
+  return '#6B7280';
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function mapQueueItem(raw: any, recallById: Map<string, number | null>, subjectById: Map<string, string | undefined>): QueueItem | null {
+  const conceptId = raw?.concept_id ?? raw?.conceptId ?? raw?.id;
+  if (!conceptId) return null;
+  const probe = raw?.probe ?? null;
+  const graphRecall = recallById.has(conceptId) ? recallById.get(conceptId)! : undefined;
+  return {
+    conceptId,
+    label: raw?.concept_label ?? raw?.canonical_label ?? raw?.label ?? 'Concept',
+    recall: graphRecall !== undefined ? graphRecall : recallToPercent(raw?.recall_probability ?? raw?.recall ?? null),
+    subject: subjectById.get(conceptId),
+    isDetour: !!raw?.is_detour,
+    detourReason: raw?.detour_reason ?? null,
+    probeId: raw?.probe_id ?? probe?.id ?? probe?.probe_id ?? null,
+    prompt: raw?.prompt ?? raw?.question ?? probe?.prompt ?? probe?.question ?? probe?.text ?? null,
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+function isGrade(r: unknown): r is GradeResult {
+  return !!r && typeof r === 'object' && typeof (r as GradeResult).passed === 'boolean';
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function mapProbe(raw: any): Probe | null {
+  if (!raw?.probe_id || !raw?.prompt_text) return null;
+  const payload = raw.payload && typeof raw.payload === 'object' ? raw.payload : {};
+  return {
+    probeId: String(raw.probe_id),
+    prompt: String(raw.prompt_text),
+    type: String(raw.probe_type || ''),
+    options: Array.isArray(payload.options) ? payload.options.map(String) : [],
+    items: Array.isArray(payload.items) ? payload.items.map(String) : [],
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+function fallbackPrompt(label: string, mode: ReviewMode) {
+  return mode === 'abstract'
+    ? `In a sentence or two, what is ${label}?`
+    : `Explain ${label} in your own words: what it is, how it works, and why it matters.`;
+}
 
 export default function RetestPage() {
-  const { nodes } = useApp();
+  const { nodes, refreshGraph } = useApp();
   const navigate = useNavigate();
+  const location = useLocation();
+  const focusNodeId = (location.state as { nodeId?: string } | null)?.nodeId ?? null;
   const vw = useVW();
   const isMobile = vw < 640;
 
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [queueStatus, setQueueStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [queueError, setQueueError] = useState<string | null>(null);
+
   const [mode, setMode] = useState<ReviewMode | null>(null);
   const [queueIndex, setQueueIndex] = useState(0);
-  const [questionIndex, setQuestionIndex] = useState(0);
   const [answer, setAnswer] = useState('');
-  const [selectedOption, setSelectedOption] = useState<number | null>(null);
-  const [clozeAnswer, setClozeAnswer] = useState('');
-  const [submitted, setSubmitted] = useState(false);
-  const [selfRated, setSelfRated] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [grade, setGrade] = useState<GradeResult | null>(null);
+  const [ungraded, setUngraded] = useState(false);
   const [completed, setCompleted] = useState(false);
-  const [results, setResults] = useState<{ label: string; before: number; after: number }[]>([]);
+  const [results, setResults] = useState<SessionResult[]>([]);
+  const [probe, setProbe] = useState<Probe | null>(null);
+  const [probeStatus, setProbeStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [probeError, setProbeError] = useState<string | null>(null);
+  const [selectedOption, setSelectedOption] = useState<number | null>(null);
+  const [sortAssignment, setSortAssignment] = useState<string[]>([]);
 
-  const currentItem = QUEUE[queueIndex];
-  const nodeQuestions = QUESTIONS[currentItem?.nodeId] ?? [];
-  const questionsForMode = mode === 'abstract'
-    ? nodeQuestions.filter(q => q.type === 'abstract').slice(0, 1)
-    : nodeQuestions;
-  const currentQuestion = questionsForMode[questionIndex];
+  const loadQueue = useCallback(async () => {
+    setQueueStatus('loading');
+    setQueueError(null);
+    try {
+      const data = await api<unknown>('/api/review/queue');
+      const rawItems: unknown[] = Array.isArray(data)
+        ? data
+        : Array.isArray((data as { queue?: unknown[] })?.queue) ? (data as { queue: unknown[] }).queue
+        : Array.isArray((data as { items?: unknown[] })?.items) ? (data as { items: unknown[] }).items
+        : [];
+      const recallById = new Map(nodes.map(n => [n.id, n.recall]));
+      const subjectById = new Map(nodes.map(n => [n.id, n.subject]));
+      let items = rawItems
+        .map(r => mapQueueItem(r, recallById, subjectById))
+        .filter((i): i is QueueItem => i !== null);
+      // "Retest" from a concept panel: put that concept first (add it if the queue doesn't have it).
+      if (focusNodeId) {
+        const existing = items.find(i => i.conceptId === focusNodeId);
+        const n = nodes.find(x => x.id === focusNodeId);
+        const focused: QueueItem | null = existing ?? (n && !n.locked ? {
+          conceptId: n.id, label: n.label, recall: n.recall, subject: n.subject,
+          isDetour: false, detourReason: null, probeId: null, prompt: null,
+        } : null);
+        if (focused) items = [focused, ...items.filter(i => i.conceptId !== focusNodeId)];
+      }
+      setQueue(items);
+      setQueueStatus('ready');
+    } catch (err) {
+      setQueueError(describeApiError(err, 'Could not load your review queue.'));
+      setQueueStatus('error');
+    }
+    // nodes are read for enrichment only; don't refetch the queue on every graph refresh
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusNodeId]);
+
+  useEffect(() => { loadQueue(); }, [loadQueue]);
+
+  // Fetch a probe (question) for the current concept once a mode is chosen.
+  // Abstract mode asks for a short cloze; Understand lets the backend pick by SOLO level.
+  const currentConceptId = queue[queueIndex]?.conceptId ?? null;
+  const loadProbe = useCallback(async () => {
+    if (!mode || !currentConceptId) return;
+    setProbe(null);
+    setProbeStatus('loading');
+    setProbeError(null);
+    setSelectedOption(null);
+    setSortAssignment([]);
+    try {
+      const body: Record<string, unknown> = { concept_id: currentConceptId };
+      if (mode === 'abstract') body.probe_type = 'CLOZE';
+      const res = await api<unknown>('/api/review/probe', { method: 'POST', body });
+      const p = mapProbe(res);
+      if (!p) throw new Error('Malformed probe');
+      setProbe(p);
+      setSortAssignment(p.items.map(() => ''));
+      setProbeStatus('ready');
+    } catch (err) {
+      setProbeError(describeApiError(err, 'Could not prepare a question for this concept.'));
+      setProbeStatus('error');
+    }
+  }, [mode, currentConceptId]);
+
+  useEffect(() => { loadProbe(); }, [loadProbe]);
 
   if (!mode) {
-    return <ModeSelector onSelect={setMode} />;
+    return (
+      <ModeSelector
+        queue={queue}
+        status={queueStatus}
+        error={queueError}
+        onRetry={loadQueue}
+        onSelect={setMode}
+      />
+    );
   }
 
   if (completed) {
     return <ReviewComplete results={results} onDone={() => navigate('/brain')} />;
   }
 
-  const isFreeText = currentQuestion && !currentQuestion.cloze && !currentQuestion.options;
-  const needsSelfRating = submitted && isFreeText && !selfRated;
+  const currentItem = queue[queueIndex];
+  if (!currentItem) {
+    return <ReviewComplete results={results} onDone={() => navigate('/brain')} />;
+  }
 
-  const handleSubmit = () => setSubmitted(true);
+  const rs = recallStatus(currentItem.recall);
+  const probeId = probe?.probeId ?? currentItem.probeId;
+  const prompt = probe?.prompt || currentItem.prompt || (probeStatus === 'loading' ? 'Preparing a question…' : fallbackPrompt(currentItem.label, mode));
+  const answered = grade !== null || ungraded;
+  const isMcq = !!probe && probe.type === 'MISCONCEPTION_MCQ' && probe.options.length > 0;
+  const isSort = !!probe && probe.type === 'CONCEPT_SORT' && probe.items.length > 0;
+  const canSubmit = !!probeId && !submitting && (
+    isMcq ? selectedOption !== null
+      : isSort ? sortAssignment.length > 0 && sortAssignment.every(g => g)
+      : !!answer.trim()
+  );
 
-  const handleRate = (rating: SelfRating) => {
-    setSelfRated(true);
-    const delta = ratingConfig[rating].delta;
-    finishQuestion(delta);
-  };
-
-  const handleNextMCQ = () => {
-    const isCorrect = selectedOption === currentQuestion.correctIndex;
-    finishQuestion(isCorrect ? 15 : -3);
-  };
-
-  const handleNextCloze = () => {
-    const isCorrect = clozeAnswer.toLowerCase().trim() === currentQuestion.cloze!.blank.toLowerCase();
-    finishQuestion(isCorrect ? 12 : 0);
-  };
-
-  const finishQuestion = (delta: number) => {
-    const nextQ = questionIndex + 1;
-    if (nextQ < questionsForMode.length) {
-      setQuestionIndex(nextQ);
-      setAnswer(''); setSelectedOption(null); setClozeAnswer('');
-      setSubmitted(false); setSelfRated(false);
-    } else {
-      const newResult = {
-        label: currentItem.label,
-        before: currentItem.recall,
-        after: Math.max(0, Math.min(100, currentItem.recall + delta)),
-      };
-      setResults(prev => [...prev, newResult]);
-      const nextNode = queueIndex + 1;
-      if (nextNode >= QUEUE.length) {
-        setCompleted(true);
-      } else {
-        setQueueIndex(nextNode);
-        setQuestionIndex(0);
-        setAnswer(''); setSelectedOption(null); setClozeAnswer('');
-        setSubmitted(false); setSelfRated(false);
-      }
+  const handleSubmit = async () => {
+    if (!canSubmit || !probeId) return;
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      const body: Record<string, unknown> = { probe_id: probeId };
+      if (isMcq) body.answer_payload = { selected_index: selectedOption };
+      else if (isSort) body.answer_payload = { assignment: sortAssignment };
+      else body.answer_text = answer.trim();
+      const res = await api<unknown>('/api/review/answer', { method: 'POST', body });
+      if (isGrade(res)) setGrade(res);
+      else setUngraded(true);
+    } catch (err) {
+      setSubmitError(describeApiError(err, 'Could not submit your answer.'));
+    } finally {
+      setSubmitting(false);
     }
   };
 
-  if (!currentQuestion) { finishQuestion(0); return null; }
+  const advance = (skipped = false) => {
+    setResults(prev => [...prev, {
+      label: currentItem.label,
+      band: !skipped && grade?.band ? grade.band : null,
+      passed: !skipped && grade && typeof grade.passed === 'boolean' ? grade.passed : null,
+      before: currentItem.recall,
+    }]);
+    setAnswer('');
+    setGrade(null);
+    setUngraded(false);
+    setSubmitError(null);
+    if (queueIndex + 1 >= queue.length) {
+      setCompleted(true);
+      refreshGraph();
+    } else {
+      setQueueIndex(queueIndex + 1);
+    }
+  };
 
-  const node = nodes.find(n => n.id === currentItem.nodeId);
-  const rs = recallStatus(node?.recall ?? null);
-  const totalQ = QUEUE.reduce((s, item) => s + (QUESTIONS[item.nodeId]?.length ?? 0), 0);
-  const doneQ = results.length > 0
-    ? QUEUE.slice(0, queueIndex).reduce((s, item) => s + (QUESTIONS[item.nodeId]?.length ?? 0), 0) + questionIndex
-    : questionIndex;
+  const missing = grade?.gap_report?.missing_claims ?? [];
 
-  /* ── Mobile layout ── */
-  if (isMobile) {
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--bg)' }}>
-        {/* Mobile top bar */}
-        <div style={{
-          height: 52, flexShrink: 0, display: 'flex', alignItems: 'center',
-          padding: '0 14px', borderBottom: '1px solid var(--border)',
-          background: 'var(--bg-elevated)',
-        }}>
-          {/* Progress dots */}
-          <div style={{ display: 'flex', gap: 5, flex: 1 }}>
-            {QUEUE.map((item, i) => {
-              const done = i < queueIndex || results.some(r => r.label === item.label);
-              const active = i === queueIndex;
-              const irs = recallStatus(item.recall);
-              return (
-                <div key={item.nodeId} style={{
-                  width: 8, height: 8, borderRadius: '50%',
-                  background: done ? 'var(--green)' : active ? irs.color : 'var(--bg-input)',
-                  border: `1.5px solid ${done ? 'var(--green)' : active ? irs.color : 'var(--border-strong)'}`,
-                  transition: 'all 0.2s',
-                }} />
-              );
-            })}
-          </div>
-          {/* Concept name centered */}
-          <div style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>
-            {currentItem.label}
-          </div>
-          {/* Exit button */}
-          <button
-            onClick={() => navigate('/brain')}
-            style={{
-              width: 32, height: 32, borderRadius: 8, background: 'transparent',
-              border: '1px solid var(--border)', color: 'var(--text-muted)',
-              cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-              flexShrink: 0,
-            }}
-          >
-            <XIcon size={14} />
-          </button>
-        </div>
-
-        {/* Mobile main content */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '20px 16px' }}>
-          {/* Question card */}
-          <div style={{
-            background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-            borderRadius: 16, padding: '20px 16px', marginBottom: 16,
-          }}>
-            {/* Type badge */}
-            <div style={{
-              display: 'inline-flex', alignItems: 'center', gap: 6,
-              padding: '4px 10px', borderRadius: 6, marginBottom: 16,
-              background: rs.color + '18', border: `1px solid ${rs.color}40`,
-              fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: rs.color,
-            }}>
-              {currentQuestion.type === 'abstract' ? '⚡ Recall'
-                : currentQuestion.type === 'explain' ? '💬 Explain'
-                : currentQuestion.type === 'counterfactual' ? '🔀 Counterfactual'
-                : '🔁 Transfer'}
-            </div>
-
-            <p style={{ fontSize: 15, color: 'var(--text)', lineHeight: 1.65, margin: '0 0 20px', whiteSpace: 'pre-line', fontWeight: 400 }}>
-              {currentQuestion.question}
-            </p>
-
-            {/* Cloze */}
-            {currentQuestion.cloze && (
-              <div style={{ padding: '14px 14px', borderRadius: 10, background: 'var(--bg)', border: '1px solid var(--border)', fontSize: 14, color: 'var(--text-2)', lineHeight: 2.2 }}>
-                {currentQuestion.cloze.before}{' '}
-                <input
-                  value={clozeAnswer}
-                  onChange={e => setClozeAnswer(e.target.value)}
-                  disabled={submitted}
-                  onKeyDown={e => e.key === 'Enter' && !submitted && handleSubmit()}
-                  placeholder="________"
-                  style={{
-                    padding: '5px 10px', borderRadius: 7,
-                    border: submitted
-                      ? clozeAnswer.toLowerCase().trim() === currentQuestion.cloze!.blank.toLowerCase()
-                        ? '2px solid var(--green)' : '2px solid var(--red)'
-                      : '1.5px solid var(--border-strong)',
-                    background: 'var(--bg-input)', color: 'var(--text)', fontSize: 13,
-                    fontFamily: 'inherit', outline: 'none', minWidth: 100,
-                  }}
-                />
-                {', '}{currentQuestion.cloze.after}
-              </div>
-            )}
-
-            {/* MCQ */}
-            {currentQuestion.options && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {currentQuestion.options.map((opt, i) => {
-                  const isCorrect = i === currentQuestion.correctIndex;
-                  const isSelected = selectedOption === i;
-                  let bg = 'var(--bg)';
-                  let borderColor = 'var(--border)';
-                  let textColor = 'var(--text-2)';
-                  if (submitted) {
-                    if (isCorrect) { bg = 'rgba(88,204,2,0.1)'; borderColor = 'var(--green)'; textColor = 'var(--text)'; }
-                    else if (isSelected) { bg = 'rgba(255,75,75,0.08)'; borderColor = 'var(--red)'; }
-                  } else if (isSelected) {
-                    bg = rs.color + '10'; borderColor = rs.color; textColor = 'var(--text)';
-                  }
-                  return (
-                    <button
-                      key={i}
-                      onClick={() => !submitted && setSelectedOption(i)}
-                      style={{
-                        padding: '12px 14px', borderRadius: 10, textAlign: 'left',
-                        background: bg, border: `1.5px solid ${borderColor}`,
-                        color: textColor, cursor: submitted ? 'default' : 'pointer',
-                        fontSize: 13, fontFamily: 'inherit', lineHeight: 1.5,
-                        transition: 'all 0.18s', display: 'flex', alignItems: 'center', gap: 10,
-                      }}
-                    >
-                      <span style={{
-                        width: 20, height: 20, borderRadius: '50%', flexShrink: 0,
-                        border: `1.5px solid ${submitted && isCorrect ? 'var(--green)' : submitted && isSelected ? 'var(--red)' : isSelected ? rs.color : 'var(--border-strong)'}`,
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        background: submitted && isCorrect ? 'rgba(88,204,2,0.2)' : submitted && isSelected ? 'rgba(255,75,75,0.2)' : 'transparent',
-                        fontSize: 10, color: submitted && isCorrect ? 'var(--green)' : submitted && isSelected ? 'var(--red)' : 'var(--text-dim)',
-                        fontWeight: 700,
-                      }}>
-                        {submitted && isCorrect ? '✓' : submitted && isSelected && !isCorrect ? '✗' : ['A', 'B', 'C', 'D'][i]}
-                      </span>
-                      {opt}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* Free text */}
-            {isFreeText && (
-              <textarea
-                value={answer}
-                onChange={e => setAnswer(e.target.value)}
-                disabled={submitted}
-                placeholder="Write your explanation here..."
-                rows={5}
-                style={{
-                  width: '100%', padding: '12px 14px', borderRadius: 10,
-                  background: 'var(--bg)', border: '1.5px solid var(--border)',
-                  color: 'var(--text)', fontSize: 14, fontFamily: 'inherit',
-                  resize: 'vertical', outline: 'none', boxSizing: 'border-box', lineHeight: 1.65,
-                  transition: 'border-color 0.15s',
-                }}
-                onFocus={e => (e.currentTarget as HTMLElement).style.borderColor = rs.color}
-                onBlur={e => (e.currentTarget as HTMLElement).style.borderColor = 'var(--border)'}
-              />
-            )}
-
-            {/* Model answer */}
-            {submitted && (
-              <div style={{
-                marginTop: 16, padding: '14px 14px', borderRadius: 10,
-                background: 'rgba(88,204,2,0.07)', border: '1px solid rgba(88,204,2,0.25)',
-                animation: 'fadeUp 0.3s ease',
-              }}>
-                <div style={{ fontWeight: 700, color: 'var(--green)', marginBottom: 8, fontSize: 11, letterSpacing: '0.05em', textTransform: 'uppercase' }}>Model Answer</div>
-                <div style={{ fontSize: 13, color: 'var(--text-2)', lineHeight: 1.65 }}>{currentQuestion.explanation}</div>
-              </div>
-            )}
-          </div>
-
-          {/* Self-rating (free-text only) — mobile: tighter padding */}
-          {needsSelfRating && (
-            <div style={{ marginBottom: 16, animation: 'fadeUp 0.25s ease' }}>
-              <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 10, textAlign: 'center' }}>How well did you know this?</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
-                {(Object.entries(ratingConfig) as [SelfRating, typeof ratingConfig[SelfRating]][]).map(([key, cfg]) => (
-                  <button
-                    key={key}
-                    onClick={() => handleRate(key)}
-                    style={{
-                      padding: '10px 6px', borderRadius: 12,
-                      background: cfg.bg, border: `1.5px solid ${cfg.color}50`,
-                      color: cfg.color, cursor: 'pointer', fontFamily: 'inherit',
-                      fontSize: 12, fontWeight: 700, transition: 'all 0.15s',
-                    }}
-                  >{cfg.label}</button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Action buttons — mobile: full width */}
-          {!needsSelfRating && (
-            <div style={{ display: 'flex', gap: 10 }}>
-              {!submitted ? (
-                <button
-                  onClick={handleSubmit}
-                  disabled={currentQuestion.options ? selectedOption === null : currentQuestion.cloze ? !clozeAnswer.trim() : !answer.trim()}
-                  style={{
-                    flex: 1, padding: '13px', borderRadius: 12, background: rs.color,
-                    color: '#fff', border: 'none', cursor: 'pointer', fontSize: 15,
-                    fontWeight: 700, fontFamily: 'inherit', transition: 'opacity 0.15s',
-                    opacity: (currentQuestion.options ? selectedOption === null : currentQuestion.cloze ? !clozeAnswer.trim() : !answer.trim()) ? 0.45 : 1,
-                  }}
-                >Submit</button>
-              ) : !isFreeText ? (
-                <button
-                  onClick={currentQuestion.cloze ? handleNextCloze : handleNextMCQ}
-                  style={{
-                    flex: 1, padding: '13px', borderRadius: 12, background: 'var(--green)',
-                    color: '#fff', border: 'none', cursor: 'pointer', fontSize: 15,
-                    fontWeight: 700, fontFamily: 'inherit',
-                  }}
-                >Next →</button>
-              ) : selfRated ? (
-                <div style={{ fontSize: 13, color: 'var(--text-dim)', padding: '13px 0' }}>Moving on...</div>
-              ) : null}
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  /* ── Desktop layout ── */
   return (
-    <div style={{ display: 'flex', height: '100%', background: 'var(--bg)' }}>
-
-      {/* ── Left sidebar ── */}
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--bg)' }}>
+      {/* Top bar */}
       <div style={{
-        width: 280, flexShrink: 0, borderRight: '1px solid var(--border)',
-        background: 'var(--bg-elevated)', display: 'flex', flexDirection: 'column',
-        padding: '24px 18px', gap: 20,
+        height: isMobile ? 52 : 60, flexShrink: 0, display: 'flex', alignItems: 'center',
+        padding: isMobile ? '0 14px' : '0 28px', borderBottom: '1px solid var(--border)',
+        background: 'var(--bg-elevated)', position: 'relative', gap: 12,
       }}>
-        {/* Session header */}
-        <div>
-          <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: '-0.02em', color: 'var(--text)', marginBottom: 4 }}>Review Session</div>
-          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16 }}>{mode === 'abstract' ? 'Abstract' : 'Understand'} mode · {QUEUE.length} concepts</div>
-
-          {/* Overall progress bar */}
-          <div style={{ marginBottom: 4 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-dim)', marginBottom: 6 }}>
-              <span>Progress</span>
-              <span>{results.length}/{QUEUE.length} concepts</span>
-            </div>
-            <div style={{ height: 5, background: 'var(--bg-input)', borderRadius: 3, overflow: 'hidden' }}>
-              <div style={{ height: '100%', borderRadius: 3, background: 'var(--green)', width: `${(results.length / QUEUE.length) * 100}%`, transition: 'width 0.5s ease' }} />
-            </div>
-          </div>
-        </div>
-
-        {/* Concept queue */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 4 }}>Queue</div>
-          {QUEUE.map((item, i) => {
-            const done = i < queueIndex || results.some(r => r.label === item.label);
+        <div style={{ display: 'flex', gap: 5, flex: 1, flexWrap: 'wrap' }}>
+          {queue.map((item, i) => {
+            const done = i < queueIndex;
             const active = i === queueIndex;
             const irs = recallStatus(item.recall);
-            const result = results.find(r => r.label === item.label);
             return (
-              <div key={item.nodeId} style={{
-                padding: '10px 12px', borderRadius: 10,
-                background: active ? 'var(--bg-input)' : 'transparent',
-                border: `1px solid ${active ? 'var(--border-strong)' : 'transparent'}`,
-                display: 'flex', alignItems: 'center', gap: 10,
-                opacity: done && !active ? 0.6 : 1,
+              <div key={item.conceptId} title={item.label} style={{
+                width: 8, height: 8, borderRadius: '50%',
+                background: done ? 'var(--green)' : active ? irs.color : 'var(--bg-input)',
+                border: `1.5px solid ${done ? 'var(--green)' : active ? irs.color : 'var(--border-strong)'}`,
                 transition: 'all 0.2s',
-              }}>
-                <div style={{
-                  width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
-                  border: `2px solid ${done ? 'var(--green)' : active ? irs.color : 'var(--border-strong)'}`,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  background: done ? 'rgba(88,204,2,0.12)' : 'transparent',
-                }}>
-                  {done
-                    ? <Check size={12} strokeWidth={2.5} style={{ color: 'var(--green)' }} />
-                    : <span style={{ fontSize: 10, fontWeight: 700, color: active ? irs.color : 'var(--text-dim)' }}>{item.recall}%</span>
-                  }
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: active ? 600 : 400, color: active ? 'var(--text)' : 'var(--text-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.label}</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>{item.subject}</div>
-                </div>
-                {result && (
-                  <span style={{ fontSize: 11, fontWeight: 700, color: result.after > result.before ? 'var(--green)' : 'var(--red)', flexShrink: 0 }}>
-                    {result.after > result.before ? '+' : ''}{result.after - result.before}%
-                  </span>
-                )}
-              </div>
+              }} />
             );
           })}
         </div>
-
-        {/* Exit */}
+        <div style={{ fontSize: isMobile ? 14 : 15, fontWeight: 700, color: 'var(--text)', maxWidth: '50%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {currentItem.label}
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--text-dim)', flexShrink: 0 }}>{queueIndex + 1}/{queue.length}</div>
         <button
           onClick={() => navigate('/brain')}
+          aria-label="Exit review"
           style={{
-            padding: '9px', borderRadius: 8, background: 'transparent',
+            width: 32, height: 32, borderRadius: 8, background: 'transparent',
             border: '1px solid var(--border)', color: 'var(--text-muted)',
-            cursor: 'pointer', fontSize: 13, fontFamily: 'inherit',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-            transition: 'background 0.15s, color 0.15s',
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
           }}
-          onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'var(--bg-input)'; (e.currentTarget as HTMLElement).style.color = 'var(--text)'; }}
-          onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent'; (e.currentTarget as HTMLElement).style.color = 'var(--text-muted)'; }}
         >
-          <XIcon size={14} /> Exit Session
+          <XIcon size={14} />
         </button>
       </div>
 
-      {/* ── Main content ── */}
-      <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '48px 48px' }}>
-        <div style={{ width: '100%', maxWidth: 760 }}>
+      {/* Main */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: isMobile ? '20px 16px' : '40px 28px', display: 'flex', justifyContent: 'center' }}>
+        <div style={{ width: '100%', maxWidth: 720 }}>
+          {currentItem.isDetour && currentItem.detourReason && (
+            <div style={{ marginBottom: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(28,176,246,0.06)', border: '1px solid rgba(28,176,246,0.2)', fontSize: 13, color: 'var(--text-2)' }}>
+              {currentItem.detourReason}
+            </div>
+          )}
 
-          {/* Concept header */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 36 }}>
-            <div style={{
-              width: 52, height: 52, borderRadius: '50%',
-              border: `2.5px solid ${rs.color}`,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              background: rs.color + '12', flexShrink: 0,
-            }}>
-              <span style={{ fontSize: 14, fontWeight: 800, color: rs.color }}>{currentItem.recall}%</span>
-            </div>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 22, fontWeight: 800, color: 'var(--text)', letterSpacing: '-0.02em', lineHeight: 1.2 }}>{currentItem.label}</div>
-              <div style={{ fontSize: 12, color: rs.color, fontWeight: 600, marginTop: 2 }}>{rs.label} · {currentItem.subject}</div>
-            </div>
-            {/* Question counter */}
-            <div style={{ display: 'flex', gap: 6 }}>
-              {questionsForMode.map((_, i) => (
-                <div key={i} style={{
-                  width: i === questionIndex ? 20 : 8, height: 8, borderRadius: 4,
-                  background: i < questionIndex ? 'var(--green)' : i === questionIndex ? rs.color : 'var(--bg-input)',
-                  transition: 'all 0.3s',
-                }} />
-              ))}
-            </div>
-          </div>
-
-          {/* Question card */}
-          <div style={{
-            background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-            borderRadius: 18, padding: '32px 36px', marginBottom: 20,
-          }}>
-            {/* Type badge */}
-            <div style={{
-              display: 'inline-flex', alignItems: 'center', gap: 6,
-              padding: '4px 12px', borderRadius: 6, marginBottom: 20,
-              background: rs.color + '18', border: `1px solid ${rs.color}40`,
-              fontSize: 11, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: rs.color,
-            }}>
-              {currentQuestion.type === 'abstract' ? '⚡ Recall'
-                : currentQuestion.type === 'explain' ? '💬 Explain'
-                : currentQuestion.type === 'counterfactual' ? '🔀 Counterfactual'
-                : '🔁 Transfer'}
+          <div style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 16, padding: isMobile ? '20px 16px' : '28px 28px', marginBottom: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+              <div style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 6,
+                background: rs.color + '18', border: `1px solid ${rs.color}40`,
+                fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: rs.color,
+              }}>
+                {mode === 'abstract' ? '⚡ Recall' : '💬 Explain'}
+              </div>
+              <span style={{ fontSize: 11, color: rs.color, fontWeight: 600 }}>
+                {currentItem.recall !== null ? `${currentItem.recall}% · ${rs.label}` : 'Not reviewed yet'}
+              </span>
+              {currentItem.subject && <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>{currentItem.subject}</span>}
             </div>
 
-            <p style={{ fontSize: 17, color: 'var(--text)', lineHeight: 1.65, margin: '0 0 24px', whiteSpace: 'pre-line', fontWeight: 400 }}>
-              {currentQuestion.question}
-            </p>
+            <p style={{ fontSize: 15, color: 'var(--text)', lineHeight: 1.65, margin: '0 0 20px', whiteSpace: 'pre-line' }}>{prompt}</p>
 
-            {/* Cloze */}
-            {currentQuestion.cloze && (
-              <div style={{ padding: '18px 20px', borderRadius: 10, background: 'var(--bg)', border: '1px solid var(--border)', fontSize: 15, color: 'var(--text-2)', lineHeight: 2.2 }}>
-                {currentQuestion.cloze.before}{' '}
-                <input
-                  value={clozeAnswer}
-                  onChange={e => setClozeAnswer(e.target.value)}
-                  disabled={submitted}
-                  onKeyDown={e => e.key === 'Enter' && !submitted && handleSubmit()}
-                  placeholder="________"
-                  style={{
-                    padding: '5px 12px', borderRadius: 7,
-                    border: submitted
-                      ? clozeAnswer.toLowerCase().trim() === currentQuestion.cloze!.blank.toLowerCase()
-                        ? '2px solid var(--green)' : '2px solid var(--red)'
-                      : '1.5px solid var(--border-strong)',
-                    background: 'var(--bg-input)', color: 'var(--text)', fontSize: 14,
-                    fontFamily: 'inherit', outline: 'none', minWidth: 130,
-                  }}
-                />
-                {', '}{currentQuestion.cloze.after}
+            {probeStatus === 'error' && (
+              <div role="alert" style={{ marginBottom: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(255,75,75,0.08)', border: '1px solid rgba(255,75,75,0.3)', fontSize: 13, color: 'var(--red)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                <span>{probeError}</span>
+                <button onClick={loadProbe} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderRadius: 8, background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--text-2)', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}>
+                  <RefreshCw size={12} /> Retry
+                </button>
               </div>
             )}
 
-            {/* MCQ */}
-            {currentQuestion.options && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {currentQuestion.options.map((opt, i) => {
-                  const isCorrect = i === currentQuestion.correctIndex;
-                  const isSelected = selectedOption === i;
-                  let bg = 'var(--bg)';
-                  let borderColor = 'var(--border)';
-                  let textColor = 'var(--text-2)';
-                  if (submitted) {
-                    if (isCorrect) { bg = 'rgba(88,204,2,0.1)'; borderColor = 'var(--green)'; textColor = 'var(--text)'; }
-                    else if (isSelected) { bg = 'rgba(255,75,75,0.08)'; borderColor = 'var(--red)'; }
-                  } else if (isSelected) {
-                    bg = rs.color + '10'; borderColor = rs.color; textColor = 'var(--text)';
-                  }
+            {isMcq ? (
+              <fieldset style={{ border: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <legend style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>Choose one answer</legend>
+                {probe!.options.map((opt, i) => {
+                  const selected = selectedOption === i;
                   return (
-                    <button
-                      key={i}
-                      onClick={() => !submitted && setSelectedOption(i)}
-                      style={{
-                        padding: '14px 18px', borderRadius: 10, textAlign: 'left',
-                        background: bg, border: `1.5px solid ${borderColor}`,
-                        color: textColor, cursor: submitted ? 'default' : 'pointer',
-                        fontSize: 14, fontFamily: 'inherit', lineHeight: 1.5,
-                        transition: 'all 0.18s', display: 'flex', alignItems: 'center', gap: 12,
-                      }}
-                      onMouseEnter={e => { if (!submitted) (e.currentTarget as HTMLElement).style.borderColor = rs.color; }}
-                      onMouseLeave={e => { if (!submitted && selectedOption !== i) (e.currentTarget as HTMLElement).style.borderColor = 'var(--border)'; }}
-                    >
-                      <span style={{
-                        width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
-                        border: `1.5px solid ${submitted && isCorrect ? 'var(--green)' : submitted && isSelected ? 'var(--red)' : isSelected ? rs.color : 'var(--border-strong)'}`,
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        background: submitted && isCorrect ? 'rgba(88,204,2,0.2)' : submitted && isSelected ? 'rgba(255,75,75,0.2)' : 'transparent',
-                        fontSize: 11, color: submitted && isCorrect ? 'var(--green)' : submitted && isSelected ? 'var(--red)' : 'var(--text-dim)',
-                        fontWeight: 700,
-                      }}>
-                        {submitted && isCorrect ? '✓' : submitted && isSelected && !isCorrect ? '✗' : ['A', 'B', 'C', 'D'][i]}
-                      </span>
-                      {opt}
-                    </button>
+                    <label key={i} style={{
+                      display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 12px', borderRadius: 10,
+                      border: `1.5px solid ${selected ? rs.color : 'var(--border)'}`, background: 'var(--bg)',
+                      cursor: answered || submitting ? 'default' : 'pointer', fontSize: 14, color: 'var(--text)', lineHeight: 1.5,
+                    }}>
+                      <input
+                        type="radio" name="retest-mcq" checked={selected}
+                        disabled={answered || submitting}
+                        onChange={() => setSelectedOption(i)}
+                        style={{ marginTop: 3 }}
+                      />
+                      <span>{opt}</span>
+                    </label>
                   );
                 })}
+              </fieldset>
+            ) : isSort ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>Put each item into a group (A, B or C) so items that work the same way end up together.</div>
+                {probe!.items.map((item, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 10, border: '1px solid var(--border)', background: 'var(--bg)' }}>
+                    <span style={{ flex: 1, fontSize: 14, color: 'var(--text)' }}>{item}</span>
+                    <label htmlFor={`sort-${i}`} style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>Group for item {i + 1}</label>
+                    <select
+                      id={`sort-${i}`}
+                      value={sortAssignment[i] ?? ''}
+                      disabled={answered || submitting}
+                      onChange={e => setSortAssignment(prev => prev.map((g, j) => (j === i ? e.target.value : g)))}
+                      style={{ padding: '6px 8px', borderRadius: 8, background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--text)', fontFamily: 'inherit' }}
+                    >
+                      <option value="">Group…</option>
+                      {SORT_GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <>
+                <label htmlFor="retest-answer" style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>Your answer</label>
+                <textarea
+                  id="retest-answer"
+                  value={answer}
+                  onChange={e => setAnswer(e.target.value)}
+                  disabled={answered || submitting || probeStatus !== 'ready'}
+                  placeholder={mode === 'abstract' ? 'Type a short answer...' : 'Write your explanation here...'}
+                  rows={mode === 'abstract' ? 3 : 6}
+                  style={{
+                    width: '100%', padding: '12px 14px', borderRadius: 10,
+                    background: 'var(--bg)', border: '1.5px solid var(--border)',
+                    color: 'var(--text)', fontSize: 14, fontFamily: 'inherit',
+                    resize: 'vertical', outline: 'none', boxSizing: 'border-box', lineHeight: 1.65,
+                  }}
+                  onFocus={e => (e.currentTarget as HTMLElement).style.borderColor = rs.color}
+                  onBlur={e => (e.currentTarget as HTMLElement).style.borderColor = 'var(--border)'}
+                />
+              </>
+            )}
+
+            {submitError && (
+              <div role="alert" style={{ marginTop: 12, padding: '10px 14px', borderRadius: 10, background: 'rgba(255,75,75,0.08)', border: '1px solid rgba(255,75,75,0.3)', fontSize: 13, color: 'var(--red)' }}>
+                {submitError}
               </div>
             )}
 
-            {/* Free text */}
-            {isFreeText && (
-              <textarea
-                value={answer}
-                onChange={e => setAnswer(e.target.value)}
-                disabled={submitted}
-                placeholder="Write your explanation here..."
-                rows={6}
-                style={{
-                  width: '100%', padding: '14px 16px', borderRadius: 10,
-                  background: 'var(--bg)', border: '1.5px solid var(--border)',
-                  color: 'var(--text)', fontSize: 14, fontFamily: 'inherit',
-                  resize: 'vertical', outline: 'none', boxSizing: 'border-box', lineHeight: 1.65,
-                  transition: 'border-color 0.15s',
-                }}
-                onFocus={e => (e.currentTarget as HTMLElement).style.borderColor = rs.color}
-                onBlur={e => (e.currentTarget as HTMLElement).style.borderColor = 'var(--border)'}
-              />
+            {grade && (
+              <div style={{ marginTop: 16, padding: '14px 14px', borderRadius: 10, background: grade.passed ? 'rgba(88,204,2,0.07)' : 'rgba(255,150,0,0.07)', border: `1px solid ${grade.passed ? 'rgba(88,204,2,0.25)' : 'rgba(255,150,0,0.3)'}`, animation: 'fadeUp 0.3s ease' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: missing.length || grade.mastery?.newly_mastered ? 10 : 0 }}>
+                  <span style={{ fontWeight: 700, color: grade.passed ? 'var(--green)' : 'var(--orange)', fontSize: 11, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                    {grade.passed ? 'Passed' : 'Not yet'}{grade.band ? ` · ${bandLabel(grade.band)}` : ''}
+                  </span>
+                  {grade.solo_level && <span style={{ fontSize: 12, color: 'var(--text-dim)' }}>{grade.solo_level}</span>}
+                </div>
+                {grade.mastery?.newly_mastered && (
+                  <div style={{ fontSize: 13, color: 'var(--green)', fontWeight: 600, marginBottom: missing.length ? 10 : 0 }}>Concept mastered. It leaves your review queue.</div>
+                )}
+                {missing.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-dim)', marginBottom: 6, letterSpacing: '0.05em', textTransform: 'uppercase' }}>What to add</div>
+                    <ul style={{ margin: 0, paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      {missing.map((m, i) => (
+                        <li key={i} style={{ fontSize: 13, color: 'var(--text-2)', lineHeight: 1.55 }}>
+                          {m.hint || m.category || 'A key idea is missing'}
+                          {m.prerequisite_concept_label ? ` (review ${m.prerequisite_concept_label} first)` : ''}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
             )}
 
-            {/* Model answer */}
-            {submitted && (
-              <div style={{
-                marginTop: 20, padding: '16px 18px', borderRadius: 10,
-                background: 'rgba(88,204,2,0.07)', border: '1px solid rgba(88,204,2,0.25)',
-                animation: 'fadeUp 0.3s ease',
-              }}>
-                <div style={{ fontWeight: 700, color: 'var(--green)', marginBottom: 8, fontSize: 12, letterSpacing: '0.05em', textTransform: 'uppercase' }}>Model Answer</div>
-                <div style={{ fontSize: 14, color: 'var(--text-2)', lineHeight: 1.65 }}>{currentQuestion.explanation}</div>
+            {ungraded && (
+              <div style={{ marginTop: 16, padding: '12px 14px', borderRadius: 10, background: 'var(--bg)', border: '1px solid var(--border)', fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.55 }}>
+                Answer received, but automatic grading isn&apos;t available for this concept yet, so it wasn&apos;t scored.
               </div>
             )}
           </div>
 
-          {/* Self-rating (free-text only) */}
-          {needsSelfRating && (
-            <div style={{ marginBottom: 20, animation: 'fadeUp 0.25s ease' }}>
-              <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12, textAlign: 'center' }}>How well did you know this?</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
-                {(Object.entries(ratingConfig) as [SelfRating, typeof ratingConfig[SelfRating]][]).map(([key, cfg]) => (
-                  <button
-                    key={key}
-                    onClick={() => handleRate(key)}
-                    style={{
-                      padding: '14px 10px', borderRadius: 12,
-                      background: cfg.bg, border: `1.5px solid ${cfg.color}50`,
-                      color: cfg.color, cursor: 'pointer', fontFamily: 'inherit',
-                      fontSize: 13, fontWeight: 700, transition: 'all 0.15s',
-                    }}
-                    onMouseEnter={e => { (e.currentTarget as HTMLElement).style.border = `1.5px solid ${cfg.color}`; (e.currentTarget as HTMLElement).style.transform = 'translateY(-2px)'; }}
-                    onMouseLeave={e => { (e.currentTarget as HTMLElement).style.border = `1.5px solid ${cfg.color}50`; (e.currentTarget as HTMLElement).style.transform = 'translateY(0)'; }}
-                  >{cfg.label}</button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Action buttons */}
-          {!needsSelfRating && (
-            <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
-              {!submitted ? (
+          <div style={{ display: 'flex', gap: 10 }}>
+            {!answered ? (
+              <>
+                <button
+                  onClick={() => advance(true)}
+                  style={{ flex: 1, padding: '13px', borderRadius: 12, background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--text-2)', cursor: 'pointer', fontSize: 14, fontWeight: 600, fontFamily: 'inherit' }}
+                >Skip</button>
                 <button
                   onClick={handleSubmit}
-                  disabled={currentQuestion.options ? selectedOption === null : currentQuestion.cloze ? !clozeAnswer.trim() : !answer.trim()}
+                  disabled={!canSubmit}
                   style={{
-                    padding: '13px 36px', borderRadius: 12, background: rs.color,
-                    color: '#fff', border: 'none', cursor: 'pointer', fontSize: 15,
-                    fontWeight: 700, fontFamily: 'inherit', transition: 'opacity 0.15s',
-                    opacity: (currentQuestion.options ? selectedOption === null : currentQuestion.cloze ? !clozeAnswer.trim() : !answer.trim()) ? 0.45 : 1,
+                    flex: 2, padding: '13px', borderRadius: 12, background: rs.color, color: '#fff', border: 'none',
+                    cursor: !canSubmit ? 'not-allowed' : 'pointer', opacity: !canSubmit ? 0.5 : 1,
+                    fontSize: 14, fontWeight: 700, fontFamily: 'inherit',
                   }}
-                >Submit</button>
-              ) : !isFreeText ? (
-                <button
-                  onClick={currentQuestion.cloze ? handleNextCloze : handleNextMCQ}
-                  style={{
-                    padding: '13px 36px', borderRadius: 12, background: 'var(--green)',
-                    color: '#fff', border: 'none', cursor: 'pointer', fontSize: 15,
-                    fontWeight: 700, fontFamily: 'inherit',
-                  }}
-                >Next →</button>
-              ) : selfRated ? (
-                <div style={{ fontSize: 13, color: 'var(--text-dim)', padding: '13px 0' }}>Moving on...</div>
-              ) : null}
-            </div>
-          )}
+                >{submitting ? 'Checking…' : 'Submit answer'}</button>
+              </>
+            ) : (
+              <button
+                onClick={() => advance(false)}
+                style={{ flex: 1, padding: '13px', borderRadius: 12, background: 'var(--green)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 14, fontWeight: 700, fontFamily: 'inherit' }}
+              >{queueIndex + 1 >= queue.length ? 'Finish session →' : 'Next concept →'}</button>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -725,10 +495,17 @@ export default function RetestPage() {
 }
 
 /* ── Mode Selector ── */
-function ModeSelector({ onSelect }: { onSelect: (m: ReviewMode) => void }) {
+function ModeSelector({ queue, status, error, onRetry, onSelect }: {
+  queue: QueueItem[];
+  status: 'loading' | 'ready' | 'error';
+  error: string | null;
+  onRetry: () => void;
+  onSelect: (m: ReviewMode) => void;
+}) {
   const navigate = useNavigate();
   const vw = useVW();
   const isMobile = vw < 640;
+  const shown = queue.slice(0, 8);
 
   return (
     <div style={{ height: '100%', overflowY: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: isMobile ? '32px 16px' : '48px 40px', background: 'var(--bg)' }}>
@@ -739,55 +516,70 @@ function ModeSelector({ onSelect }: { onSelect: (m: ReviewMode) => void }) {
             <Target size={isMobile ? 32 : 40} strokeWidth={1.4} />
           </div>
           <h1 style={{ fontSize: isMobile ? 28 : 36, fontWeight: 800, margin: '0 0 12px', letterSpacing: '-0.03em', color: 'var(--text)' }}>Retest</h1>
-          <p style={{ fontSize: 15, color: 'var(--text-muted)', margin: 0 }}>
-            {QUEUE.length} concepts due for review
+          <p role="status" style={{ fontSize: 15, color: 'var(--text-muted)', margin: 0 }}>
+            {status === 'loading' ? 'Loading your review queue…'
+              : status === 'error' ? (error || 'Could not load your review queue.')
+              : queue.length === 0 ? 'Nothing is due for review right now.'
+              : `${queue.length} concept${queue.length === 1 ? '' : 's'} due for review`}
           </p>
+          {status === 'error' && (
+            <button onClick={onRetry} style={{ marginTop: 14, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 14px', borderRadius: 8, background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--text-2)', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>
+              <RefreshCw size={13} /> Retry
+            </button>
+          )}
         </div>
 
-        {/* Queue cards — mobile: 2x2, desktop: 4x1 */}
-        <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr 1fr' : 'repeat(4, 1fr)', gap: 12, marginBottom: isMobile ? 28 : 48 }}>
-          {QUEUE.map(item => {
-            const rs = recallStatus(item.recall);
-            const hex = item.recall >= 75 ? '#58CC02' : item.recall >= 50 ? '#FF9600' : '#FF4B4B';
-            return (
-              <div key={item.nodeId} style={{
-                padding: isMobile ? '14px 12px' : '18px 16px', borderRadius: 14,
-                background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-              }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10 }}>
-                  <span style={{ fontSize: isMobile ? 13 : 14, fontWeight: 600, color: 'var(--text)' }}>{item.label}</span>
-                  <span style={{ fontSize: 12, color: rs.color, fontWeight: 700 }}>{item.recall}%</span>
+        {/* Queue cards */}
+        {shown.length > 0 && (
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr 1fr' : 'repeat(4, 1fr)', gap: 12, marginBottom: isMobile ? 28 : 48 }}>
+            {shown.map(item => {
+              const rs = recallStatus(item.recall);
+              const r = item.recall;
+              const hex = r === null ? '#6B7280' : r >= 75 ? '#58CC02' : r >= 50 ? '#FF9600' : '#FF4B4B';
+              return (
+                <div key={item.conceptId} style={{
+                  padding: isMobile ? '14px 12px' : '18px 16px', borderRadius: 14,
+                  background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10, gap: 6 }}>
+                    <span style={{ fontSize: isMobile ? 13 : 14, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.label}</span>
+                    <span style={{ fontSize: 12, color: rs.color, fontWeight: 700, flexShrink: 0 }}>{r !== null ? `${r}%` : '—'}</span>
+                  </div>
+                  <div style={{ height: 5, background: 'var(--bg-input)', borderRadius: 3, overflow: 'hidden', marginBottom: 8 }}>
+                    <div style={{ height: '100%', borderRadius: 3, width: `${r ?? 0}%`, background: `linear-gradient(90deg, ${hex}88, ${hex})` }} />
+                  </div>
+                  <div style={{ fontSize: 11, color: rs.color, fontWeight: 600 }}>{item.isDetour ? 'Prerequisite first' : rs.label}</div>
                 </div>
-                <div style={{ height: 5, background: 'var(--bg-input)', borderRadius: 3, overflow: 'hidden', marginBottom: 8 }}>
-                  <div style={{ height: '100%', borderRadius: 3, width: `${item.recall}%`, background: `linear-gradient(90deg, ${hex}88, ${hex})` }} />
-                </div>
-                <div style={{ fontSize: 11, color: rs.color, fontWeight: 600 }}>{rs.label}</div>
-              </div>
-            );
-          })}
-        </div>
+              );
+            })}
+          </div>
+        )}
 
-        {/* Mode cards — mobile: stacked vertically, desktop: side by side */}
-        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 16, textAlign: 'center' }}>Choose Mode</div>
-        <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: isMobile ? 12 : 20 }}>
-          <ModeCard
-            title="Abstract"
-            Icon={Zap}
-            color="var(--blue)"
-            desc="Fast flashcard recall. Fill in the blanks, test facts. Best when you're short on time."
-            features={['Cloze fill-in-the-blank', 'Quick 1 question per concept', 'Tests surface memory']}
-            onSelect={() => onSelect('abstract')}
-          />
-          <ModeCard
-            title="Understand"
-            Icon={Puzzle}
-            color="var(--green)"
-            desc="Explain mechanisms, test counterfactuals, apply to new cases. The real test of knowledge."
-            features={['Multi-question sequence', 'Counterfactual reasoning', 'Transfer to new cases', 'Self-rated free responses']}
-            recommended
-            onSelect={() => onSelect('understand')}
-          />
-        </div>
+        {/* Mode cards */}
+        {status === 'ready' && queue.length > 0 && (
+          <>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 16, textAlign: 'center' }}>Choose Mode</div>
+            <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: isMobile ? 12 : 20 }}>
+              <ModeCard
+                title="Abstract"
+                Icon={Zap}
+                color="var(--blue)"
+                desc="Fast recall. A short answer per concept. Best when you're short on time."
+                features={['One quick prompt per concept', 'Short free-text answers', 'Tests surface memory']}
+                onSelect={() => onSelect('abstract')}
+              />
+              <ModeCard
+                title="Understand"
+                Icon={Puzzle}
+                color="var(--green)"
+                desc="Explain the mechanism in your own words. The real test of knowledge."
+                features={['Explain what, how and why', 'Feedback on missing key ideas when graded', 'Prerequisites tested first']}
+                recommended
+                onSelect={() => onSelect('understand')}
+              />
+            </div>
+          </>
+        )}
 
         <button
           onClick={() => navigate('/brain')}
@@ -849,30 +641,29 @@ function ModeCard({ title, Icon, color, desc, features, recommended, onSelect }:
 }
 
 /* ── Review Complete ── */
-function ReviewComplete({ results, onDone }: { results: { label: string; before: number; after: number }[]; onDone: () => void }) {
+function ReviewComplete({ results, onDone }: { results: SessionResult[]; onDone: () => void }) {
   const navigate = useNavigate();
   const vw = useVW();
   const isMobile = vw < 640;
-  const totalGain = results.reduce((s, r) => s + (r.after - r.before), 0);
-  const improved = results.filter(r => r.after > r.before).length;
+  const graded = results.filter(r => r.band !== null);
+  const passed = results.filter(r => r.passed === true).length;
+  const full = results.filter(r => r.band === 'Full').length;
 
   return (
-    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: isMobile ? '24px 16px' : '40px', background: 'var(--bg)' }}>
+    <div style={{ height: '100%', overflowY: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: isMobile ? '24px 16px' : '40px', background: 'var(--bg)' }}>
       <div style={{ width: '100%', maxWidth: 560 }}>
-        {/* Header */}
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
           <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 16, color: 'var(--green)' }}>
             <PartyPopper size={isMobile ? 40 : 48} strokeWidth={1.2} />
           </div>
           <h2 style={{ fontSize: isMobile ? 26 : 32, fontWeight: 800, margin: '0 0 10px', letterSpacing: '-0.03em' }}>Session Complete</h2>
-          <p style={{ fontSize: 15, color: 'var(--text-muted)', margin: 0 }}>{results.length} concepts reviewed</p>
+          <p style={{ fontSize: 15, color: 'var(--text-muted)', margin: 0 }}>{results.length} concept{results.length === 1 ? '' : 's'} reviewed</p>
         </div>
 
-        {/* Stats row — mobile: 2-col, desktop: 3-col */}
         <div style={{ display: 'grid', gridTemplateColumns: isMobile ? 'repeat(2, 1fr)' : 'repeat(3, 1fr)', gap: 10, marginBottom: 20 }}>
           {[
-            { label: 'Improved', value: improved, color: 'var(--green)' },
-            { label: 'Total recall gain', value: `+${Math.max(0, totalGain)}%`, color: 'var(--blue)' },
+            { label: 'Passed', value: passed, color: 'var(--green)' },
+            { label: 'Full understanding', value: graded.length ? full : '—', color: 'var(--blue)' },
             { label: 'Concepts done', value: results.length, color: 'var(--text)' },
           ].map(({ label, value, color }) => (
             <div key={label} style={{ padding: '14px', borderRadius: 12, background: 'var(--bg-elevated)', border: '1px solid var(--border)', textAlign: 'center' }}>
@@ -882,28 +673,22 @@ function ReviewComplete({ results, onDone }: { results: { label: string; before:
           ))}
         </div>
 
-        {/* Per-concept results */}
-        <div style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 14, padding: '18px 18px', marginBottom: 20 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 14 }}>Results</div>
-          {results.map(r => {
-            const delta = r.after - r.before;
-            const hex = r.after >= 75 ? '#58CC02' : r.after >= 50 ? '#FF9600' : '#FF4B4B';
-            return (
-              <div key={r.label} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
-                <span style={{ fontSize: 13, color: 'var(--text)', flex: 1, fontWeight: 500 }}>{r.label}</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, width: isMobile ? 140 : 180 }}>
-                  <span style={{ fontSize: 12, color: 'var(--text-dim)', width: 28, textAlign: 'right' }}>{r.before}%</span>
-                  <div style={{ flex: 1, height: 5, background: 'var(--bg-input)', borderRadius: 3, overflow: 'hidden' }}>
-                    <div style={{ height: '100%', borderRadius: 3, width: `${r.after}%`, background: `linear-gradient(90deg, ${hex}88, ${hex})`, transition: 'width 1s ease' }} />
-                  </div>
-                  <span style={{ fontSize: 13, fontWeight: 700, color: delta > 0 ? 'var(--green)' : delta < 0 ? 'var(--red)' : 'var(--text-dim)', width: 34 }}>
-                    {delta > 0 ? '+' : ''}{delta}%
+        {results.length > 0 && (
+          <div style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 14, padding: '18px 18px', marginBottom: 20 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 14 }}>Results</div>
+            {results.map((r, i) => {
+              const hex = bandColor(r.band);
+              return (
+                <div key={`${r.label}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+                  <span style={{ fontSize: 13, color: 'var(--text)', flex: 1, fontWeight: 500 }}>{r.label}</span>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: r.band ? hex : 'var(--text-dim)', width: isMobile ? 110 : 140, textAlign: 'right' }}>
+                    {r.band ? bandLabel(r.band) : 'Not graded'}
                   </span>
                 </div>
-              </div>
-            );
-          })}
-        </div>
+              );
+            })}
+          </div>
+        )}
 
         <div style={{ display: 'flex', gap: 10 }}>
           <button

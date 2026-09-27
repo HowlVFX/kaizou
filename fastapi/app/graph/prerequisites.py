@@ -139,6 +139,100 @@ def break_cycle_at_weakest(
     return weakest_edge
 
 
+def build_requires_forward(edges: list[dict]) -> dict[str, list[str]]:
+    """Build the prerequisite → [dependents] graph from REQUIRES edge rows.
+
+    DB convention (edges table): ``source_id REQUIRES target_id``, i.e. the
+    target is the prerequisite ("Hoisting ──REQUIRES──> Creation Phase").
+    Graph helpers here and in app.graph.paths use the forward orientation
+    parent (prerequisite) → children (dependents), so each row is inverted.
+    Edges flagged CYCLE_CONFLICT are not part of the DAG and are skipped.
+    """
+    forward: dict[str, list[str]] = {}
+    for e in edges:
+        if e.get("flag") == "CYCLE_CONFLICT":
+            continue
+        prereq = str(e["target_id"])
+        dependent = str(e["source_id"])
+        children = forward.setdefault(prereq, [])
+        if dependent not in children:
+            children.append(dependent)
+    return forward
+
+
+def compute_prerequisite_depths(
+    requires_forward: dict[str, list[str]],
+    node_ids: set[str] | None = None,
+) -> dict[str, int]:
+    """Longest prerequisite chain below each node (0 = no prerequisites).
+
+    Nodes caught in a cycle (should not happen once CYCLE_CONFLICT edges are
+    excluded) keep the depth reached before the cycle.
+    """
+    nodes: set[str] = set(node_ids or ())
+    for parent, children in requires_forward.items():
+        nodes.add(parent)
+        nodes.update(children)
+
+    in_degree = {n: 0 for n in nodes}
+    for parent, children in requires_forward.items():
+        for child in children:
+            in_degree[child] += 1
+
+    depths = {n: 0 for n in nodes}
+    queue = deque(n for n, d in in_degree.items() if d == 0)
+    while queue:
+        node = queue.popleft()
+        for child in requires_forward.get(node, []):
+            depths[child] = max(depths[child], depths[node] + 1)
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+    return depths
+
+
+def plan_requires_edges(
+    concept_id: str,
+    prerequisite_ids: list[str],
+    requires_forward: dict[str, list[str]],
+) -> tuple[list[dict], int]:
+    """Decide which REQUIRES edges to write for a concept (D-15).
+
+    For each prerequisite P of concept C the proposed DAG edge is P → C.
+    If C already (transitively) precedes P, the edge would close a cycle:
+    the existing edges were accepted first, so they win and the new edge is
+    recorded with flag CYCLE_CONFLICT (kept for dev review, excluded from
+    traversal). Self-references are dropped.
+
+    ``requires_forward`` is updated in place with accepted edges so later
+    prerequisites in the same batch see them.
+
+    Returns:
+        (edges, depth): edge dicts {'source_id': C, 'target_id': P, 'flag'}
+        in DB orientation, and C's prerequisite depth after the accepted
+        edges are applied.
+    """
+    planned: list[dict] = []
+    seen: set[str] = set()
+    for prereq_id in prerequisite_ids:
+        if prereq_id == concept_id or prereq_id in seen:
+            continue
+        seen.add(prereq_id)
+        conflict = detect_cycle(prereq_id, concept_id, requires_forward)
+        if not conflict:
+            children = requires_forward.setdefault(prereq_id, [])
+            if concept_id not in children:
+                children.append(concept_id)
+        planned.append({
+            "source_id": concept_id,
+            "target_id": prereq_id,
+            "flag": "CYCLE_CONFLICT" if conflict else None,
+        })
+
+    depths = compute_prerequisite_depths(requires_forward, {concept_id})
+    return planned, depths.get(concept_id, 0)
+
+
 def resolve_prerequisite_labels(
     labels: list[str],
     existing_concepts: dict[str, str],

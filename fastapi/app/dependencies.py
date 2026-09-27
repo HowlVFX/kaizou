@@ -7,9 +7,12 @@ Provides:
 """
 from __future__ import annotations
 
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from functools import lru_cache
+
+from fastapi import Header, HTTPException
 from typing import AsyncGenerator, Optional
 
 import psycopg
@@ -67,15 +70,29 @@ async def get_db() -> AsyncGenerator[psycopg.AsyncConnection, None]:
         yield conn
 
 
-async def verify_internal_token(token: str) -> bool:
-    """Verify service-to-service auth token.
-    
-    Used when Express calls FastAPI endpoints internally.
-    Simple shared-secret check for now.
+def verify_internal_token(token: Optional[str]) -> bool:
+    """Constant-time check of the Express→FastAPI shared secret.
+
+    Fails closed: with no INTERNAL_API_KEY configured, nothing is accepted
+    unless ALLOW_UNAUTHENTICATED_INTERNAL=true is set explicitly (local
+    experiments only; never in deployment).
     """
     settings = get_settings()
-    expected = getattr(settings, 'internal_api_key', None)
+    expected = settings.internal_api_key
     if not expected:
-        # If no key configured, allow all (dev mode)
-        return True
-    return token == expected
+        return bool(settings.allow_unauthenticated_internal)
+    if not token:
+        return False
+    return hmac.compare_digest(token.encode(), expected.encode())
+
+
+async def require_internal_key(
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+) -> None:
+    """Router-level dependency: only Express (holding the shared key) may call.
+
+    FastAPI trusts the learner_id Express sends because Express derives it
+    from a verified JWT; this dependency is what makes that trust valid.
+    """
+    if not verify_internal_token(x_internal_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Internal-Key")

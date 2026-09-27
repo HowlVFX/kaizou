@@ -40,10 +40,34 @@ def get_generation_client(settings=None, provider: str | None = None, **override
         return GeminiGenerationClient(
             api_key=settings.gemini_api_key,
             model=settings.gemini_generation_model,
+            max_tokens=settings.generation_max_tokens,
+            thinking_level=getattr(settings, "gemini_thinking_level", ""),
             **common,
         )
     raise ProviderConfigError(
         "generation", f"GENERATION_PROVIDER={name!r} is not supported; use 'anthropic' or 'gemini'.",
+    )
+
+
+def get_guarded_generation_client(settings=None, conn=None, provider: str | None = None, **overrides):
+    """Generation client wrapped with budget ledger + reuse cache.
+
+    With no ``conn``, the ledger/cache run in degraded (in-memory / no-op)
+    mode, so the guard is safe to build anywhere. Call sites with a DB
+    connection get real spend capping and caching.
+    """
+    if settings is None:
+        from app.config import get_settings
+        settings = get_settings()
+    from app.providers.budget import BudgetLedger
+    from app.providers.cache import AICache
+    from app.providers.guard import GuardedGenerationClient
+    inner = get_generation_client(settings, provider, **overrides)
+    return GuardedGenerationClient(
+        inner,
+        ledger=BudgetLedger(conn, settings=settings),
+        cache=AICache(conn, settings=settings),
+        settings=settings,
     )
 
 
@@ -62,6 +86,7 @@ __all__ = [
     "StructuredResult",
     "check_generation_provider",
     "get_generation_client",
+    "get_guarded_generation_client",
     "parse_json_object",
     "strict_object",
 ]

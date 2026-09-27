@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 
-from app.providers.generation import GenerationClient, get_generation_client, strict_object
+from app.providers.generation import GenerationClient, strict_object
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,11 @@ TEMPLATE_SCHEMA = strict_object({
 class ProcessTemplateManager:
     """Manages process templates for concepts."""
 
-    def __init__(self, client: GenerationClient | None = None):
-        self._client = client or get_generation_client()
+    def __init__(self, client: GenerationClient | None = None, *, conn=None):
+        if client is None:
+            from app.providers.generation import get_guarded_generation_client
+            client = get_guarded_generation_client(conn=conn)
+        self._client = client
 
     async def get_or_generate_template(
         self,
@@ -71,12 +74,12 @@ class ProcessTemplateManager:
 
         # Generate new template
         structure = await self._generate_template_structure(
-            concept_label, claims,
+            concept_label, claims, run=0,
         )
 
-        # Run second generation for agreement
+        # Run second, independent generation for agreement
         structure_b = await self._generate_template_structure(
-            concept_label, claims,
+            concept_label, claims, run=1,
         )
 
         stable, disputed, tau = self._verify_agreement(structure, structure_b)
@@ -120,6 +123,7 @@ class ProcessTemplateManager:
         self,
         concept_label: str,
         claims: list[dict],
+        run: int = 0,
     ) -> dict:
         """Generate a process template structure via LLM."""
         claim_texts = [c.get("text", "") for c in claims][:15]
@@ -138,12 +142,14 @@ class ProcessTemplateManager:
             content += f"  {i}. {ct}\n"
 
         # Two independent calls feed _verify_agreement (generate-twice-agree).
-        # Default sampling keeps them independent; the old temperature=0.3 is
-        # dropped because Claude Opus 5.5 rejects sampling parameters.
+        # A distinct `variant` per run gives each its own cache entry, so the
+        # second run is a real second sample rather than a cache hit of the
+        # first (which would make the agreement check trivially pass).
         result = await self._client.generate_structured(
             system=system_prompt,
             prompt=content,
             schema=TEMPLATE_SCHEMA,
+            variant=f"template-run-{run}",
         )
         return {
             "trunk": [i for i in result.data.get("trunk", []) if isinstance(i, int)],

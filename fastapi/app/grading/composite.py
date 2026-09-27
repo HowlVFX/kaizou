@@ -97,6 +97,9 @@ def calculate_composite_score(
     branch_leakage: float,
     gamma: float = GAMMA,
     beta: float = BETA,
+    w_coverage: float = W_COVERAGE,
+    w_ordering: float = W_ORDERING,
+    w_precision: float = W_PRECISION,
 ) -> float:
     """Compute the clamped composite score (§5.8).
 
@@ -115,17 +118,23 @@ def calculate_composite_score(
         branch_leakage: branch leakage penalty [0, 1].
         gamma: verbatim coefficient (default 0.20).
         beta: leakage coefficient (default 0.25).
+        w_coverage, w_ordering, w_precision: positive weights (§5.26);
+            callers pass the Settings values. When ordering is dropped the
+            coverage/precision weights are renormalised to sum to 1.
 
     Returns:
         Composite score clamped to [0, 1].
     """
     if ordering is not None:
-        raw = (W_COVERAGE * coverage +
-               W_ORDERING * ordering +
-               W_PRECISION * precision)
+        raw = (w_coverage * coverage +
+               w_ordering * ordering +
+               w_precision * precision)
     else:
-        raw = (W_COVERAGE_RENORM * coverage +
-               W_PRECISION_RENORM * precision)
+        denom = w_coverage + w_precision
+        if denom <= 0.0:
+            raw = 0.0
+        else:
+            raw = (w_coverage / denom) * coverage + (w_precision / denom) * precision
 
     score = raw - gamma * verbatim_penalty - beta * branch_leakage
 
@@ -135,6 +144,9 @@ def calculate_composite_score(
 def classify_understanding_band(
     score: float,
     all_transitions_matched: bool,
+    band_full: float = BAND_FULL,
+    band_shallow: float = BAND_SHALLOW,
+    band_incomplete: float = BAND_INCOMPLETE,
 ) -> str:
     """Classify the composite score into an understanding band (§5.8.3).
 
@@ -151,11 +163,11 @@ def classify_understanding_band(
     Returns:
         One of: "Full", "Shallow", "Incomplete", "Not_Yet_Engaged"
     """
-    if score >= BAND_FULL and all_transitions_matched:
+    if score >= band_full and all_transitions_matched:
         return "Full"
-    elif score >= BAND_SHALLOW:
+    elif score >= band_shallow:
         return "Shallow"
-    elif score >= BAND_INCOMPLETE:
+    elif score >= band_incomplete:
         return "Incomplete"
     else:
         return "Not_Yet_Engaged"

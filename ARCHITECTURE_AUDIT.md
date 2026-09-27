@@ -602,3 +602,24 @@ These were latent breakages found and corrected — no business logic added:
 
 - `node_modules/`, `.venv/`, `__pycache__/`, and build `dist/` outputs are gitignored.
 - No source files were deleted; all existing functionality preserved.
+
+---
+
+## 14. Schema Reconciliation to UUID (2026-09-26)
+
+The conflicts noted in §10.2 (SERIAL vs UUID, `notes.body` vs `body_md`, `notes.concepts`) were resolved by a **full UUID reconciliation** applied to the live Neon database.
+
+**Decision (approved):** clear existing users and rebuild, rather than an in-place primary-key type change. There were 5 learners / 38 refresh tokens / 1 note; all were intentionally cleared. Users re-register.
+
+**Migration `003_full_schema_reset.sql`** drops the legacy integer-key `learners`/`notes`/`refresh_tokens` (and their sequences + old enum types), then the runner rebuilds the full 21-table UUID schema from `schema.sql` (19 core tables + `provider_usage` + `ai_cache`). Applied to Neon; verified: `learners.id` is `uuid`, `notes` uses `body_md`/`ingestion_status`, all `learner_id` FKs are UUID.
+
+**Fixes required for Express to work against the new schema:**
+1. `refresh_tokens.id` — the schema had `UUID PRIMARY KEY` with **no default**, but Express inserts without supplying `id`. Added `DEFAULT gen_random_uuid()` (and `created_at DEFAULT CURRENT_TIMESTAMP`).
+2. `routes/notes.js` — rewritten to the new columns while keeping the **API contract unchanged**: the JSON fields stay `body`/`status`/`concepts`, mapped to `body_md`/`ingestion_status` in SQL; `concepts` returns `[]` until the `note_concepts` join table is populated by ingestion. POST/PUT no longer write `status`/`concepts`.
+3. `generateTokens` (in `routes/auth.js` **and** `routes/oauth.js`) — added a random `jti` claim to the refresh token. Without it, a signup and login in the same second produced a byte-identical JWT and violated the `refresh_tokens.token` UNIQUE constraint (a latent bug the reconciliation surfaced). `crypto` now required in both files.
+
+**JWT / OAuth safety:** confirmed UUID-safe. The token payload `id` is opaque (`jwt.sign`/`verify` don't care about its type), `middleware/auth.js` copies the decoded payload verbatim (no `parseInt`), and no code coerces the id to an integer. So UUID string ids flow through auth and notes unchanged.
+
+**Verified end-to-end (real HTTP against Neon):** signup → login → notes POST/GET/PUT/DELETE → bad-token rejection all pass; learner ids are UUIDs; note body round-trips through `body_md`. Test users were removed afterward (Neon back to 0 learners).
+
+**Still deferred:** the `learners`/`notes` etc. remain unpopulated by the ingestion pipeline (concepts/claims/edges are created by FastAPI, not yet run end-to-end). The API's `concepts: []` placeholder stands until ingestion writes to `note_concepts`.

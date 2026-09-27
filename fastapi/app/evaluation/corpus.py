@@ -86,7 +86,8 @@ class SeededCorpusLoader:
             )
             rows = await cur.fetchall()
 
-        status_counts = {row[0]: row[1] for row in rows}
+        # Pool connections use dict_row, so index by column name.
+        status_counts = {row["ingestion_status"]: row["count"] for row in rows}
         total = sum(status_counts.values())
 
         return {

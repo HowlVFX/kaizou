@@ -11,6 +11,7 @@ class SourceResult(BaseModel):
     domain: str
     trust_tier: str
     snippet: str
+    title: str = ""
 
 
 class SearchRequest(BaseModel):
@@ -21,6 +22,10 @@ class SearchRequest(BaseModel):
 
 class SearchResponse(BaseModel):
     results: List[SourceResult]
+    # False when GOOGLE_SEARCH_API_KEY / GOOGLE_SEARCH_ENGINE_ID are unset:
+    # results is then empty because search is disabled, not because nothing matched.
+    configured: bool = True
+    detail: Optional[str] = None
 
 
 class FetchRequest(BaseModel):

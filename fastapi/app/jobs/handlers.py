@@ -9,6 +9,7 @@ import logging
 from typing import Any, Callable, Coroutine
 
 import psycopg
+from psycopg.rows import dict_row
 
 logger = logging.getLogger(__name__)
 
@@ -28,37 +29,63 @@ async def handle_ingest_job(payload: dict, conn: psycopg.AsyncConnection) -> Non
 
 
 async def handle_weekly_cluster_job(payload: dict, conn: psycopg.AsyncConnection) -> None:
-    """Run weekly cluster detection for a learner.
-    
-    Pipeline: build graph → Louvain → name clusters → track lineage.
+    """Run cluster detection for a learner (weekly or after ingestion).
+
+    Pipeline: build graph → Louvain (γ=1.0) → sub-clusters (γ=1.6, |K|>=12)
+    → lineage vs ACTIVE clusters → persist clusters / cluster_members /
+    cluster_lineage. Naming is deterministic (no LLM).
+    Payload without learner_id re-clusters every learner with concepts.
     """
-    logger.info("Running weekly cluster job for learner %s", payload.get("learner_id"))
-    # TODO: implement full pipeline
-    # 1. Fetch all concepts and edges for learner
-    # 2. Build weighted graph
-    # 3. Run Louvain at γ=1.0
-    # 4. Run sub-clustering at γ=1.6 for large communities
-    # 5. Name clusters via LLM
-    # 6. Track lineage against previous week
-    # 7. Persist results
+    from app.config import get_settings
+    from app.graph.cluster_service import recluster_learner
+
+    settings = get_settings()
+    learner_id = payload.get("learner_id")
+    if learner_id:
+        learner_ids = [str(learner_id)]
+    else:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("SELECT DISTINCT learner_id FROM concepts")
+            learner_ids = [str(r["learner_id"]) for r in await cur.fetchall()]
+
+    failed: list[str] = []
+    for lid in learner_ids:
+        try:
+            result = await recluster_learner(conn, lid, settings)
+            logger.info("Cluster run for learner %s: %s", lid, result)
+        except Exception as e:
+            # One learner's failure must not block the rest of an all-learner run.
+            logger.error("Cluster run failed for learner %s: %s", lid, e, exc_info=True)
+            await conn.rollback()
+            failed.append(lid)
+    if failed:
+        raise RuntimeError(f"Cluster run failed for {len(failed)} learner(s)")
 
 
 async def handle_compute_aggregates_job(payload: dict, conn: psycopg.AsyncConnection) -> None:
     """Compute portal aggregate metrics.
-    
+
     Aggregates are written to portal_aggregates with privacy floor N=5.
-    No free-text columns (D-10).
+    No free-text columns (D-10). Payload: {"window_days": int} (default 30).
     """
-    logger.info("Computing portal aggregates")
-    # TODO: implement aggregate computation
-    # Metrics: recall distribution, mastery rates, grader reliability,
-    # probe discrimination, source coverage, etc.
+    from app.config import get_settings
+    from app.evaluation.aggregates import compute_portal_aggregates
+
+    n = await compute_portal_aggregates(conn, payload, get_settings())
+    logger.info("Computed %d portal aggregate rows", n)
 
 
 async def handle_evaluation_run_job(payload: dict, conn: psycopg.AsyncConnection) -> None:
-    """Run evaluation harness."""
-    logger.info("Running evaluation harness")
-    # TODO: implement evaluation pipeline
+    """Evaluation metrics from live data: memory calibration + probe discrimination.
+
+    Cohen's kappa needs hand-labelled bands, which the schema does not store,
+    so it is not computed here.
+    """
+    from app.config import get_settings
+    from app.evaluation.aggregates import run_evaluation_metrics
+
+    n = await run_evaluation_metrics(conn, payload, get_settings())
+    logger.info("Evaluation run wrote %d metric rows", n)
 
 
 # --- Handler Registry ---

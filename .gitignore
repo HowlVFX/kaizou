@@ -1,7 +1,15 @@
 .neon
 node_modules/
-.env
 .agents/
+
+# Environment files — never commit secrets.
+# Bare ".env" already matches at any depth; the explicit paths below are
+# redundant but make the intent obvious.
+.env
+.env.*
+!.env.example
+fastapi/.env
+
 # Python
 .venv/
 __pycache__/
@@ -12,6 +20,13 @@ dist/
 
 # Python tooling
 .pytest_cache/
+
+# Frontend binary assets tracked via Git LFS upstream but not present as real
+# blobs in this clone (they arrive as LFS pointers). Excluded so pushes aren't
+# blocked by missing LFS objects; the frontend owner provides them separately.
+KNODES-main/public/assets/fonts/Anurati-Regular.woff
+KNODES-main/public/assets/fonts/Anurati-Regular.woff2
+KNODES-main/src/imports/image.png
 
 # Editor / OS / logs
 .kiro/

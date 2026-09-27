@@ -5,11 +5,12 @@ Endpoints:
     POST /retrieval/fetch    — Fetch and store a source document
     POST /retrieval/validate — Validate a note against its source
 
-Source trust tiers (§10.1):
-    Tier 1 — Peer-reviewed, authoritative textbooks
-    Tier 2 — Established educational resources, docs
-    Tier 3 — Community content with editorial oversight
-    Tier 4 — Unverified / user-authored
+Source trust tiers (§10.1), stored as the ``source_trust_tier`` enum:
+    PEER_REVIEWED  — Tier 1: peer-reviewed, authoritative textbooks
+    INSTITUTIONAL  — Tier 2: established educational resources, docs
+    GENERAL        — Tier 3/4: community or unverified content
+    SELF_AUTHORED  — learner-supplied material
+    Mapping lives in app.retrieval.search.classify_trust_tier.
 
 Source validation (§10.2):
     Coverage: what fraction of the source's claims does the note cover?
@@ -17,7 +18,6 @@ Source validation (§10.2):
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,70 +26,64 @@ import psycopg
 from psycopg.rows import dict_row
 
 from app.dependencies import get_db
+from app.retrieval.fetcher import FetchBlockedError, FetchTooLargeError, fetch_url
 from app.retrieval.schemas import (
     SearchRequest, SearchResponse, SourceResult,
     FetchRequest, FetchResponse,
     ValidateRequest, ValidateResponse,
 )
+from app.retrieval.search import (
+    SearchUnavailableError,
+    WebSearchService,
+    classify_trust_tier,
+    normalize_trust_tiers,
+)
+from app.retrieval.service import upsert_source
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/retrieval", tags=["Retrieval"])
-
-# Domain → trust tier mapping (§10.1)
-DOMAIN_TRUST_TIERS: dict[str, str] = {
-    # Tier 1 — Peer-reviewed
-    "nature.com": "TIER_1",
-    "science.org": "TIER_1",
-    "scholar.google.com": "TIER_1",
-    "pubmed.ncbi.nlm.nih.gov": "TIER_1",
-    "ieee.org": "TIER_1",
-    "acm.org": "TIER_1",
-    # Tier 2 — Established educational
-    "docs.python.org": "TIER_2",
-    "developer.mozilla.org": "TIER_2",
-    "docs.oracle.com": "TIER_2",
-    "mathworld.wolfram.com": "TIER_2",
-    "khan-academy.org": "TIER_2",
-    "britannica.com": "TIER_2",
-    # Tier 3 — Community with oversight
-    "stackoverflow.com": "TIER_3",
-    "en.wikipedia.org": "TIER_3",
-    "geeksforgeeks.org": "TIER_3",
-}
-
-
-def classify_domain_trust(domain: str) -> str:
-    """Classify a domain into a trust tier (§10.1)."""
-    domain_lower = domain.lower()
-    for known, tier in DOMAIN_TRUST_TIERS.items():
-        if known in domain_lower:
-            return tier
-    return "TIER_4"
 
 
 @router.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest):
     """Search for authoritative sources for a concept's claims.
 
-    Uses web search API to find sources that discuss the same claims.
-    Results are classified by trust tier.
+    Uses Google Custom Search (GOOGLE_SEARCH_API_KEY + GOOGLE_SEARCH_ENGINE_ID).
+    Results are classified by trust tier and filtered to ``trust_tiers``
+    (enum names or tier_1..tier_4; empty = all). When search is not
+    configured the response is ``{results: [], configured: false}``.
     """
-    # Use the LLM/search API to find relevant sources
-    from app.config import get_settings
-    settings = get_settings()
+    try:
+        tiers = normalize_trust_tiers(request.trust_tiers)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
-    # For now, return placeholder results
-    # In production, this would use a search API (Google Custom Search, etc.)
-    logger.info(
-        "Search requested for concept '%s' with %d claims",
-        request.concept_label, len(request.claims),
+    service = WebSearchService.from_settings()
+    if not service.configured:
+        return SearchResponse(
+            results=[], configured=False,
+            detail="Web search is not configured (set GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID).",
+        )
+
+    logger.info("Search requested with %d claims", len(request.claims))
+    try:
+        found = await service.search_for_concept(
+            request.concept_label, request.claims, tiers or None, raise_errors=True,
+        )
+    except SearchUnavailableError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return SearchResponse(
+        results=[
+            SourceResult(
+                url=r["url"], domain=r["domain"], trust_tier=r["trust_tier"],
+                snippet=r.get("snippet", ""), title=r.get("title", ""),
+            )
+            for r in found
+        ],
+        configured=True,
     )
-
-    # Placeholder: in production, this would call a web search API
-    results: list[SourceResult] = []
-
-    return SearchResponse(results=results)
 
 
 @router.post("/fetch", response_model=FetchResponse)
@@ -99,60 +93,46 @@ async def fetch(
 ):
     """Fetch and store a source document.
 
-    Downloads the content, computes SHA-256, counts tokens,
-    and persists to the sources table.
+    Downloads the content (HTML stripped to text), computes SHA-256,
+    and persists to the sources table. token_count is computed for the
+    response only; the schema does not store it.
     """
     from urllib.parse import urlparse
 
-    # Fetch the content
+    async with db.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT 1 AS ok FROM concepts WHERE id = %s", (str(request.concept_id),))
+        if not await cur.fetchone():
+            raise HTTPException(status_code=404, detail="Concept not found")
+
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(str(request.url), timeout=30.0)
-            response.raise_for_status()
-            content = response.text
+        fetched = await fetch_url(str(request.url))
+    except FetchBlockedError as e:
+        raise HTTPException(status_code=400, detail=f"URL not allowed: {e}")
+    except FetchTooLargeError as e:
+        raise HTTPException(status_code=413, detail=str(e))
     except httpx.HTTPError as e:
         raise HTTPException(
             status_code=502,
-            detail=f"Failed to fetch source: {e}",
+            detail=f"Failed to fetch source: {type(e).__name__}",
         )
 
-    # Compute hash and token count
-    content_hash = hashlib.sha256(content.encode()).hexdigest()
-    token_count = len(content.split())
-
-    # Classify trust tier
-    parsed_url = urlparse(str(request.url))
-    domain = parsed_url.netloc
-    trust_tier = classify_domain_trust(domain)
-
-    # Persist to DB
-    async with db.cursor(row_factory=dict_row) as cur:
-        await cur.execute(
-            """INSERT INTO sources (
-                id, concept_id, url, domain, trust_tier,
-                content_sha256, token_count, raw_text
-            ) VALUES (
-                gen_random_uuid(), %s, %s, %s, %s,
-                %s, %s, %s
-            )
-            ON CONFLICT (url) DO UPDATE SET
-                content_sha256 = EXCLUDED.content_sha256,
-                token_count = EXCLUDED.token_count,
-                raw_text = EXCLUDED.raw_text
-            RETURNING id, content_sha256, token_count""",
-            (
-                str(request.concept_id), str(request.url), domain,
-                trust_tier, content_hash, token_count, content[:50000],
-            ),
-        )
-        row = await cur.fetchone()
-
+    # Domain for trust classification = host only (no port / userinfo).
+    domain = (urlparse(str(request.url)).hostname or "").lower()
+    source_id = await upsert_source(
+        db,
+        concept_id=str(request.concept_id),
+        url=str(request.url),
+        domain=domain,
+        trust_tier=classify_trust_tier(domain),
+        content_sha256=fetched["content_hash"],
+        content_text=fetched["content"],
+    )
     await db.commit()
 
     return FetchResponse(
-        source_id=row["id"],
-        content_sha256=row["content_sha256"],
-        token_count=row["token_count"],
+        source_id=source_id,
+        content_sha256=fetched["content_hash"],
+        token_count=fetched["token_count"],
     )
 
 
@@ -169,9 +149,12 @@ async def validate(
     # Fetch note claims
     async with db.cursor(row_factory=dict_row) as cur:
         await cur.execute(
+            # Current version only: each version holds the full claim set,
+            # so reading every version would count carried claims repeatedly.
             """SELECT c.text, c.embedding
                FROM claims c
                JOIN note_concepts nc ON nc.concept_id = c.concept_id
+               JOIN concepts co ON co.id = c.concept_id AND c.concept_version = co.version
                WHERE nc.note_id = %s""",
             (str(request.note_id),),
         )
@@ -180,7 +163,7 @@ async def validate(
     # Fetch source content
     async with db.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT raw_text FROM sources WHERE id = %s",
+            "SELECT content_text FROM sources WHERE id = %s",
             (str(request.source_id),),
         )
         source = await cur.fetchone()
@@ -196,13 +179,13 @@ async def validate(
     from app.config import get_settings
 
     settings = get_settings()
-    extractor = ClaimExtractor()
-    source_claims = await extractor.extract_claims(source["raw_text"])
+    extractor = ClaimExtractor(conn=db)
+    source_claims = await extractor.extract_claims(source["content_text"])
 
     # Compute embeddings for source claims
     from app.ingestion.embedding import create_embedding_service
 
-    emb_service = create_embedding_service(settings)
+    emb_service = create_embedding_service(settings, conn=db)
 
     source_embeddings = await emb_service.compute_batch_embeddings(
         [c.text for c in source_claims],
@@ -223,6 +206,30 @@ async def validate(
     else:
         source_coverage = 0.0
 
+    # Contradiction detection (§5.10): premise = source claim, hypothesis =
+    # the learner's note claim. Skipped (with an explicit flag) if NLI is off.
+    import psycopg.types.json
+    from app.nli.service import get_nli_service, NLIUnavailable
+    from app.grading.contradiction import ContradictionDetector
+
+    contradiction_count = 0
+    flagged_pairs: list = []
+    nli_ran = False
+    nli = get_nli_service(conn=db)
+    if nli.enabled:
+        try:
+            report = await ContradictionDetector(
+                nli, threshold=settings.nli_contradiction_threshold,
+            ).detect(
+                source_claims=[c.text for c in source_claims],
+                learner_claims=[c["text"] for c in note_claims],
+            )
+            contradiction_count = report.contradiction_count
+            flagged_pairs = report.to_dict()["flagged_pairs"]
+            nli_ran = True
+        except NLIUnavailable:
+            nli_ran = False
+
     # Store validation result
     async with db.cursor() as cur:
         await cur.execute(
@@ -230,14 +237,15 @@ async def validate(
                 id, source_id, note_id, source_coverage,
                 contradiction_count, flagged_pairs
             ) VALUES (
-                gen_random_uuid(), %s, %s, %s, 0, '[]'::jsonb
+                gen_random_uuid(), %s, %s, %s, %s, %s
             ) ON CONFLICT DO NOTHING""",
-            (str(request.source_id), str(request.note_id), source_coverage),
+            (str(request.source_id), str(request.note_id), source_coverage,
+             contradiction_count, psycopg.types.json.Jsonb(flagged_pairs)),
         )
     await db.commit()
 
     return ValidateResponse(
         source_coverage=source_coverage,
-        contradiction_count=0,
-        flagged_pairs=[],
+        contradiction_count=contradiction_count,
+        flagged_pairs=flagged_pairs if nli_ran else [{"nli_disabled": True}],
     )

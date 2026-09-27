@@ -36,8 +36,13 @@ class GenerationClient(Protocol):
         prompt: str,
         schema: dict[str, Any],
         max_tokens: int | None = None,
+        variant: str = "",
     ) -> StructuredResult:
-        """Return an object conforming to ``schema`` (a JSON Schema dict)."""
+        """Return an object conforming to ``schema`` (a JSON Schema dict).
+
+        ``variant`` only affects caching (see GuardedGenerationClient); raw
+        provider clients accept and ignore it.
+        """
         ...
 
 

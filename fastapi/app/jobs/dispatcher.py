@@ -7,7 +7,7 @@ from uuid import UUID
 
 import psycopg
 
-from app.jobs.repository import JobRepository
+from app.jobs.repository import CLUSTER_JOB_TYPE, JobRepository
 
 
 class JobDispatcher:
@@ -32,11 +32,12 @@ class JobDispatcher:
             payload={"note_id": str(note_id), "learner_id": str(learner_id)},
         )
 
-    async def dispatch_weekly_cluster(self, learner_id: UUID) -> UUID:
-        """Enqueue a weekly cluster detection job."""
-        return await self._repo.create_job(
-            job_type="WEEKLY_CLUSTER",
-            payload={"learner_id": str(learner_id)},
+    async def dispatch_weekly_cluster(self, learner_id: UUID) -> Optional[UUID]:
+        """Enqueue a cluster detection job (None if one is already pending)."""
+        return await self._repo.create_job_if_absent(
+            job_type=CLUSTER_JOB_TYPE,
+            payload={"learner_id": str(learner_id), "reason": "weekly"},
+            dedupe_on={"learner_id": str(learner_id)},
         )
 
     async def dispatch_compute_aggregates(self) -> UUID:

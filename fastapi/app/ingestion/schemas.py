@@ -12,7 +12,7 @@ class IngestRequest(BaseModel):
 
 
 class IngestResponse(BaseModel):
-    concept_id: str
+    concept_id: Optional[str] = None   # None for PENDING (job mode) or UNCHANGED
     status: str
     claims_count: int
 

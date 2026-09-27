@@ -151,11 +151,30 @@ def track_lineage(
     # Build lineage records
     records: list[LineageRecord] = []
 
+    # Full Jaccard lookup for SPLIT detection (an old cluster already consumed
+    # by its best match can still be the parent of other new clusters).
+    pair_j = {(n, o): j for n, o, j in pairs}
+
     for new_id, new_members in new_sets.items():
         matches = new_matched.get(new_id, [])
 
         if not matches:
-            # No matching old cluster
+            # No unconsumed old cluster: SPLIT child if it overlaps an old
+            # cluster that another new cluster retained, else NEW.
+            split_parent = max(
+                ((o, pair_j.get((new_id, o), 0.0)) for o in old_sets),
+                key=lambda x: x[1],
+                default=(None, 0.0),
+            )
+            if split_parent[0] is not None and split_parent[1] >= JACCARD_EVOLVED:
+                records.append(LineageRecord(
+                    new_cluster_id=new_id,
+                    old_cluster_ids=[split_parent[0]],
+                    event=LineageEvent.SPLIT,
+                    jaccard=split_parent[1],
+                    needs_rename=True,
+                ))
+                continue
             records.append(LineageRecord(
                 new_cluster_id=new_id,
                 old_cluster_ids=[],
@@ -214,9 +233,16 @@ def track_lineage(
                     needs_rename=True,
                 ))
 
-    # Handle DISSOLVED: old clusters not consumed
+    # Handle DISSOLVED: old clusters that no new cluster retained (SAME /
+    # EVOLVED) or absorbed (MERGED). Consumed-but-below-threshold matches
+    # (recorded as NEW) also dissolve, otherwise they would stay ACTIVE
+    # with stale membership.
+    accounted: set[str] = set()
+    for rec in records:
+        if rec.event in (LineageEvent.SAME, LineageEvent.EVOLVED, LineageEvent.MERGED):
+            accounted.update(rec.old_cluster_ids)
     for old_id in old_sets:
-        if old_id not in old_consumed:
+        if old_id not in accounted:
             records.append(LineageRecord(
                 new_cluster_id="",
                 old_cluster_ids=[old_id],
@@ -225,18 +251,8 @@ def track_lineage(
                 needs_rename=False,
             ))
 
-    # Handle SPLIT: check if one old cluster maps to multiple new clusters
-    # (This is a second pass — old clusters that matched multiple new ones)
-    old_to_new: dict[str, list[tuple[str, float]]] = {}
-    for new_id, matches in new_matched.items():
-        for old_id, j in matches:
-            if old_id not in old_to_new:
-                old_to_new[old_id] = []
-            old_to_new[old_id].append((new_id, j))
-
-    # Note: in the greedy scheme above, each old is consumed at most once,
-    # so true SPLIT detection requires a separate analysis pass where we
-    # look at the full Jaccard matrix before greedy consumption.
-    # For now, SPLIT is handled implicitly via NEW events on the children.
+    # SPLIT: greedy matching consumes each old cluster once (its best new
+    # match retains it); the other new clusters overlapping it at
+    # J >= 0.20 were recorded above as SPLIT children with that parent.
 
     return records

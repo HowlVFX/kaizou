@@ -1,56 +1,54 @@
-import React, { useEffect, useState } from 'react';
-import { fetchApi } from '../api/client';
+import React from 'react';
+import { useManagementData } from '../api/useManagementData';
+import type { PopulationResponse } from '../api/types';
+import { fmtLabel, fmtNum } from '../api/format';
 import { MetricCard } from '../components/MetricCard';
 import { DataTable } from '../components/DataTable';
+import { CardRow, ErrorMessage, Loading, PageTitle, SectionTitle, SuppressedNotice, TwoColumns } from '../components/PageState';
+
+const EMPTY = '[below privacy threshold or no data]';
 
 export const PopulationPage: React.FC = () => {
-  const [data, setData] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { data, loading, error } = useManagementData<PopulationResponse>('/population');
 
-  useEffect(() => {
-    fetchApi('/population').then(setData).catch(e => setError(e.message)).finally(() => setLoading(false));
-  }, []);
+  if (loading) return <Loading />;
+  if (error || !data) return <ErrorMessage message={error || 'No data'} />;
 
-  if (loading) return <div style={{ color: '#e0e0e0' }}>Loading...</div>;
-  if (error) return <div style={{ color: '#e06060' }}>Error: {error}</div>;
-
-  const soloDistributionRows = data?.solo_distribution ? Object.entries(data.solo_distribution).map(([level, count]) => [level, count as number]) : [];
+  const maxCount = Math.max(1, ...data.recall_distribution.map((r) => r.count));
 
   return (
     <div>
-      <h1 style={{ color: '#e0e0e0', marginBottom: '1.5rem' }}>Population</h1>
-      <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginBottom: '2rem' }}>
-        <MetricCard title="Active Learners" value={data?.active_learners ?? 0} color="#533483" />
-        <MetricCard title="Inactive Learners" value={data?.inactive_learners ?? 0} color="#e06060" />
-      </div>
-      
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem' }}>
+      <PageTitle>Population</PageTitle>
+      <SuppressedNotice envelope={data} />
+      <CardRow>
+        <MetricCard title="Active Learners" value={fmtNum(data.active_learners)} subtitle="notes or attempts in last 30 days" color="#533483" />
+        <MetricCard title="Inactive Learners" value={fmtNum(data.inactive_learners)} color="#e06060" />
+      </CardRow>
+      <TwoColumns>
         <div>
-          <h3 style={{ color: '#a0a0a0', marginBottom: '1rem' }}>Recall Distribution</h3>
-          {data?.recall_distribution && Object.entries(data.recall_distribution).map(([bin, count]) => (
-            <div key={bin} style={{ display: 'flex', alignItems: 'center', marginBottom: '0.5rem' }}>
-              <div style={{ width: '60px', color: '#e0e0e0', fontSize: '0.85rem' }}>{bin}</div>
-              <div style={{ flex: 1, background: '#16213e', height: '1.5rem', borderRadius: '4px', overflow: 'hidden' }}>
-                <div style={{ width: `${Math.min((count as number) * 5, 100)}%`, background: '#0f3460', height: '100%' }}></div>
-              </div>
-              <div style={{ width: '40px', textAlign: 'right', color: '#808080', fontSize: '0.85rem' }}>{count as React.ReactNode}</div>
-            </div>
-          ))}
-          {(!data?.recall_distribution || Object.keys(data.recall_distribution).length === 0) && (
-            <p style={{ color: '#808080', fontStyle: 'italic' }}>[below privacy threshold]</p>
-          )}
+          <SectionTitle>Latest Predicted Recall Distribution</SectionTitle>
+          {data.recall_distribution.length === 0 && <p style={{ color: '#808080', fontStyle: 'italic' }}>{EMPTY}</p>}
+          <ul aria-label="Predicted recall distribution" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+            {data.recall_distribution.map((row) => (
+              <li key={row.bucket} style={{ display: 'flex', alignItems: 'center', marginBottom: '0.5rem' }}>
+                <div style={{ width: '70px', color: '#e0e0e0', fontSize: '0.85rem' }}>{row.bucket}</div>
+                <div style={{ flex: 1, background: '#16213e', height: '1.5rem', borderRadius: '4px', overflow: 'hidden' }}>
+                  <div style={{ width: `${(row.count / maxCount) * 100}%`, background: '#0f3460', height: '100%' }} />
+                </div>
+                <div style={{ width: '50px', textAlign: 'right', color: '#808080', fontSize: '0.85rem' }}>{row.count}</div>
+              </li>
+            ))}
+          </ul>
         </div>
-        
         <div>
-          <h3 style={{ color: '#a0a0a0', marginBottom: '1rem' }}>SOLO Level Distribution</h3>
-          {soloDistributionRows.length > 0 ? (
-            <DataTable headers={['SOLO Level', 'Count']} rows={soloDistributionRows} />
-          ) : (
-            <p style={{ color: '#808080', fontStyle: 'italic' }}>[below privacy threshold]</p>
-          )}
+          <SectionTitle>SOLO Level Distribution</SectionTitle>
+          <DataTable
+            headers={['SOLO Level', 'Concepts']}
+            rows={data.solo_distribution.map((r) => [fmtLabel(r.level), r.count])}
+            emptyMessage={EMPTY}
+          />
         </div>
-      </div>
+      </TwoColumns>
     </div>
   );
 };

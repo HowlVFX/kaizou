@@ -9,23 +9,79 @@ Probe type selection logic (§8):
     Multistructural → PROCESS_TRACE or CONCEPT_SORT
     Relational     → PERTURBATION or NEAR_TRANSFER
     Extended_Abstract → FAR_TRANSFER or ANALOGY_*
+
+Payload probe types carry their own answer key, which is validated here
+before the probe can be served:
+    CLOZE             blanked term + aliases + the claim it blanks
+    MISCONCEPTION_MCQ 4 options, exactly one correct, every distractor
+                      mapped to a named misconception (§5.14 — an unmapped
+                      distractor is a defect and fails validation)
+    CONCEPT_SORT      5–6 items with two different partitions: by mechanism
+                      (G_m) and by surface (G_s) (§5.13.1)
+
+If generation keeps failing validation or leakage, ``fallback_probe`` builds
+a hand-authored probe with no AI call (§6.7 step 5).
 """
 from __future__ import annotations
 
 import logging
+import random
+import re
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
-from app.providers.generation import GenerationClient, get_generation_client, strict_object
+from app.providers.generation import GenerationClient, strict_object
 
 logger = logging.getLogger(__name__)
 
 PROBE_SCHEMA = strict_object({"prompt_text": {"type": "string"}})
 
+CLOZE_SCHEMA = strict_object({
+    "prompt_text": {"type": "string"},
+    "answer": {"type": "string"},
+    "aliases": {"type": "array", "items": {"type": "string"}},
+    "claim_index": {"type": "integer"},
+})
+
+MCQ_SCHEMA = strict_object({
+    "prompt_text": {"type": "string"},
+    "claim_index": {"type": "integer"},
+    "options": {
+        "type": "array",
+        "items": strict_object({
+            "text": {"type": "string"},
+            "is_correct": {"type": "boolean"},
+            "misconception_tag": {"type": ["string", "null"]},
+        }),
+    },
+})
+
+_GROUPS = {
+    "type": "array",
+    "items": strict_object({
+        "name": {"type": "string"},
+        "item_indices": {"type": "array", "items": {"type": "integer"}},
+    }),
+}
+SORT_SCHEMA = strict_object({
+    "prompt_text": {"type": "string"},
+    "items": {"type": "array", "items": {"type": "string"}},
+    "mechanism_groups": _GROUPS,
+    "surface_groups": _GROUPS,
+})
+
+MAX_CONTEXT_CLAIMS = 10
+BLANK = "_____"
+
 # Probe type → prompt template
 PROBE_TEMPLATES = {
     "CLOZE": (
         "Create a fill-in-the-blank question about '{label}'. "
-        "Remove one key term from a factual statement about this concept. "
-        "The blank must test a specific claim, not a generic fact."
+        "Take ONE of the listed claims, rephrase it, and replace one key term "
+        f"with '{BLANK}'. The blank must test a specific claim, not a generic "
+        "fact. Return the removed term as 'answer', accepted equivalent forms "
+        "as 'aliases', and the 0-based index of the claim as 'claim_index'. "
+        "The answer must NOT appear anywhere in prompt_text."
     ),
     "RECALL": (
         "Create an open-ended recall question about '{label}'. "
@@ -43,14 +99,20 @@ PROBE_TEMPLATES = {
         "The answer must be verifiable by execution."
     ),
     "MISCONCEPTION_MCQ": (
-        "Create a multiple-choice question about '{label}' where the wrong "
-        "answers correspond to common misconceptions. Each distractor must "
-        "map to a named misconception. Include 4 options."
+        "Create a multiple-choice question about '{label}' testing one of the "
+        "listed claims (give its 0-based index as 'claim_index'). Provide "
+        "exactly 4 options: exactly one correct (is_correct=true, "
+        "misconception_tag=null) and three distractors, each corresponding to "
+        "a common, named misconception (misconception_tag = a short snake_case "
+        "name for that misconception, e.g. 'confuses_tdz_with_hoisting')."
     ),
     "CONCEPT_SORT": (
-        "Create a concept-sort question. Present 5-6 items that relate to "
-        "'{label}' and ask the learner to group them. Include two valid "
-        "groupings: one by underlying mechanism and one by surface appearance."
+        "Create a concept-sort question. Present 5-6 short items that relate "
+        "to '{label}' and ask the learner to group them. Provide two valid "
+        "groupings over the 0-based item indices: 'mechanism_groups' (by "
+        "underlying mechanism) and 'surface_groups' (by surface appearance). "
+        "Each grouping must use every item exactly once, have at least 2 "
+        "groups, and the two groupings must differ."
     ),
     "PERTURBATION": (
         "Create a perturbation question about '{label}'. Change one "
@@ -82,114 +144,317 @@ PROBE_TEMPLATES = {
     ),
 }
 
-# SOLO level → eligible probe types (§8)
-SOLO_PROBE_MAP: dict[str, list[str]] = {
-    "Prestructural": ["CLOZE"],
-    "Unistructural": ["CLOZE", "RECALL"],
-    "Multistructural": ["RECALL", "PROCESS_TRACE", "CONCEPT_SORT"],
-    "Relational": [
+# Hand-authored fallbacks (§6.7 step 5) — no AI, no claim text.
+FALLBACK_TEMPLATES = {
+    "RECALL": "Explain {label} in your own words. Cover what it is, how it works, and why it matters.",
+    "PROCESS_TRACE": "Walk through {label} step by step, in order, and say what causes each step to happen.",
+    "PROCEDURAL": "Describe the procedure for {label}: what are the inputs, the steps, and the expected output?",
+    "PERTURBATION": "Pick one condition in {label} and change it. Which later steps change as a result, and which stay the same? Explain why.",
+    "NEAR_TRANSFER": "Describe a new situation, similar to the one in your notes, where {label} applies. Explain how it applies there.",
+    "FAR_TRANSFER": "Describe a situation in a completely different field that works on the same principle as {label}. Explain the correspondence.",
+    "ANALOGY_FORWARD": "Using your analogy for {label}: if something changes in the analogy, what happens in the real system?",
+    "ANALOGY_SIMULATE": "Run your analogy for {label} step by step and describe the real-world outcome at each step.",
+    "ANALOGY_BREAKDOWN": "Where does your analogy for {label} stop working? Which parts do not carry over?",
+}
+
+# Types whose AI output cannot be replaced by a hand-authored template of the
+# same type fall back to RECALL.
+FALLBACK_TYPE = {"MISCONCEPTION_MCQ": "RECALL", "CONCEPT_SORT": "RECALL"}
+
+# SOLO level → eligible probe types (§8). Tuples: callers must never be able
+# to mutate this shared table.
+SOLO_PROBE_MAP: dict[str, tuple[str, ...]] = {
+    "Prestructural": ("CLOZE",),
+    "Unistructural": ("CLOZE", "RECALL"),
+    "Multistructural": ("RECALL", "PROCESS_TRACE", "CONCEPT_SORT"),
+    "Relational": (
         "PROCESS_TRACE", "PERTURBATION", "NEAR_TRANSFER",
         "MISCONCEPTION_MCQ",
-    ],
-    "Extended_Abstract": [
+    ),
+    "Extended_Abstract": (
         "FAR_TRANSFER", "ANALOGY_FORWARD", "ANALOGY_SIMULATE",
         "ANALOGY_BREAKDOWN",
-    ],
+    ),
 }
+
+ORDER_DEPENDENT_TYPES = frozenset({"PROCESS_TRACE", "PERTURBATION"})
+ANALOGY_TYPES = frozenset({"ANALOGY_FORWARD", "ANALOGY_SIMULATE", "ANALOGY_BREAKDOWN"})
+
+_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "is", "are", "was",
+    "were", "be", "by", "for", "with", "that", "this", "it", "its", "as", "at",
+    "from", "which", "when", "then", "than", "into", "their", "there", "these",
+})
+
+
+class ProbeValidationError(ValueError):
+    """Structured generator output failed probe validation."""
+
+
+@dataclass
+class GeneratedProbe:
+    probe_type: str
+    prompt_text: str
+    payload: dict = field(default_factory=dict)          # learner-visible extras
+    target_claim_index: Optional[int] = None
+    cloze: Optional[dict] = None
+    mcq: Optional[dict] = None
+    sort: Optional[dict] = None
+    fallback: bool = False
+
+
+def normalise_tag(tag: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (tag or "").lower()).strip("_")[:64]
+
+
+def validate_mcq(data: dict, n_claims: int) -> tuple[str, dict, dict, Optional[int]]:
+    """Return (prompt, learner payload, snapshot mcq, claim_index) or raise."""
+    prompt = (data.get("prompt_text") or "").strip()
+    options = data.get("options") or []
+    if not prompt:
+        raise ProbeValidationError("MCQ has no question text")
+    if len(options) != 4:
+        raise ProbeValidationError(f"MCQ must have 4 options, got {len(options)}")
+    correct = [i for i, o in enumerate(options) if o.get("is_correct")]
+    if len(correct) != 1:
+        raise ProbeValidationError("MCQ must have exactly one correct option")
+    texts = [(o.get("text") or "").strip() for o in options]
+    if any(not t for t in texts) or len({t.casefold() for t in texts}) != 4:
+        raise ProbeValidationError("MCQ options must be non-empty and distinct")
+    for i, o in enumerate(options):
+        if i != correct[0] and not normalise_tag(o.get("misconception_tag") or ""):
+            raise ProbeValidationError("every MCQ distractor must map to a misconception")
+
+    order = list(range(4))
+    random.shuffle(order)  # the generator tends to put the key first
+    shuffled = [options[i] for i in order]
+    new_correct = order.index(correct[0])
+    distractor_map = {
+        str(pos): normalise_tag(o["misconception_tag"])
+        for pos, o in enumerate(shuffled) if pos != new_correct
+    }
+    ci = data.get("claim_index")
+    claim_index = ci if isinstance(ci, int) and 0 <= ci < n_claims else None
+    return (
+        prompt,
+        {"options": [(o.get("text") or "").strip() for o in shuffled]},
+        {"correct_index": new_correct, "n_options": 4, "distractor_map": distractor_map},
+        claim_index,
+    )
+
+
+def validate_sort(data: dict) -> tuple[str, dict, dict]:
+    """Return (prompt, learner payload, snapshot sort) or raise."""
+    from app.grading.concept_sort import partition_labels
+
+    prompt = (data.get("prompt_text") or "").strip()
+    items = [(i or "").strip() for i in (data.get("items") or [])]
+    if not prompt:
+        raise ProbeValidationError("concept sort has no instructions")
+    if not 4 <= len(items) <= 8 or any(not i for i in items):
+        raise ProbeValidationError(f"concept sort needs 4-8 non-empty items, got {len(items)}")
+
+    def groups_of(key: str) -> list[list[int]]:
+        return [list(g.get("item_indices") or []) for g in (data.get(key) or [])]
+
+    g_m, g_s = groups_of("mechanism_groups"), groups_of("surface_groups")
+    labels_m = partition_labels(g_m, len(items))
+    labels_s = partition_labels(g_s, len(items))
+    if labels_m is None or labels_s is None:
+        raise ProbeValidationError("each grouping must use every item exactly once")
+    if len(g_m) < 2 or len(g_s) < 2:
+        raise ProbeValidationError("each grouping needs at least 2 groups")
+    if sorted(map(sorted, g_m)) == sorted(map(sorted, g_s)):
+        raise ProbeValidationError("mechanism and surface groupings must differ")
+    return (
+        prompt,
+        {"items": items},
+        {"n_items": len(items), "mechanism_groups": g_m, "surface_groups": g_s},
+    )
+
+
+def validate_cloze(data: dict, claims: list[dict]) -> tuple[str, dict, Optional[int]]:
+    from app.probes.leakage import check_cloze_leakage
+
+    prompt = (data.get("prompt_text") or "").strip()
+    answer = (data.get("answer") or "").strip()
+    if not prompt or not answer:
+        raise ProbeValidationError("cloze needs question text and an answer")
+    if "___" not in prompt:
+        raise ProbeValidationError("cloze prompt has no blank")
+    aliases = [a.strip() for a in (data.get("aliases") or []) if a and a.strip()]
+    if check_cloze_leakage(prompt, [answer, *aliases]):
+        raise ProbeValidationError("cloze prompt contains its own answer")
+    ci = data.get("claim_index")
+    claim_index = ci if isinstance(ci, int) and 0 <= ci < min(len(claims), MAX_CONTEXT_CLAIMS) else None
+    return prompt, {"answer": answer, "aliases": aliases}, claim_index
+
+
+def fallback_probe(probe_type: str, concept: dict, claims: list[dict]) -> GeneratedProbe:
+    """Hand-authored probe, no AI (§6.7 step 5)."""
+    label = concept.get("canonical_label") or "this concept"
+    if probe_type == "CLOZE":
+        cloze = _deterministic_cloze(claims)
+        if cloze is not None:
+            idx, prompt, answer = cloze
+            return GeneratedProbe(
+                probe_type="CLOZE", prompt_text=prompt, target_claim_index=idx,
+                cloze={"answer": answer, "aliases": []}, fallback=True,
+            )
+        probe_type = "RECALL"
+    probe_type = FALLBACK_TYPE.get(probe_type, probe_type)
+    template = FALLBACK_TEMPLATES.get(probe_type, FALLBACK_TEMPLATES["RECALL"])
+    return GeneratedProbe(
+        probe_type=probe_type, prompt_text=template.format(label=label), fallback=True,
+    )
+
+
+def _deterministic_cloze(claims: list[dict]) -> Optional[tuple[int, str, str]]:
+    """Blank the longest alias (else the longest content word) of a claim."""
+    for idx, claim in enumerate(claims):
+        text = claim.get("text") or ""
+        candidates = sorted(
+            (a for a in (claim.get("aliases") or []) if a and a in text),
+            key=len, reverse=True,
+        )
+        if not candidates:
+            words = [w.strip(".,;:!?()\"'") for w in text.split()]
+            words = [w for w in words if len(w) >= 5 and w.lower() not in _STOPWORDS]
+            candidates = sorted(words, key=len, reverse=True)
+        if candidates:
+            term = candidates[0]
+            prompt = "Fill in the blank: " + text.replace(term, BLANK, 1)
+            if term.lower() not in prompt.lower():
+                return idx, prompt, term
+    return None
 
 
 class ProbeGenerator:
     """Generates probe prompts via LLM structured output."""
 
-    def __init__(self, client: GenerationClient | None = None):
-        self._client = client or get_generation_client()
+    def __init__(self, client: GenerationClient | None = None, *, conn=None):
+        if client is None:
+            from app.providers.generation import get_guarded_generation_client
+            client = get_guarded_generation_client(conn=conn)
+        self._client = client
 
     async def select_probe_type(
         self,
         solo_level: str,
         shape: str,
         attempted_types: list[str] | None = None,
+        track: str | None = None,
     ) -> str:
         """Select an appropriate probe type based on SOLO level (§8).
 
-        Avoids recently attempted types to ensure diversity
-        (mastery condition 3: at least 2 distinct types).
+        Round-robin over types not yet used for this concept, so mastery
+        condition 3 (>= 2 distinct types, §5.18.1) is reachable. When every
+        eligible type has been used, the least recently used one is chosen.
+        ``attempted_types`` is ordered most-recent first.
         """
-        import random
+        # Copy — never mutate the shared SOLO_PROBE_MAP.
+        eligible = list(SOLO_PROBE_MAP.get(solo_level, ("RECALL",)))
 
-        eligible = SOLO_PROBE_MAP.get(solo_level, ["RECALL"])
-
-        # Filter out recently attempted types
-        if attempted_types:
-            remaining = [t for t in eligible if t not in attempted_types]
-            if remaining:
-                eligible = remaining
+        if shape == "DEFINITION":
+            narrowed = [t for t in eligible if t not in ORDER_DEPENDENT_TYPES]
+            eligible = narrowed or eligible
+        if track != "ANALOGY":
+            narrowed = [t for t in eligible if t not in ANALOGY_TYPES]
+            eligible = narrowed or ["FAR_TRANSFER"]
 
         # For PROCEDURAL shape, prefer PROCEDURAL type
         if shape == "PROCEDURAL" and "PROCEDURAL" not in eligible:
             eligible.append("PROCEDURAL")
 
-        return random.choice(eligible)
+        attempted = list(attempted_types or [])
+        remaining = [t for t in eligible if t not in attempted]
+        if remaining:
+            return random.choice(remaining)
+        # All used: least recently used (largest index in most-recent-first list).
+        return max(eligible, key=lambda t: attempted.index(t))
 
     async def generate_probe(
         self,
         concept: dict,
         claims: list[dict],
         probe_type: str,
-    ) -> tuple[str, dict]:
-        """Generate a probe prompt and answer key.
+        variant: str = "",
+        violation: str | None = None,
+        focus: str | None = None,
+    ) -> GeneratedProbe:
+        """Generate and validate one probe via the guarded LLM client.
 
         Args:
             concept: concept dict with 'canonical_label', 'shape', etc.
             claims: list of claim dicts with 'text', 'order_index', etc.
             probe_type: one of the probe type enum values.
+            variant: cache variant — each leakage retry is a fresh sample.
+            violation: leakage report from the previous attempt, appended so
+                the regenerated probe avoids the same leak (§6.7).
+            focus: optional extra instruction (e.g. the target branch).
 
-        Returns:
-            (prompt_text, answer_key_snapshot): the generated prompt and
-            the answer key for grading.
+        Raises:
+            ProbeValidationError: the structured output is not a valid probe.
+            ProviderError: the provider call failed (budget, auth, network).
         """
         label = concept.get("canonical_label", "this concept")
         shape = concept.get("shape", "DEFINITION")
         claim_texts = [c["text"] for c in claims]
 
-        # Build the template
         template = PROBE_TEMPLATES.get(probe_type, PROBE_TEMPLATES["RECALL"])
         base_prompt = template.format(label=label)
 
-        # Build context for LLM
         context = (
             f"Concept: {label}\n"
             f"Shape: {shape}\n"
             f"Number of claims: {len(claim_texts)}\n\n"
             f"Claims for context (DO NOT reproduce these verbatim in the question):\n"
         )
-        for i, ct in enumerate(claim_texts[:10], 1):
+        for i, ct in enumerate(claim_texts[:MAX_CONTEXT_CLAIMS]):
             context += f"  {i}. {ct}\n"
+        if focus:
+            context += f"\n{focus}\n"
+        if violation:
+            context += (
+                "\nYour previous question was rejected because it leaked the "
+                f"answer ({violation}). Rephrase it so it does not restate the claims.\n"
+            )
 
         system_prompt = (
             "You are generating a learning assessment probe. "
-            "Generate ONLY the question text that the learner will see. "
-            "Do NOT include the answer. Do NOT reproduce any claim verbatim — "
-            "the question must test understanding, not recognition. "
-            "Return JSON: {\"prompt_text\": \"...\"}"
+            "Generate ONLY what the learner will see plus the structured fields "
+            "requested. Do NOT include the answer in the question text. Do NOT "
+            "reproduce any claim verbatim — the question must test "
+            "understanding, not recognition. Return JSON matching the schema."
         )
 
-        # The previous transport set temperature=0.7 for variety. Claude Opus
-        # 5.5 rejects sampling parameters; variety across leakage retries comes
-        # from independent sampling at default settings.
+        schema = {
+            "CLOZE": CLOZE_SCHEMA,
+            "MISCONCEPTION_MCQ": MCQ_SCHEMA,
+            "CONCEPT_SORT": SORT_SCHEMA,
+        }.get(probe_type, PROBE_SCHEMA)
+
+        # `variant` gives each leakage retry its own cache entry, so a retry is
+        # a fresh sample instead of replaying the probe that just leaked.
         result = await self._client.generate_structured(
             system=system_prompt,
             prompt=f"{base_prompt}\n\n{context}",
-            schema=PROBE_SCHEMA,
+            schema=schema,
+            variant=variant,
         )
-        prompt_text = result.data.get("prompt_text") or f"Explain {label}."
+        data = result.data or {}
 
-        # Build answer key snapshot (the claims this probe grades against)
-        answer_key = {
-            "claims": claim_texts,
-            "probe_type": probe_type,
-            "concept_label": label,
-            "shape": shape,
-        }
+        if probe_type == "MISCONCEPTION_MCQ":
+            prompt, payload, mcq, ci = validate_mcq(data, min(len(claims), MAX_CONTEXT_CLAIMS))
+            return GeneratedProbe(probe_type, prompt, payload=payload, mcq=mcq, target_claim_index=ci)
+        if probe_type == "CONCEPT_SORT":
+            prompt, payload, sort = validate_sort(data)
+            return GeneratedProbe(probe_type, prompt, payload=payload, sort=sort)
+        if probe_type == "CLOZE":
+            prompt, cloze, ci = validate_cloze(data, claims)
+            return GeneratedProbe(probe_type, prompt, cloze=cloze, target_claim_index=ci)
 
-        return prompt_text, answer_key
+        prompt = (data.get("prompt_text") or "").strip()
+        if not prompt:
+            raise ProbeValidationError("generator returned no question text")
+        return GeneratedProbe(probe_type, prompt)

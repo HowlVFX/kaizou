@@ -25,10 +25,9 @@ from dataclasses import dataclass
 from app.providers.classification import (
     Choice,
     ChoiceAnswer,
-    JevClient,
     Score,
     ScoreAnswer,
-    get_classification_client,
+    get_guarded_classification_client,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,8 +89,8 @@ class NoteClassifier:
         ),
     }
 
-    def __init__(self, client: JevClient | None = None):
-        self._client = client or get_classification_client()
+    def __init__(self, client=None, *, conn=None):
+        self._client = client or get_guarded_classification_client(conn=conn)
 
     async def classify(self, text: str) -> ClassificationResult:
         """Classify a note's text into track, shape, category, and Bloom level."""

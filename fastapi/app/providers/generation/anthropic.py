@@ -25,7 +25,7 @@ from app.providers.shared.errors import (
     missing_key_error,
 )
 from app.providers.shared.http import post_json
-from app.providers.shared.types import HealthCheckResult, Usage
+from app.providers.shared.types import HealthCheckResult, Usage, usage_int
 
 MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
@@ -65,6 +65,7 @@ class AnthropicGenerationClient:
         schema: dict[str, Any],
         max_tokens: int | None = None,
         effort: str | None = None,
+        variant: str = "",  # cache-only concept; ignored by the provider
     ) -> StructuredResult:
         output_config: dict[str, Any] = {"format": {"type": "json_schema", "schema": schema}}
         chosen_effort = effort or self._effort
@@ -89,33 +90,48 @@ class AnthropicGenerationClient:
             transport=self._transport,
         )
 
+        # Usage first: every error below is raised after the call was billed.
+        usage_raw = body.get("usage") or {}
+        usage = Usage(
+            input_tokens=usage_int(usage_raw, "input_tokens"),
+            output_tokens=usage_int(usage_raw, "output_tokens"),
+        )
+
         stop_reason = body.get("stop_reason")
         if stop_reason == "refusal":
-            raise ProviderRefusalError(self.provider_label, "model declined the request (stop_reason=refusal)")
+            raise ProviderRefusalError(
+                self.provider_label, "model declined the request (stop_reason=refusal)", usage=usage,
+            )
         if stop_reason == "max_tokens":
             raise ProviderResponseError(
                 self.provider_label,
                 "output truncated (stop_reason=max_tokens); the JSON is incomplete. "
                 "Raise GENERATION_MAX_TOKENS or lower GENERATION_EFFORT.",
+                usage=usage,
             )
         if stop_reason == "model_context_window_exceeded":
-            raise ProviderResponseError(self.provider_label, "input exceeds the model context window")
+            raise ProviderResponseError(
+                self.provider_label, "input exceeds the model context window", usage=usage,
+            )
 
         # Thinking blocks come first; select the text block by type, never by index.
         texts = [b.get("text", "") for b in body.get("content", []) if b.get("type") == "text"]
         if not texts:
-            raise ProviderResponseError(self.provider_label, f"no text block in response (stop_reason={stop_reason})")
+            raise ProviderResponseError(
+                self.provider_label, f"no text block in response (stop_reason={stop_reason})", usage=usage,
+            )
+        try:
+            data = parse_json_object(self.provider_label, "".join(texts))
+        except ProviderResponseError as exc:
+            exc.usage = usage
+            raise
 
-        usage_raw = body.get("usage") or {}
         return StructuredResult(
-            data=parse_json_object(self.provider_label, "".join(texts)),
+            data=data,
             model=str(body.get("model", self.model)),
             provider=self.provider_label,
             stop_reason=stop_reason,
-            usage=Usage(
-                input_tokens=usage_raw.get("input_tokens"),
-                output_tokens=usage_raw.get("output_tokens"),
-            ),
+            usage=usage,
         )
 
 

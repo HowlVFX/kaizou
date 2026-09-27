@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
 import { recallStatus } from '../data/demo';
-import { Brain, CheckCircle, AlertTriangle, BarChart, ArrowUpRight, Check } from '../components/Icon';
+import { api, describeApiError } from '../lib/api';
+import { Brain, CheckCircle, AlertTriangle, BarChart, RefreshCw } from '../components/Icon';
 
 function useVW() {
   const [vw, setVw] = useState(window.innerWidth);
@@ -14,130 +15,113 @@ function useVW() {
   return vw;
 }
 
-// Mini SVG line chart data
-const RECALL_HISTORY = [
-  { date: 'Aug 1', avg: 52 }, { date: 'Aug 5', avg: 58 }, { date: 'Aug 9', avg: 55 },
-  { date: 'Aug 13', avg: 63 }, { date: 'Aug 17', avg: 60 }, { date: 'Aug 21', avg: 68 },
-  { date: 'Aug 25', avg: 65 }, { date: 'Aug 30', avg: 71 },
-];
-
-const GROWTH_DATA = [4, 6, 6, 8, 10, 11, 13, 17];
-
-const MISCONCEPTIONS = [
-  { concept: 'Hoisting', text: 'Hoisting moves code physically to the top of the file.', status: 'corrected' },
-  { concept: 'TDZ', text: 'let and const are not hoisted at all.', status: 'active' },
-  { concept: 'Scope', text: 'var is block-scoped like let.', status: 'corrected' },
-];
-
-const CAPABILITIES = [
-  { label: 'Counterfactual on Hoisting', date: 'Aug 28', type: 'counterfactual' },
-  { label: 'Transfer: var vs const in loops', date: 'Aug 25', type: 'transfer' },
-  { label: 'Process trace: TCP 3-way handshake', date: 'Aug 22', type: 'process' },
-  { label: 'Relational: Normalization ↔ Indexing', date: 'Aug 20', type: 'relational' },
-];
-
-function LineChart({ data }: { data: { date: string; avg: number }[] }) {
-  const W = 500, H = 120, PAD = 20;
-  const minV = 40, maxV = 100;
-  const pts = data.map((d, i) => ({
-    x: PAD + (i / (data.length - 1)) * (W - 2 * PAD),
-    y: H - PAD - ((d.avg - minV) / (maxV - minV)) * (H - 2 * PAD),
-    ...d,
-  }));
-  const pathD = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ');
-  const areaD = `${pathD} L ${pts[pts.length - 1].x} ${H - PAD} L ${pts[0].x} ${H - PAD} Z`;
-
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 120, overflow: 'visible' }}>
-      <defs>
-        <linearGradient id="area-grad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#58CC02" stopOpacity="0.25" />
-          <stop offset="100%" stopColor="#58CC02" stopOpacity="0.02" />
-        </linearGradient>
-      </defs>
-      {/* Grid lines */}
-      {[50, 60, 70, 80].map(v => {
-        const y = H - PAD - ((v - minV) / (maxV - minV)) * (H - 2 * PAD);
-        return (
-          <g key={v}>
-            <line x1={PAD} y1={y} x2={W - PAD} y2={y} stroke="var(--border)" strokeWidth={0.5} />
-            <text x={PAD - 4} y={y + 3} textAnchor="end" fontSize={8} fill="var(--text-dim)">{v}%</text>
-          </g>
-        );
-      })}
-      {/* Area */}
-      <path d={areaD} fill="url(#area-grad)" />
-      {/* Line */}
-      <path d={pathD} fill="none" stroke="var(--green)" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
-      {/* Points */}
-      {pts.map((p, i) => (
-        <g key={i}>
-          <circle cx={p.x} cy={p.y} r={3} fill="var(--green)" />
-          <text x={p.x} y={H - 4} textAnchor="middle" fontSize={7} fill="var(--text-dim)">{p.date}</text>
-        </g>
-      ))}
-    </svg>
-  );
+// GET /api/analytics/dashboard
+interface Dashboard {
+  soloLevels: { solo_level: string | null; count: number }[];
+  recallDistribution: { band: 'strong' | 'fading' | 'weak' | 'unreviewed'; count: number }[];
+  absorptionEfficiency: number | null;
+  absorption: { absorbed: number; ingested: number };
 }
 
-function GrowthChart({ data }: { data: number[] }) {
-  const max = Math.max(...data);
-  const W = 500, H = 80, PAD = 20;
-  const barW = (W - 2 * PAD) / data.length - 4;
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 80 }}>
-      {data.map((v, i) => {
-        const bh = ((v / max) * (H - 2 * PAD));
-        const x = PAD + i * ((W - 2 * PAD) / data.length) + 2;
-        const y = H - PAD - bh;
-        return (
-          <g key={i}>
-            <rect x={x} y={y} width={barW} height={bh} rx={2} fill="var(--blue)" opacity={0.6 + (i / data.length) * 0.4} />
-            <text x={x + barW / 2} y={H - 4} textAnchor="middle" fontSize={7} fill="var(--text-dim)">{['1', '5', '9', '13', '17', '21', '25', '30'][i]}</text>
-          </g>
-        );
-      })}
-    </svg>
-  );
-}
+const SOLO_ORDER = ['Extended Abstract', 'Relational', 'Multistructural', 'Unistructural', 'Prestructural'] as const;
+const SOLO_COLORS: Record<string, string> = {
+  'Extended Abstract': 'var(--green)',
+  Relational: 'var(--green)',
+  Multistructural: 'var(--blue)',
+  Unistructural: 'var(--orange)',
+  Prestructural: 'var(--red)',
+};
 
-const SOLO_DISTRIBUTION = [
-  { level: 'Extended Abstract', count: 2, color: 'var(--green)' },
-  { level: 'Relational', count: 5, color: 'var(--green)' },
-  { level: 'Multistructural', count: 4, color: 'var(--blue)' },
-  { level: 'Unistructural', count: 3, color: 'var(--orange)' },
-  { level: 'Prestructural', count: 3, color: 'var(--red)' },
-];
-const TOTAL_SOLO = SOLO_DISTRIBUTION.reduce((s, d) => s + d.count, 0);
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function mapDashboard(d: any): Dashboard {
+  return {
+    soloLevels: Array.isArray(d?.soloLevels) ? d.soloLevels.map((s: any) => ({
+      solo_level: typeof s?.solo_level === 'string' ? s.solo_level.replace(/_/g, ' ') : null,
+      count: Number(s?.count) || 0,
+    })) : [],
+    recallDistribution: Array.isArray(d?.recallDistribution) ? d.recallDistribution.map((r: any) => ({
+      band: r?.band, count: Number(r?.count) || 0,
+    })) : [],
+    absorptionEfficiency: typeof d?.absorptionEfficiency === 'number' ? d.absorptionEfficiency : null,
+    absorption: {
+      absorbed: Number(d?.absorption?.absorbed) || 0,
+      ingested: Number(d?.absorption?.ingested) || 0,
+    },
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 export default function InsightsPage() {
-  const { nodes } = useApp();
+  const { nodes, graphStatus } = useApp();
   const navigate = useNavigate();
   const vw = useVW();
   const isMobile = vw < 640;
   const [activeTab, setActiveTab] = useState<'overview' | 'transfer' | 'misconceptions'>('overview');
 
-  const healthy = nodes.filter(n => n.recall !== null && n.recall >= 75).length;
-  const weakening = nodes.filter(n => n.recall !== null && n.recall >= 50 && n.recall < 75).length;
-  const review = nodes.filter(n => n.recall !== null && n.recall < 50).length;
-  const avgRecall = Math.round(
-    nodes.filter(n => n.recall !== null).reduce((s, n) => s + (n.recall ?? 0), 0) /
-    nodes.filter(n => n.recall !== null).length
-  );
+  const [dash, setDash] = useState<Dashboard | null>(null);
+  const [dashStatus, setDashStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [dashError, setDashError] = useState<string | null>(null);
+
+  const loadDashboard = useCallback(async () => {
+    setDashStatus('loading');
+    setDashError(null);
+    try {
+      const d = await api<unknown>('/api/analytics/dashboard');
+      setDash(mapDashboard(d));
+      setDashStatus('ready');
+    } catch (err) {
+      setDashError(describeApiError(err, 'Could not load analytics.'));
+      setDashStatus('error');
+    }
+  }, []);
+
+  useEffect(() => { loadDashboard(); }, [loadDashboard]);
+
+  const band = (b: Dashboard['recallDistribution'][number]['band']) =>
+    dash?.recallDistribution.find(r => r.band === b)?.count;
+
+  const reviewed = nodes.filter(n => n.recall !== null);
+  const healthy = band('strong') ?? nodes.filter(n => n.recall !== null && n.recall >= 75).length;
+  const weakening = band('fading') ?? nodes.filter(n => n.recall !== null && n.recall >= 50 && n.recall < 75).length;
+  const review = band('weak') ?? nodes.filter(n => n.recall !== null && n.recall < 50).length;
+  const unreviewed = band('unreviewed') ?? nodes.filter(n => n.recall === null && !n.locked).length;
+  const avgRecall = reviewed.length
+    ? Math.round(reviewed.reduce((s, n) => s + (n.recall ?? 0), 0) / reviewed.length)
+    : null;
+  const totalConcepts = nodes.filter(n => !n.locked).length;
+  const monthLabel = new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+
+  const soloRows = SOLO_ORDER.map(level => ({
+    level,
+    count: dash?.soloLevels.find(s => s.solo_level === level)?.count ?? 0,
+    color: SOLO_COLORS[level],
+  }));
+  const totalSolo = soloRows.reduce((s, d) => s + d.count, 0);
 
   return (
     <div style={{ padding: isMobile ? '16px 16px' : '32px 40px', height: '100%', overflowY: 'auto', width: '100%', boxSizing: 'border-box' }}>
       <div style={{ marginBottom: 24 }}>
         <h1 style={{ fontSize: 24, fontWeight: 800, margin: '0 0 4px', letterSpacing: '-0.02em' }}>Insights</h1>
-        <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>August 2026 · 17 concepts</p>
+        <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
+          {monthLabel} · {graphStatus === 'loading' && nodes.length === 0 ? 'Loading…' : `${totalConcepts} concept${totalConcepts === 1 ? '' : 's'}`}
+        </p>
       </div>
+
+      {dashStatus === 'error' && (
+        <div role="alert" style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderRadius: 10, background: 'rgba(255,75,75,0.08)', border: '1px solid rgba(255,75,75,0.3)', marginBottom: 20 }}>
+          <span style={{ fontSize: 13, color: 'var(--red)', flex: 1 }}>{dashError}</span>
+          <button onClick={loadDashboard} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', borderRadius: 8, background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--text-2)', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}>
+            <RefreshCw size={12} /> Retry
+          </button>
+        </div>
+      )}
 
       {/* Overview cards — mobile: 2x2, desktop: 4-col */}
       <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr 1fr' : 'repeat(4, 1fr)', gap: isMobile ? 10 : 16, marginBottom: 24 }}>
-        <OverviewCard Icon={Brain} label="Total Concepts" value={17} color="var(--text)" isMobile={isMobile} />
+        <OverviewCard Icon={Brain} label="Total Concepts" value={totalConcepts} color="var(--text)" isMobile={isMobile} />
         <OverviewCard Icon={CheckCircle} label="Healthy" value={healthy} color="var(--green)" isMobile={isMobile} />
         <OverviewCard Icon={AlertTriangle} label="Needs Review" value={review} color="var(--red)" isMobile={isMobile} />
-        <OverviewCard Icon={BarChart} label="Avg Recall" value={`${avgRecall}%`} color="var(--blue)" isMobile={isMobile} />
+        <OverviewCard Icon={BarChart} label="Avg Recall" value={avgRecall !== null ? `${avgRecall}%` : '—'} color="var(--blue)" isMobile={isMobile} />
       </div>
 
       {/* Tabs */}
@@ -162,41 +146,56 @@ export default function InsightsPage() {
         <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '3fr 1.4fr', gap: 20 }}>
           {/* Left column */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {/* Recall chart */}
             <Panel title="Recall Over Time" isMobile={isMobile}>
-              <LineChart data={RECALL_HISTORY} />
+              <NotAvailable text="Recall history isn't tracked yet. This chart will fill in once review history is available." />
             </Panel>
 
-            {/* SOLO distribution */}
             <Panel title="Structural Level Distribution" isMobile={isMobile}>
-              {SOLO_DISTRIBUTION.map(({ level, count, color }) => (
-                <div key={level} style={{ marginBottom: 12 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, fontSize: 13 }}>
-                    <span style={{ color: 'var(--text-2)' }}>{level}</span>
-                    <span style={{ color: 'var(--text-dim)', fontSize: 12 }}>{count} concept{count !== 1 ? 's' : ''}</span>
+              {dashStatus === 'loading' ? <Muted>Loading…</Muted>
+                : totalSolo === 0 ? <Muted>No SOLO levels assessed yet. Review concepts to build this up.</Muted>
+                : soloRows.map(({ level, count, color }) => (
+                  <div key={level} style={{ marginBottom: 12 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, fontSize: 13 }}>
+                      <span style={{ color: 'var(--text-2)' }}>{level}</span>
+                      <span style={{ color: 'var(--text-dim)', fontSize: 12 }}>{count} concept{count !== 1 ? 's' : ''}</span>
+                    </div>
+                    <div style={{ height: 8, background: 'var(--bg-input)', borderRadius: 4, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${(count / totalSolo) * 100}%`, background: color, borderRadius: 4, transition: 'width 0.6s ease' }} />
+                    </div>
                   </div>
-                  <div style={{ height: 8, background: 'var(--bg-input)', borderRadius: 4, overflow: 'hidden' }}>
-                    <div style={{ height: '100%', width: `${(count / TOTAL_SOLO) * 100}%`, background: color, borderRadius: 4, transition: 'width 0.6s ease' }} />
-                  </div>
-                </div>
-              ))}
+                ))}
             </Panel>
 
-            {/* Knowledge growth */}
-            <Panel title="Knowledge Growth (August)" isMobile={isMobile}>
-              <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 12 }}>Concepts added per period</div>
-              <GrowthChart data={GROWTH_DATA} />
+            <Panel title="Absorption" isMobile={isMobile}>
+              {dashStatus === 'loading' ? <Muted>Loading…</Muted>
+                : !dash || dash.absorption.ingested === 0 ? <Muted>No concepts ingested from your notes yet.</Muted>
+                : (
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 10 }}>
+                      <span style={{ fontSize: 26, fontWeight: 800, color: 'var(--blue)', letterSpacing: '-0.02em' }}>
+                        {dash.absorptionEfficiency !== null ? `${Math.round(dash.absorptionEfficiency * 100)}%` : '—'}
+                      </span>
+                      <span style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+                        {dash.absorption.absorbed} of {dash.absorption.ingested} ingested concepts absorbed
+                      </span>
+                    </div>
+                    <div style={{ height: 8, background: 'var(--bg-input)', borderRadius: 4, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${(dash.absorption.absorbed / dash.absorption.ingested) * 100}%`, background: 'var(--blue)', borderRadius: 4, transition: 'width 0.6s ease' }} />
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 8 }}>Absorbed = mastered or recall of 75% and above.</div>
+                  </div>
+                )}
             </Panel>
           </div>
 
           {/* Right column */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {/* Recall breakdown */}
             <Panel title="Recall Breakdown" isMobile={isMobile}>
               {[
                 { label: 'Healthy', val: healthy, color: 'var(--green)' },
                 { label: 'Weakening', val: weakening, color: 'var(--orange)' },
                 { label: 'Needs Review', val: review, color: 'var(--red)' },
+                { label: 'Not reviewed yet', val: unreviewed, color: 'var(--text-dim)' },
               ].map(({ label, val, color }) => (
                 <div key={label} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10, alignItems: 'center' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -208,18 +207,19 @@ export default function InsightsPage() {
               ))}
             </Panel>
 
-            {/* Needs attention */}
             <Panel title="Needs Attention" isMobile={isMobile}>
-              {nodes
-                .filter(n => n.recall !== null && n.recall < 60)
-                .sort((a, b) => (a.recall ?? 0) - (b.recall ?? 0))
-                .slice(0, 5)
-                .map(n => {
+              {(() => {
+                const list = nodes
+                  .filter(n => n.recall !== null && n.recall < 60)
+                  .sort((a, b) => (a.recall ?? 0) - (b.recall ?? 0))
+                  .slice(0, 5);
+                if (list.length === 0) return <Muted>Nothing needs attention right now.</Muted>;
+                return list.map(n => {
                   const rs = recallStatus(n.recall);
                   return (
                     <button
                       key={n.id}
-                      onClick={() => navigate('/retest')}
+                      onClick={() => navigate('/retest', { state: { nodeId: n.id } })}
                       style={{
                         display: 'flex', alignItems: 'center', gap: 8, width: '100%',
                         padding: '8px', borderRadius: 6, marginBottom: 4,
@@ -234,7 +234,8 @@ export default function InsightsPage() {
                       <span style={{ fontSize: 13, color: rs.color, fontWeight: 600 }}>{n.recall}%</span>
                     </button>
                   );
-                })}
+                });
+              })()}
               <button
                 onClick={() => navigate('/retest')}
                 style={{
@@ -245,17 +246,8 @@ export default function InsightsPage() {
               >Start Review Session</button>
             </Panel>
 
-            {/* Capabilities log */}
             <Panel title="Recent Capabilities" isMobile={isMobile}>
-              {CAPABILITIES.map(({ label, date, type }) => {
-                const colorMap: Record<string, string> = { counterfactual: 'var(--orange)', transfer: 'var(--blue)', process: 'var(--green)', relational: 'var(--green)' };
-                return (
-                  <div key={label} style={{ marginBottom: 10, paddingLeft: 10, borderLeft: `2px solid ${colorMap[type] ?? 'var(--border-strong)'}` }}>
-                    <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 2 }}>{label}</div>
-                    <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>{date}</div>
-                  </div>
-                );
-              })}
+              <NotAvailable text="Capability history isn't available yet." />
             </Panel>
           </div>
         </div>
@@ -264,25 +256,8 @@ export default function InsightsPage() {
       {activeTab === 'transfer' && (
         <div style={{ maxWidth: 860 }}>
           <Panel title="Transfer Evidence" isMobile={isMobile}>
-            <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 20 }}>Concepts where you have demonstrated transfer — applying knowledge outside the original example.</p>
-            {[
-              { concept: 'Hoisting', example: 'Applied to class declarations', date: 'Aug 27' },
-              { concept: 'Scope', example: 'Used to explain module patterns', date: 'Aug 24' },
-              { concept: 'TCP', example: 'Compared to QUIC connection setup', date: 'Aug 19' },
-            ].map(({ concept, example, date }) => (
-              <div key={concept} style={{
-                padding: '14px 16px', borderRadius: 8, background: 'var(--bg-input)',
-                border: '1px solid var(--border)', marginBottom: 10,
-                display: 'flex', alignItems: 'center', gap: 16,
-              }}>
-                <div style={{ color: 'var(--blue)' }}><ArrowUpRight size={20} strokeWidth={1.5} /></div>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600, fontSize: 14, color: 'var(--text)', marginBottom: 2 }}>{concept}</div>
-                  <div style={{ fontSize: 13, color: 'var(--text-2)' }}>{example}</div>
-                </div>
-                <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>{date}</div>
-              </div>
-            ))}
+            <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 20 }}>Concepts where you have demonstrated transfer: applying knowledge outside the original example.</p>
+            <NotAvailable text="Transfer evidence isn't available yet. It will appear here once transfer probes are graded." />
           </Panel>
         </div>
       )}
@@ -290,28 +265,24 @@ export default function InsightsPage() {
       {activeTab === 'misconceptions' && (
         <div style={{ maxWidth: 860 }}>
           <Panel title="Misconception Tracker" isMobile={isMobile}>
-            <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 20 }}>Common incorrect beliefs KNODES detected and helped you correct.</p>
-            {MISCONCEPTIONS.map(({ concept, text, status }) => (
-              <div key={concept} style={{
-                padding: '14px 16px', borderRadius: 8, background: 'var(--bg-input)',
-                border: `1px solid ${status === 'active' ? 'var(--orange)' : 'var(--border)'}`,
-                marginBottom: 10, display: 'flex', gap: 12, alignItems: 'flex-start',
-              }}>
-                <span style={{ flexShrink: 0, color: status === 'active' ? 'var(--orange)' : 'var(--green)', display: 'flex' }}>{status === 'active' ? <AlertTriangle size={18} strokeWidth={1.5} /> : <Check size={18} strokeWidth={2} />}</span>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text)', marginBottom: 4 }}>{concept}</div>
-                  <div style={{ fontSize: 13, color: 'var(--text-2)', fontStyle: 'italic' }}>"{text}"</div>
-                </div>
-                <span style={{
-                  fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 4,
-                  color: status === 'active' ? 'var(--orange)' : 'var(--green)',
-                  background: status === 'active' ? 'rgba(255,150,0,0.1)' : 'rgba(88,204,2,0.1)',
-                }}>{status === 'active' ? 'Active' : 'Corrected'}</span>
-              </div>
-            ))}
+            <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 20 }}>Incorrect beliefs detected in your answers and whether you have corrected them.</p>
+            <NotAvailable text="Misconception tracking isn't available yet." />
           </Panel>
         </div>
       )}
+    </div>
+  );
+}
+
+function Muted({ children }: { children: React.ReactNode }) {
+  return <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>{children}</div>;
+}
+
+function NotAvailable({ text }: { text: string }) {
+  return (
+    <div style={{ padding: '18px 0', textAlign: 'center', color: 'var(--text-dim)', fontSize: 13 }}>
+      <RefreshCw size={20} style={{ marginBottom: 8, opacity: 0.4 }} />
+      <div>{text}</div>
     </div>
   );
 }

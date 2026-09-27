@@ -42,7 +42,7 @@ from app.providers.shared.errors import (
     missing_key_error,
 )
 from app.providers.shared.http import post_json
-from app.providers.shared.types import HealthCheckResult, Usage
+from app.providers.shared.types import HealthCheckResult, Usage, usage_float, usage_int
 
 BACKENDS: dict[str, dict[str, str]] = {
     "openrouter": {
@@ -208,16 +208,41 @@ class JevClient:
         )
         return self._parse(body, questions)
 
+    @staticmethod
+    def parse_usage(body: Mapping[str, Any]) -> Usage:
+        """Usage from a Jev response.
+
+        Documented shape (TypeSafe System One reference as mirrored by the
+        ZenMux and Cloudflare Workers AI docs, checked 2026-09-26):
+        ``usage: {"input_tokens": int, "output_tokens": int}``; OpenRouter
+        additionally returns ``usage.cost`` in USD (authoritative when present).
+        ``prompt_tokens``/``completion_tokens`` are accepted as fallbacks.
+        Output is not billed for Jev, so it is recorded as 0 for pricing.
+        """
+        raw = body.get("usage") if isinstance(body, Mapping) else None
+        raw = raw if isinstance(raw, Mapping) else {}
+        return Usage(
+            input_tokens=usage_int(raw, "input_tokens", "prompt_tokens"),
+            output_tokens=usage_int(raw, "output_tokens", "completion_tokens"),
+            cost_usd=usage_float(raw, "cost", "total_cost"),
+        )
+
     def _parse(self, body: dict[str, Any], questions: Mapping[str, Question]) -> Decision:
-        raw_answers = body.get("answers")
+        # Usage first: a malformed answer is still a billed call.
+        usage = self.parse_usage(body)
+        raw_answers = body.get("answers") if isinstance(body, dict) else None
         if not isinstance(raw_answers, dict):
-            raise ProviderResponseError(self.provider_label, f"no 'answers' object in response: {str(body)[:300]}")
+            raise ProviderResponseError(
+                self.provider_label, f"no 'answers' object in response: {str(body)[:300]}", usage=usage,
+            )
 
         answers: dict[str, Answer] = {}
         for qid, question in questions.items():
             a = raw_answers.get(qid)
             if not isinstance(a, dict):
-                raise ProviderResponseError(self.provider_label, f"missing answer for question {qid!r}")
+                raise ProviderResponseError(
+                    self.provider_label, f"missing answer for question {qid!r}", usage=usage,
+                )
             try:
                 if isinstance(question, Choice):
                     answers[qid] = ChoiceAnswer(
@@ -237,15 +262,9 @@ class JevClient:
                     )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ProviderResponseError(
-                    self.provider_label, f"malformed answer for {qid!r}: {a!r}",
+                    self.provider_label, f"malformed answer for {qid!r}: {a!r}", usage=usage,
                 ) from exc
 
-        usage_raw = body.get("usage") or {}
-        usage = Usage(
-            input_tokens=usage_raw.get("input_tokens") or usage_raw.get("prompt_tokens"),
-            output_tokens=usage_raw.get("output_tokens") or usage_raw.get("completion_tokens"),
-            cost_usd=usage_raw.get("cost"),
-        )
         return Decision(answers=answers, model=str(body.get("model", self.model)), usage=usage, raw=body)
 
 
@@ -267,6 +286,75 @@ def get_classification_client(settings=None, **overrides) -> JevClient:
         timeout_seconds=min(settings.provider_timeout_seconds, 60.0),
         max_retries=settings.provider_max_retries,
         **overrides,
+    )
+
+
+class GuardedJevClient:
+    """Wraps JevClient with budget enforcement + classification cache.
+
+    Jev is cheap (input-billed, output free) but a looping bug still spends,
+    so classification goes through the same reserve/record/cache path.
+    """
+
+    def __init__(self, inner: "JevClient", *, ledger, cache, settings):
+        self._inner = inner
+        self._ledger = ledger
+        self._cache = cache
+        self._s = settings
+        self.model = inner.model
+
+    @property
+    def provider_label(self) -> str:
+        return self._inner.provider_label
+
+    async def decide(self, state, questions: Mapping[str, Question]) -> Decision:
+        import hashlib as _h
+        import json as _j
+        key = _h.sha256(_j.dumps(
+            [self.model, self._s.ai_prompt_version, state,
+             {k: v.to_wire() for k, v in questions.items()}],
+            sort_keys=True, ensure_ascii=False, default=str,
+        ).encode()).hexdigest()
+
+        cached = await self._cache.get("classification", key)
+        if cached is not None:
+            # Rehydrate typed answers from the cached raw body.
+            return self._inner._parse(cached, questions)
+
+        # Estimate worst-case input tokens from the serialized request.
+        import math as _m
+        approx_chars = len(_j.dumps({"state": state, "questions": {k: v.to_wire() for k, v in questions.items()}}, default=str))
+        worst_in = max(1, _m.ceil(approx_chars / 4))
+        from app.providers.guard import settle_call
+        from app.providers.pricing import worst_case_cost_inr
+        worst = worst_case_cost_inr(self.model, worst_in, 0, self._s.usd_inr_rate)
+        reservation = await self._ledger.reserve(self.provider_label, self.model, "classification", worst)
+        # Settled exactly once: usage.cost (authoritative) or tokens on success
+        # and on malformed-but-billed responses; worst case on cancel/timeout.
+        decision = await settle_call(
+            self._ledger, reservation,
+            lambda: self._inner.decide(state, questions),
+            model=self.model, usd_inr=self._s.usd_inr_rate,
+            worst_in=worst_in, worst_out=0,
+            usage_of=lambda d: d.usage,
+        )
+        await self._cache.put("classification", key, self.model, decision.raw)
+        return decision
+
+
+def get_guarded_classification_client(settings=None, conn=None, **overrides):
+    """Jev client wrapped with budget ledger + cache."""
+    if settings is None:
+        from app.config import get_settings
+        settings = get_settings()
+    from app.providers.budget import BudgetLedger
+    from app.providers.cache import AICache
+    inner = get_classification_client(settings, **overrides)
+    return GuardedJevClient(
+        inner,
+        ledger=BudgetLedger(conn, settings=settings),
+        cache=AICache(conn, settings=settings),
+        settings=settings,
     )
 
 

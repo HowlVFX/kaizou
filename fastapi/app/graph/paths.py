@@ -266,7 +266,13 @@ def generate_cluster_path(
     # Unordered: members NOT in any REQUIRES relationship
     unordered_ids = sorted(member_set - in_requires)
 
-    depths = _compute_depths(member_set, requires_edges)
+    # Displayed depth is the learner-wide prerequisite depth (a member's
+    # prerequisites may live outside the cluster), not the in-cluster one.
+    all_nodes = set(member_set)
+    for parent, children in requires_edges.items():
+        all_nodes.add(parent)
+        all_nodes.update(children)
+    depths = _compute_depths(all_nodes, requires_edges)
 
     ordered_nodes = [
         PathNode(
@@ -284,7 +290,7 @@ def generate_cluster_path(
         PathNode(
             concept_id=cid,
             concept_label=concept_info.get(cid, {}).get("label", cid),
-            depth=0,
+            depth=depths.get(cid, 0),
             complexity=concept_info.get(cid, {}).get("complexity", 1.0),
             recall=concept_info.get(cid, {}).get("recall", 0.0),
             is_locked=concept_info.get(cid, {}).get("is_locked", False),

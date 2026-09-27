@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { GraphNode } from '../types';
 import { recallStatus, demoNodes } from '../data/demo';
+import { useApp } from '../context/AppContext';
+import { useConceptDetail, formatRelative } from '../lib/concepts';
 import { Lock, FileText, X as XIcon, Target, RefreshCw, GitMerge, BarChart, Zap } from './Icon';
 
 interface Props {
@@ -40,9 +42,21 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
   const circumference = 2 * Math.PI * 36;
   const recallDash = node.recall !== null ? (node.recall / 100) * circumference : 0;
 
-  const connected = demoNodes.filter(n =>
-    node.related?.includes(n.id) || node.prerequisites?.includes(n.id)
-  );
+  // Claims + edges come from GET /api/concepts/:id; neighbours resolve against the loaded graph.
+  const { nodes: allNodes, isLoggedIn } = useApp();
+  const { detail, loading: detailLoading, error: detailError } = useConceptDetail(node.id);
+  const pool = isLoggedIn ? allNodes : demoNodes;
+  const linkedIds = new Set<string>([
+    ...(detail?.prerequisites ?? node.prerequisites ?? []),
+    ...(detail?.related ?? node.related ?? []),
+    ...(detail?.dependents ?? []),
+  ]);
+  const connected = pool.filter(n => n.id !== node.id && linkedIds.has(n.id));
+  const viewNode: GraphNode = {
+    ...node,
+    claims: detail ? detail.claims : node.claims,
+    lastReviewed: formatRelative(node.lastReviewed) ?? undefined,
+  };
 
   return (
     <div style={{
@@ -99,8 +113,8 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
             </div>
             <div style={{ flex: 1 }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: rs.color, marginBottom: 4 }}>{rs.label}</div>
-              {node.lastReviewed && <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 2 }}>Last reviewed: {node.lastReviewed}</div>}
-              {node.halfLife && <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Half-life: {node.halfLife} days</div>}
+              {viewNode.lastReviewed && <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 2 }}>Last reviewed: {viewNode.lastReviewed}</div>}
+              {node.halfLife ? <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Half-life: {Math.round(node.halfLife * 10) / 10} days</div> : null}
               {/* Mini decay bar */}
               <div style={{ marginTop: 8, height: 3, background: 'var(--border-strong)', borderRadius: 2, overflow: 'hidden' }}>
                 <div style={{
@@ -111,6 +125,12 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
                 }} />
               </div>
             </div>
+          </div>
+        )}
+
+        {!node.locked && node.recall === null && (
+          <div style={{ marginBottom: 16, padding: '12px 16px', borderRadius: 12, background: 'var(--bg)', border: '1px solid var(--border)', fontSize: 12, color: 'var(--text-muted)' }}>
+            Not reviewed yet. Retest this concept to start tracking recall.
           </div>
         )}
 
@@ -202,7 +222,11 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
       <div style={{ flex: 1, overflowY: 'auto', padding: '18px 20px' }}>
 
         {tab === 'overview' && (
-          <OverviewTab node={node} connected={connected} navigate={navigate} />
+          <>
+            {detailLoading && <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 12 }}>Loading concept details…</div>}
+            {detailError && <div role="alert" style={{ fontSize: 12, color: 'var(--red)', marginBottom: 12 }}>{detailError}</div>}
+            <OverviewTab node={viewNode} connected={connected} navigate={navigate} />
+          </>
         )}
 
         {tab === 'depth' && (

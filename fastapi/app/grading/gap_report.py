@@ -12,6 +12,12 @@ pointer to that node: "this requires understanding [node] first."
 🔒 The gap report replaces the model answer. The template is never
 displayed. Showing the answer key leaks the claim set the next probe
 grades against and makes the verbatim penalty meaningless (§5.9).
+
+So the serialised report never carries claim text. Each gap is described by
+its position in the answer key, its structural category, and a redacted cue
+(the opening word or two, the rest elided) that points the learner at the
+area they missed without handing them the sentence. ``GapItem.claim_text``
+is kept in memory for server-side use only and is never serialised.
 """
 
 from __future__ import annotations
@@ -19,16 +25,54 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+REDACTED = "…"
+
+
+def redacted_cue(claim_text: str) -> str:
+    """Build a non-revealing cue for a missed claim.
+
+    Shows the first two words of claims with >= 6 words (one word for
+    shorter claims) and elides the remainder, with the hidden word count so
+    the learner can gauge how much is missing. Never returns the full claim.
+    """
+    words = (claim_text or "").split()
+    if not words:
+        return REDACTED
+    n_show = 2 if len(words) >= 6 else 1
+    if len(words) <= n_show:
+        # One-word claim: showing it would reveal it entirely.
+        return f"{REDACTED} (1 word)"
+    hidden = len(words) - n_show
+    return f"{' '.join(words[:n_show])} {REDACTED} ({hidden} more words)"
+
+
+def claim_category(is_transition: bool, is_load_bearing: bool) -> str:
+    """Structural role of a claim, for learner-facing hints."""
+    if is_transition:
+        return "transition"
+    if is_load_bearing:
+        return "load_bearing"
+    return "supporting"
+
 
 @dataclass
 class GapItem:
     """A single missing claim in the gap report."""
-    claim_text: str
+    claim_text: str                     # server-side only — never serialised
     weight: float
     is_transition: bool
     is_load_bearing: bool
     prerequisite_concept_id: Optional[str] = None
     prerequisite_concept_label: Optional[str] = None
+    claim_index: int = -1
+
+    @property
+    def category(self) -> str:
+        return claim_category(self.is_transition, self.is_load_bearing)
+
+    @property
+    def hint(self) -> str:
+        return redacted_cue(self.claim_text)
 
 
 @dataclass
@@ -41,11 +85,13 @@ class GapReport:
     band: str = ""
 
     def to_dict(self) -> dict:
-        """Serialise to JSON-safe dict for storage in attempts.gap_report."""
+        """Serialise to a JSON-safe, answer-key-free dict (§5.9)."""
         return {
             "missing_claims": [
                 {
-                    "claim_text": item.claim_text,
+                    "claim_index": item.claim_index,
+                    "category": item.category,
+                    "hint": item.hint,
                     "weight": item.weight,
                     "is_transition": item.is_transition,
                     "is_load_bearing": item.is_load_bearing,
@@ -123,6 +169,7 @@ class GapReportBuilder:
                     is_load_bearing=load_bearings[i],
                     prerequisite_concept_id=prereq_id,
                     prerequisite_concept_label=prereq_label,
+                    claim_index=i,
                 ))
 
         # Sort by weight descending — most important gaps first

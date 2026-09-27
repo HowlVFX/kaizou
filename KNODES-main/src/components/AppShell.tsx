@@ -55,7 +55,7 @@ export default function AppShell({ children }: Props) {
             userSelect: 'none',
           }}
         >
-          KNODES
+          KAIZOU
         </span>
 
         {/* Theme toggle */}

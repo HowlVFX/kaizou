@@ -50,24 +50,24 @@ class SnapshotService:
 
         changed = old_hash != new_hash
 
+        # The schema has no separate last_checked column; fetched_at records
+        # the most recent successful fetch and doubles as "last checked".
         if changed:
             async with self._conn.cursor() as cur:
                 await cur.execute(
                     """UPDATE sources
                        SET content_sha256 = %s,
-                           token_count = %s,
-                           raw_text = %s,
-                           last_checked = NOW()
+                           content_text = %s,
+                           fetched_at = NOW()
                        WHERE id = %s""",
-                    (new_hash, fetched['token_count'],
-                     fetched['content'][:50000], source_id),
+                    (new_hash, fetched['content'][:50000], source_id),
                 )
             await self._conn.commit()
             logger.info('Source %s content changed', source_id)
         else:
             async with self._conn.cursor() as cur:
                 await cur.execute(
-                    'UPDATE sources SET last_checked = NOW() WHERE id = %s',
+                    'UPDATE sources SET fetched_at = NOW() WHERE id = %s',
                     (source_id,),
                 )
             await self._conn.commit()
@@ -81,9 +81,8 @@ class SnapshotService:
         async with self._conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """SELECT id FROM sources
-                   WHERE last_checked IS NULL
-                      OR last_checked < NOW() - INTERVAL '%s days'
-                   ORDER BY last_checked ASC NULLS FIRST
+                   WHERE fetched_at < NOW() - make_interval(days => %s)
+                   ORDER BY fetched_at ASC
                    LIMIT 50""",
                 (max_age_days,),
             )

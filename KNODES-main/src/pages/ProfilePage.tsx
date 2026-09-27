@@ -17,7 +17,7 @@ const SECTIONS = ['Profile', 'Appearance', 'Learning', 'Account'] as const;
 type Section = typeof SECTIONS[number];
 
 export default function ProfilePage() {
-  const { user, theme, setTheme, logout, updateUser, learningPrefs, setLearningPrefs, nodes, notes } = useApp();
+  const { user, theme, setTheme, logout, updateUser, learningPrefs, setLearningPrefs, nodes, edges, notes } = useApp();
   const navigate = useNavigate();
   const [activeSection, setActiveSection] = useState<Section>('Profile');
   const [showSignOut, setShowSignOut] = useState(false);
@@ -33,9 +33,10 @@ export default function ProfilePage() {
 
   const stats = [
     { label: 'Concepts', value: nodes.filter(n => !n.locked).length },
-    { label: 'Connections', value: nodes.length > 0 ? 19 : 0 },
+    { label: 'Connections', value: edges.length },
     { label: 'Notes', value: notes.length },
-    { label: 'Reviews', value: 12 },
+    // No review-history endpoint yet; don't show a made-up number.
+    { label: 'Reviews', value: '—' },
   ];
 
   return (
@@ -188,7 +189,7 @@ export default function ProfilePage() {
 }
 
 /* ── Profile section with inline editing ── */
-function ProfileSection({ user, onUpdate, isMobile }: { user: { name: string; email: string; memberSince: string }; onUpdate: (f: Partial<{ name: string; email: string }>) => void; isMobile?: boolean }) {
+function ProfileSection({ user, onUpdate, isMobile }: { user: { name: string; email: string; memberSince: string }; onUpdate: (f: Partial<{ name: string; email: string }>) => Promise<void>; isMobile?: boolean }) {
   const [editing, setEditing] = useState<'name' | 'email' | null>(null);
   const [draft, setDraft] = useState('');
   const [saved, setSaved] = useState<string | null>(null);
@@ -198,18 +199,29 @@ function ProfileSection({ user, onUpdate, isMobile }: { user: { name: string; em
     setDraft(field === 'name' ? user.name : user.email);
   };
 
-  const save = () => {
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const save = async () => {
     if (!editing || !draft.trim()) return;
-    onUpdate({ [editing]: draft.trim() });
-    setSaved(editing);
+    const field = editing;
+    setSaveError(null);
     setEditing(null);
-    setTimeout(() => setSaved(null), 1800);
+    try {
+      await onUpdate({ [field]: draft.trim() });
+      setSaved(field);
+      setTimeout(() => setSaved(null), 1800);
+    } catch (err) {
+      setSaveError((err as Error)?.message || 'Could not save your changes.');
+    }
   };
 
   const cancel = () => { setEditing(null); setDraft(''); };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+      {saveError && (
+        <div role="alert" style={{ fontSize: 13, color: 'var(--red)', padding: '10px 0' }}>{saveError}</div>
+      )}
       {(['name', 'email'] as const).map(field => (
         <div
           key={field}

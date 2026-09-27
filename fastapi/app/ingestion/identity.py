@@ -38,6 +38,9 @@ class IdentityResolution:
     is_merge_candidate: bool
     similarity: Optional[float]
     matched_label: Optional[str]
+    # Nearest existing concept, set even when is_new (needed to record the
+    # MERGE_CANDIDATE edge for the ambiguous band).
+    best_match_id: Optional[str] = None
 
 
 def resolve_concept_identity(
@@ -97,6 +100,7 @@ def resolve_concept_identity(
             is_merge_candidate=False,
             similarity=best_sim,
             matched_label=best_label,
+            best_match_id=best_concept_id,
         )
     elif best_sim >= match_threshold:
         # AMBIGUOUS: create new, flag for weekly merge review
@@ -106,6 +110,7 @@ def resolve_concept_identity(
             is_merge_candidate=True,
             similarity=best_sim,
             matched_label=best_label,
+            best_match_id=best_concept_id,
         )
     else:
         # NEW: no close match
@@ -115,6 +120,7 @@ def resolve_concept_identity(
             is_merge_candidate=False,
             similarity=best_sim if best_sim > 0 else None,
             matched_label=best_label if best_sim > 0 else None,
+            best_match_id=best_concept_id if best_sim > 0 else None,
         )
 
 

@@ -1,5 +1,6 @@
 import React from 'react';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
+import { getSessionUser, logout } from '../api/client';
 
 const NAV_ITEMS = [
   { to: '/', label: 'Overview', icon: '📊' },
@@ -18,9 +19,11 @@ const NAV_ITEMS = [
 export const PortalShell: React.FC = () => {
   const navigate = useNavigate();
 
-  const handleLogout = () => {
-    localStorage.removeItem('portal_token');
-    navigate('/login');
+  const user = getSessionUser();
+
+  const handleLogout = async () => {
+    await logout();
+    navigate('/login', { replace: true });
   };
 
   return (
@@ -52,7 +55,13 @@ export const PortalShell: React.FC = () => {
             </NavLink>
           ))}
         </nav>
+        {user && (
+          <div style={{ color: '#808080', fontSize: '0.75rem', padding: '0 0.5rem', wordBreak: 'break-all' }}>
+            Signed in as {user.email}
+          </div>
+        )}
         <button
+          type="button"
           onClick={handleLogout}
           style={{
             background: 'transparent', border: '1px solid #533483', color: '#808080',

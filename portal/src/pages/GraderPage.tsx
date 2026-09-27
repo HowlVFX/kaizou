@@ -1,38 +1,56 @@
-import React, { useEffect, useState } from 'react';
-import { fetchApi } from '../api/client';
+import React from 'react';
+import { useManagementData } from '../api/useManagementData';
+import type { GraderResponse } from '../api/types';
+import { fmtLabel, fmtNum, fmtPct } from '../api/format';
 import { MetricCard } from '../components/MetricCard';
 import { DataTable } from '../components/DataTable';
+import { CardRow, ErrorMessage, Loading, PageTitle, SectionTitle, SuppressedNotice } from '../components/PageState';
+
+const EMPTY = '[below privacy threshold or no data]';
 
 export const GraderPage: React.FC = () => {
-  const [data, setData] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { data, loading, error } = useManagementData<GraderResponse>('/grader');
 
-  useEffect(() => {
-    fetchApi('/grader').then(setData).catch(e => setError(e.message)).finally(() => setLoading(false));
-  }, []);
+  if (loading) return <Loading />;
+  if (error || !data) return <ErrorMessage message={error || 'No data'} />;
 
-  if (loading) return <div style={{ color: '#e0e0e0' }}>Loading...</div>;
-  if (error) return <div style={{ color: '#e06060' }}>Error: {error}</div>;
-
-  const bandDistributionRows = data?.band_distribution ? Object.entries(data.band_distribution).map(([band, count]) => [band, count as number]) : [];
+  const scores = data.avg_scores;
+  const { cohens_kappa, inter_run_agreement } = data.system_metrics;
 
   return (
     <div>
-      <h1 style={{ color: '#e0e0e0', marginBottom: '1.5rem' }}>Grader Performance</h1>
-      <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginBottom: '2rem' }}>
-        <MetricCard title="Cohen's Kappa" value={data?.cohens_kappa?.toFixed(3) ?? 0} />
-        <MetricCard title="Brier Score" value={data?.brier_score?.toFixed(3) ?? 0} />
-        <MetricCard title="Expected Calibration Error (ECE)" value={data?.ece?.toFixed(3) ?? 0} />
-        <MetricCard title="AUC" value={data?.auc?.toFixed(3) ?? 0} />
-        <MetricCard title="Inter-run Agreement" value={data?.inter_run_agreement ? `${(data.inter_run_agreement * 100).toFixed(1)}%` : '0%'} color="#533483" />
-      </div>
-      <h3 style={{ color: '#a0a0a0', marginBottom: '1rem' }}>Band Distribution</h3>
-      {bandDistributionRows.length > 0 ? (
-        <DataTable headers={['Band', 'Count']} rows={bandDistributionRows} />
-      ) : (
-        <p style={{ color: '#808080', fontStyle: 'italic' }}>[below privacy threshold]</p>
-      )}
+      <PageTitle>Grader Performance</PageTitle>
+      <SuppressedNotice envelope={data} />
+      <CardRow>
+        <MetricCard title="Graded Attempts" value={fmtNum(data.total_attempts)} />
+        <MetricCard title="Pass Rate" value={fmtPct(data.pass_rate)} />
+        <MetricCard title="Avg Composite" value={fmtNum(scores?.composite, 3)} />
+        <MetricCard title="Avg Coverage" value={fmtNum(scores?.coverage, 3)} />
+        <MetricCard title="Avg Ordering" value={fmtNum(scores?.ordering, 3)} />
+        <MetricCard title="Avg Precision" value={fmtNum(scores?.precision, 3)} />
+        <MetricCard title="Avg Verbatim" value={fmtNum(scores?.verbatim, 3)} />
+      </CardRow>
+      <SectionTitle>Reliability (from computed aggregates)</SectionTitle>
+      <CardRow>
+        <MetricCard
+          title="Cohen's Kappa"
+          value={fmtNum(cohens_kappa?.value, 3)}
+          subtitle={cohens_kappa ? `n = ${cohens_kappa.sample_size}` : 'not computed yet'}
+          color="#533483"
+        />
+        <MetricCard
+          title="Inter-run Agreement"
+          value={fmtPct(inter_run_agreement?.value)}
+          subtitle={inter_run_agreement ? `n = ${inter_run_agreement.sample_size}` : 'not computed yet'}
+          color="#533483"
+        />
+      </CardRow>
+      <SectionTitle>Band Distribution</SectionTitle>
+      <DataTable
+        headers={['Band', 'Attempts']}
+        rows={data.band_distribution.map((r) => [fmtLabel(r.band), r.count])}
+        emptyMessage={EMPTY}
+      />
     </div>
   );
 };

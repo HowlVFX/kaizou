@@ -24,13 +24,34 @@ from typing import Optional
 # §5.1  Cosine similarity
 # ---------------------------------------------------------------------------
 
-def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+def as_vector(value) -> list[float]:
+    """Normalise a vector from any source into a list of floats.
+
+    pgvector columns come back from psycopg as text ('[0.1,0.2,...]') unless
+    an adapter is registered, and may also arrive as numpy arrays or tuples.
+    Accepting all of them here means every similarity caller is safe no matter
+    which connection (web pool, worker, script) produced the row.
+    """
+    if value is None:
+        raise ValueError("vector is None")
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1]
+        return [float(x) for x in text.split(",") if x.strip()]
+    return [float(x) for x in value]
+
+
+def cosine_similarity(vec_a, vec_b) -> float:
     """Compute cosine similarity between two vectors.
 
     sim(a, b) = (v_a · v_b) / (||v_a|| · ||v_b||)
 
-    Returns 0.0 if either vector has zero magnitude.
+    Returns 0.0 if either vector has zero magnitude. Inputs may be lists,
+    numpy arrays, or pgvector text; see ``as_vector``.
     """
+    vec_a = as_vector(vec_a)
+    vec_b = as_vector(vec_b)
     if len(vec_a) != len(vec_b):
         raise ValueError(
             f"Vector dimension mismatch: {len(vec_a)} vs {len(vec_b)}"
@@ -69,6 +90,9 @@ def build_similarity_matrix(
 
     Cost: O(n·m) similarity evaluations after n+m embeddings.
     """
+    # Parse each vector once (DB rows may carry pgvector text), not n×m times.
+    embeddings_required = [as_vector(v) for v in embeddings_required]
+    embeddings_learner = [as_vector(v) for v in embeddings_learner]
     n = len(embeddings_required)
     m = len(embeddings_learner)
 

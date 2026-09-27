@@ -123,7 +123,7 @@ export default function LandingPage() {
         transition: 'all 0.3s',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontFamily: "'Anurati', sans-serif", fontSize: isMobile ? 16 : 20, letterSpacing: '6px', color: 'var(--text)' }}>KNODES</span>
+          <span style={{ fontFamily: "'Anurati', sans-serif", fontSize: isMobile ? 16 : 20, letterSpacing: '6px', color: 'var(--text)' }}>KAIZOU</span>
         </div>
         <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
           {!isMobile && (
@@ -156,7 +156,7 @@ export default function LandingPage() {
             <span style={{ color: 'var(--green)' }}>Not Just Notes.</span>
           </h1>
           <p style={{ fontSize: 18, color: 'var(--text-2)', lineHeight: 1.7, margin: '0 0 40px', maxWidth: 460 }}>
-            KNODES turns what you learn into a connected knowledge graph, then helps you remember, explain, and test how that knowledge works.
+            KAIZOU turns what you learn into a connected knowledge graph, then helps you remember, explain, and test how that knowledge works.
           </p>
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
             <button
@@ -232,7 +232,7 @@ export default function LandingPage() {
         <div style={{ display: 'grid', gridTemplateColumns: isMobile ? 'repeat(2, 1fr)' : 'repeat(4, 1fr)', gap: 24 }}>
           {[
             { num: '01', Icon: NotesIcon, title: 'Write', desc: 'Capture concepts and explanations naturally in Markdown.' },
-            { num: '02', Icon: Puzzle, title: 'Structure', desc: 'KNODES extracts concepts, claims, and prerequisites automatically.' },
+            { num: '02', Icon: Puzzle, title: 'Structure', desc: 'KAIZOU extracts concepts, claims, and prerequisites automatically.' },
             { num: '03', Icon: Network, title: 'Connect', desc: 'Your knowledge becomes a connected graph with prerequisite relationships.' },
             { num: '04', Icon: Target, title: 'Retest', desc: 'Recall facts, explain mechanisms, test changes, and transfer what you know.' },
           ].map(({ num, Icon, title, desc }) => (
@@ -273,7 +273,7 @@ export default function LandingPage() {
           </div>
 
           <div style={{ padding: 28, borderRadius: 16, border: '2px solid var(--green)', background: 'var(--bg)' }}>
-            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.06em', color: 'var(--green)', marginBottom: 16 }}>KNODES</div>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.06em', color: 'var(--green)', marginBottom: 16 }}>KAIZOU</div>
             {[
               'How does hoisting work from creation to execution?',
               'What changes if var becomes let?',
@@ -378,10 +378,10 @@ export default function LandingPage() {
         <div>
           <div style={{ fontWeight: 700, marginBottom: 4,fontFamily: "'Anurati', sans-serif",
             letterSpacing: '8px',
-            color: 'var(--text)',}}>KNODES</div>
+            color: 'var(--text)',}}>KAIZOU</div>
           <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>Build Understanding, Not Just Notes.</div>
         </div>
-        <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>© 2026 KNODES</div>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>© 2026 KAIZOU</div>
       </footer>
     </div>
   );

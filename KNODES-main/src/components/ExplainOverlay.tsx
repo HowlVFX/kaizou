@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
-import type { GraphNode } from '../types';
+import type { GraphNode, GraphEdge } from '../types';
 import { recallStatus, demoNodes, demoEdges } from '../data/demo';
+import { useApp } from '../context/AppContext';
+import { useConceptDetail } from '../lib/concepts';
 import { X as XIcon, Lock, BarChart } from './Icon';
 
 interface Props {
@@ -9,18 +11,22 @@ interface Props {
   onBack?: () => void;
 }
 
-// Derive relationship graph from edges
-function getRelationships(node: GraphNode) {
-  const prereqs = demoNodes.filter(n => node.prerequisites?.includes(n.id));
-  const related = demoNodes.filter(n => node.related?.includes(n.id));
-  const dependents = demoNodes.filter(n =>
-    n.related?.includes(node.id) || n.prerequisites?.includes(node.id)
+// Derive relationship graph from the node's prerequisite/related ids and the graph edges
+function getRelationships(node: GraphNode, pool: GraphNode[], edges: GraphEdge[], dependentIds: string[] = []) {
+  const prereqs = pool.filter(n => node.prerequisites?.includes(n.id));
+  const related = pool.filter(n => node.related?.includes(n.id));
+  const dependents = pool.filter(n =>
+    n.id !== node.id && (
+      dependentIds.includes(n.id) ||
+      n.related?.includes(node.id) || n.prerequisites?.includes(node.id) ||
+      edges.some(e => e.type === 'requires' && e.source === n.id && e.target === node.id)
+    )
   );
   return { prereqs, related, dependents };
 }
 
 // Small radial SVG showing this node + its direct connections
-function ConceptWeb({ node, allNodes }: { node: GraphNode; allNodes: GraphNode[] }) {
+function ConceptWeb({ node, allNodes, edges }: { node: GraphNode; allNodes: GraphNode[]; edges: GraphEdge[] }) {
   const rs = recallStatus(node.recall);
   const CX = 160, CY = 130, R = 95;
 
@@ -52,7 +58,7 @@ function ConceptWeb({ node, allNodes }: { node: GraphNode; allNodes: GraphNode[]
 
       {/* Edges */}
       {positions.map(p => {
-        const edgeType = demoEdges.find(e =>
+        const edgeType = edges.find(e =>
           (e.source === node.id && e.target === p.id) ||
           (e.source === p.id && e.target === node.id)
         )?.type;
@@ -118,13 +124,21 @@ function useVW() {
   return vw;
 }
 
-export default function ExplainOverlay({ node, onClose, onBack }: Props) {
+export default function ExplainOverlay({ node: baseNode, onClose, onBack }: Props) {
   const [visible, setVisible] = useState(false);
   const [barsFilled, setBarsFilled] = useState(false);
   const vw = useVW();
   const isMobile = vw < 640;
+  // Logged in: claims/edges from GET /api/concepts/:id, neighbours from the real graph.
+  const { nodes: graphNodes, edges: graphEdges, isLoggedIn } = useApp();
+  const { detail } = useConceptDetail(baseNode.id);
+  const pool = isLoggedIn ? graphNodes : demoNodes;
+  const poolEdges = isLoggedIn ? graphEdges : demoEdges;
+  const node: GraphNode = detail
+    ? { ...baseNode, claims: detail.claims, prerequisites: detail.prerequisites, related: detail.related }
+    : baseNode;
   const rs = recallStatus(node.recall);
-  const { prereqs, related, dependents } = getRelationships(node);
+  const { prereqs, related, dependents } = getRelationships(node, pool, poolEdges, detail?.dependents);
   const webNodes = [...new Set([...prereqs, ...related, ...dependents])].slice(0, 8);
 
   useEffect(() => {
@@ -222,7 +236,7 @@ export default function ExplainOverlay({ node, onClose, onBack }: Props) {
               {webNodes.length > 0 && (
                 <Section title={`Concept web · ${webNodes.length} connections`}>
                   <div style={{ background: 'var(--bg-input)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
-                    <ConceptWeb node={node} allNodes={webNodes} />
+                    <ConceptWeb node={node} allNodes={webNodes} edges={poolEdges} />
                   </div>
                 </Section>
               )}
@@ -463,7 +477,7 @@ export default function ExplainOverlay({ node, onClose, onBack }: Props) {
             {webNodes.length > 0 && (
               <Section title={`Concept web · ${webNodes.length} connections`}>
                 <div style={{ background: 'var(--overlay-surface)', border: '1px solid var(--overlay-line)', borderRadius: 12, overflow: 'hidden' }}>
-                  <ConceptWeb node={node} allNodes={webNodes} />
+                  <ConceptWeb node={node} allNodes={webNodes} edges={poolEdges} />
                 </div>
               </Section>
             )}

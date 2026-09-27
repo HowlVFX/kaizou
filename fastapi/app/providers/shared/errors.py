@@ -54,11 +54,38 @@ class ProviderResponseError(ProviderError):
 
     Examples: truncated by max_tokens, missing fields, JSON that does not
     parse, wrong embedding dimensionality.
+
+    ``usage`` carries whatever token accounting the (already billed)
+    response reported, so the budget guard records the real spend instead of
+    dropping it just because the body could not be used.
     """
+
+    def __init__(self, provider: str, message: str, *, usage=None):
+        super().__init__(provider, message)
+        self.usage = usage  # app.providers.shared.types.Usage | None
 
 
 class ProviderRefusalError(ProviderResponseError):
     """The model declined to produce output (e.g. stop_reason="refusal")."""
+
+
+class BudgetExhaustedError(ProviderError):
+    """The AI budget cap would be exceeded by this call, so it was refused.
+
+    Raised before the call is made. Deterministic (non-LLM) features are
+    unaffected and keep working.
+    """
+
+    def __init__(self, spent_inr: float, cap_inr: float, needed_inr: float):
+        self.spent_inr = spent_inr
+        self.cap_inr = cap_inr
+        self.needed_inr = needed_inr
+        super().__init__(
+            "budget",
+            f"AI budget cap reached: spent ≈ ₹{spent_inr:.2f} of ₹{cap_inr:.2f}; "
+            f"this call needs ≈ ₹{needed_inr:.2f}. Raise AI_BUDGET_INR to continue, "
+            f"or wait — deterministic features are unaffected.",
+        )
 
 
 def missing_key_error(provider: str, env_var: str, where_to_get: str) -> ProviderConfigError:

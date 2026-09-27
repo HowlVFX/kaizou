@@ -127,6 +127,7 @@ def validate_probe(
     claim_token_lists: list[list[str]],
     semantic_threshold: float = SEMANTIC_LEAK_THRESHOLD,
     lexical_threshold: float = LEXICAL_LEAK_THRESHOLD,
+    ngram_n: int = 4,
 ) -> tuple[bool, float, float]:
     """Full probe leakage validation (§5.15).
 
@@ -150,9 +151,26 @@ def validate_probe(
         probe_embedding, claim_embeddings, semantic_threshold,
     )
     lex_leaked, lex_score = check_lexical_leakage(
-        probe_tokens, claim_token_lists, threshold=lexical_threshold,
+        probe_tokens, claim_token_lists, n=ngram_n, threshold=lexical_threshold,
     )
 
     is_valid = not sem_leaked and not lex_leaked
 
     return is_valid, sem_score, lex_score
+
+
+def check_cloze_leakage(prompt_text: str, expected_terms: list[str]) -> bool:
+    """CLOZE-specific leak: the blanked term (or an alias) appears in the prompt.
+
+    A cloze reproduces its claim with a blank by design, so the n-gram and
+    semantic checks would always fire. What must not leak is the answer.
+    Returns True if leaked.
+    """
+    from app.grading.answer_key import normalise_answer
+
+    prompt = f" {normalise_answer(prompt_text)} "
+    for term in expected_terms:
+        t = normalise_answer(term)
+        if t and f" {t} " in prompt:
+            return True
+    return False

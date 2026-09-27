@@ -9,7 +9,12 @@ const verifyToken = require('./middleware/auth');
 
 // To allow frontend at localhost:8443 to talk to backend
 const cors = require('cors');
-app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:5173' }));
+// CORS_ORIGIN is a comma-separated allowlist (frontend on :8443, portal on :5174 by default).
+const corsOrigins = (process.env.CORS_ORIGIN || 'http://localhost:8443,http://localhost:5174')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+app.use(cors({ origin: corsOrigins }));
 
 app.use(express.json()); // Middleware to parse JSON bodies
 
@@ -43,6 +48,20 @@ app.use('/api/management/exports', require('./routes/management/exports'));
 // Original test routes
 app.get('/', (req, res) => {
   res.send('Hello from Express');
+});
+
+// Last-resort error handler: malformed JSON bodies get a 400, anything else a
+// generic 500. Details are logged server-side, never sent to the client.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Malformed JSON body' });
+  }
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body too large' });
+  }
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 const PORT = process.env.PORT || 3000;

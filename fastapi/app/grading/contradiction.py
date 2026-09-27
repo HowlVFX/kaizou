@@ -115,23 +115,37 @@ class ContradictionDetector:
         """
         flagged: list[ContradictionPair] = []
 
-        for j, learner_claim in enumerate(learner_claims):
+        if not source_claims or not learner_claims:
+            return ContradictionReport(0, 0.0, [])
+
+        # Build every (source, learner) pair — premise=source, hypothesis=learner.
+        pairs = [
+            (source_claims[i], learner_claims[j])
+            for j in range(len(learner_claims))
+            for i in range(len(source_claims))
+        ]
+
+        # One batched inference pass when the backend supports it; otherwise
+        # fall back to per-pair for the plain NLIClassifier protocol.
+        classify_batch = getattr(self._nli, "classify_batch", None)
+        if callable(classify_batch):
+            results = await classify_batch(pairs)
+        else:
+            results = [await self._nli.classify(premise=p, hypothesis=h) for p, h in pairs]
+
+        n_src = len(source_claims)
+        for j in range(len(learner_claims)):
             max_score = 0.0
             max_source_idx = -1
-
-            for i, source_claim in enumerate(source_claims):
-                result = await self._nli.classify(
-                    premise=source_claim,
-                    hypothesis=learner_claim,
-                )
-                if result.contradiction > max_score:
-                    max_score = result.contradiction
+            for i in range(n_src):
+                score = results[j * n_src + i].contradiction
+                if score > max_score:
+                    max_score = score
                     max_source_idx = i
-
             if max_score >= self._threshold:
                 flagged.append(ContradictionPair(
                     source_claim=source_claims[max_source_idx],
-                    learner_claim=learner_claim,
+                    learner_claim=learner_claims[j],
                     contradiction_score=max_score,
                     source_index=max_source_idx,
                     learner_index=j,

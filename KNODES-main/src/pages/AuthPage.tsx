@@ -1,12 +1,25 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
+import { api, ApiError, setTokens } from '../lib/api';
+
+const OAUTH_ERROR_MESSAGES: Record<string, string> = {
+  access_denied: 'Sign-in was cancelled. You can try again or use email and password.',
+  invalid_state: 'Your sign-in session expired. Please try again.',
+  no_code_provided: 'The sign-in provider did not return a code. Please try again.',
+  email_not_verified: 'Your email with that provider is not verified. Verify it there, then try again.',
+  github_oauth_failed: 'GitHub sign-in failed. Please try again.',
+  google_oauth_failed: 'Google sign-in failed. Please try again.',
+  oauth_failed: 'Sign-in failed. Please try again.',
+};
+
+function oauthErrorMessage(code: string | null): string | null {
+  if (!code) return null;
+  return OAUTH_ERROR_MESSAGES[code] || 'Sign-in failed. Please try again.';
+}
 import { Eye, EyeOff, Check, ArrowRight } from '../components/Icon';
 
 type Mode = 'login' | 'signup';
-
-const DEMO_EMAIL = 'chirag@example.com';
-const DEMO_PASSWORD = 'knodes123';
 
 /* ── Demo nodes for interactive left panel ── */
 const DEMO_NODES = [
@@ -220,7 +233,23 @@ export default function AuthPage({ mode: initialMode }: { mode: Mode }) {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [errors, setErrors] = useState<Record<string, string>>(() => {
+    const msg = oauthErrorMessage(searchParams.get('error'));
+    const init: Record<string, string> = {};
+    if (msg) init.general = msg;
+    return init;
+  });
+
+  // Drop ?error= from the URL once shown so a refresh doesn't repeat it.
+  useEffect(() => {
+    if (searchParams.get('error')) {
+      const next = new URLSearchParams(searchParams);
+      next.delete('error');
+      setSearchParams(next, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [showPw, setShowPw] = useState(false);
@@ -244,12 +273,35 @@ export default function AuthPage({ mode: initialMode }: { mode: Mode }) {
     const errs = validate();
     if (Object.keys(errs).length) { setErrors(errs); return; }
     setLoading(true);
-    await new Promise(r => setTimeout(r, 850));
-    if (mode === 'login' && (email !== DEMO_EMAIL || password !== DEMO_PASSWORD)) {
-      setErrors({ general: 'Invalid credentials — try chirag@example.com / knodes123' });
+    setErrors({});
+
+    try {
+      const body = mode === 'login'
+        ? { email: email.trim(), password }
+        : { email: email.trim(), password, name: name.trim() };
+      const data = await api<{ accessToken?: string; refreshToken?: string }>(
+        `/api/auth/${mode === 'login' ? 'login' : 'signup'}`,
+        { method: 'POST', body, auth: false },
+      );
+      if (!data?.accessToken) {
+        setErrors({ general: 'Something went wrong. Please try again.' });
+        setLoading(false);
+        return;
+      }
+      setTokens(data.accessToken, data.refreshToken);
+    } catch (err) {
+      let msg = 'Something went wrong. Please try again.';
+      if (err instanceof ApiError) {
+        if (err.status === 0) msg = 'Could not reach the server. Is the API running?';
+        else if (err.status === 401) msg = 'Invalid email or password';
+        else if (err.status === 409) msg = 'An account with this email already exists';
+        else msg = err.message || msg;
+      }
+      setErrors({ general: msg });
       setLoading(false);
       return;
     }
+
     setSuccess(true);
     await new Promise(r => setTimeout(r, 550));
     login();
@@ -366,12 +418,6 @@ export default function AuthPage({ mode: initialMode }: { mode: Mode }) {
                 </button>
               }
             />
-
-            {mode === 'login' && !errors.general && (
-              <div style={{ background: 'rgba(255,255,255,0.03)', border: '0.8px solid rgba(255,255,255,0.08)', borderRadius: 8, padding: '9px 13px', fontSize: 12, color: 'rgba(255,255,255,0.32)', lineHeight: 1.6 }}>
-                Demo: <span style={{ color: 'rgba(255,255,255,0.6)' }}>chirag@example.com</span> / <span style={{ color: 'rgba(255,255,255,0.6)' }}>knodes123</span>
-              </div>
-            )}
 
             {errors.general && (
               <div style={{ background: 'rgba(255,75,75,0.1)', border: '0.8px solid #FF4B4B', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#FF4B4B', animation: 'fadeUp 0.2s ease' }}>

@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import type { GraphNode } from '../types';
 import { demoNodes, recallStatus } from '../data/demo';
+import { useApp, recallToPercent } from '../context/AppContext';
+import { api, describeApiError } from '../lib/api';
+import { fetchConceptDetail, type ConceptDetail } from '../lib/concepts';
 import { X as XIcon } from './Icon';
 
 // ── Data model ──────────────────────────────────────────────────────────────
@@ -158,6 +161,52 @@ function buildStep(node: GraphNode, role: DeepPathStep['role'], allNodes: GraphN
   };
 }
 
+// ── API-backed path ──────────────────────────────────────────────────────────
+
+interface ApiPathNode {
+  concept_id: string;
+  concept_label: string;
+  depth?: number;
+  complexity?: number;
+  recall?: number | null;
+  is_locked?: boolean;
+  is_target?: boolean;
+}
+
+interface ApiLearningPath {
+  target_concept_id: string;
+  ordered: ApiPathNode[];
+  unordered: ApiPathNode[];
+  has_cycle_break?: boolean;
+  cycle_break_info?: string | null;
+}
+
+function isUuid(id: string | undefined | null): boolean {
+  return !!id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
+
+function buildApiPath(path: ApiLearningPath, allNodes: GraphNode[]): DeepPathStep[] {
+  const byId = new Map(allNodes.map(n => [n.id, n]));
+  const resolve = (s: ApiPathNode): GraphNode => byId.get(s.concept_id) ?? {
+    id: s.concept_id, label: s.concept_label, x: 0, y: 0,
+    recall: recallToPercent(s.recall), locked: !!s.is_locked,
+  };
+  const targetEntry = path.ordered.find(s => s.is_target) ?? path.ordered[path.ordered.length - 1];
+  const target = targetEntry ? resolve(targetEntry) : null;
+  const targetPrereqs = new Set(target?.prerequisites ?? []);
+  const steps: DeepPathStep[] = path.ordered.map(s => {
+    const n = resolve(s);
+    const isTarget = target !== null && n.id === target.id;
+    const role: DeepPathStep['role'] = isTarget ? 'target' : targetPrereqs.has(n.id) ? 'required' : 'foundation';
+    return buildStep(n, role, allNodes, isTarget ? null : target);
+  });
+  path.unordered.forEach(s => {
+    const n = resolve(s);
+    steps.push(buildStep(n, 'related', allNodes, null));
+  });
+  return steps;
+}
+
 // ── Section type meta ─────────────────────────────────────────────────────────
 
 const sectionMeta: Record<string, { icon: string; color: string }> = {
@@ -192,9 +241,11 @@ interface Props {
   nodes: GraphNode[];
   onClose: () => void;
   onBack?: () => void;
+  /** When set, load the cluster learning path instead of the concept path. */
+  clusterId?: string;
 }
 
-export default function PathLearning({ node, nodes, onClose, onBack }: Props) {
+export default function PathLearning({ node, nodes, onClose, onBack, clusterId }: Props) {
   const [activeStep, setActiveStep] = useState(0);
   const [visible, setVisible] = useState(false);
   const [whyExpanded, setWhyExpanded] = useState(false);
@@ -205,8 +256,73 @@ export default function PathLearning({ node, nodes, onClose, onBack }: Props) {
 
   const vw = useVW();
   const isMobile = vw < 640;
-  const allNodes = nodes.length > 0 ? nodes : demoNodes;
-  const steps = buildDeepPath(node, allNodes);
+  const { isLoggedIn } = useApp();
+  const baseNodes = nodes.length > 0 ? nodes : (isLoggedIn ? [] : demoNodes);
+
+  // Real path from GET /api/learning-paths/{concept|cluster}/:id (demo ids fall back to the local builder)
+  const pathTargetId = clusterId ?? node.id;
+  const useApiPath = isLoggedIn && isUuid(pathTargetId);
+  const [apiPath, setApiPath] = useState<ApiLearningPath | null>(null);
+  const [details, setDetails] = useState<Record<string, ConceptDetail>>({});
+  const [pathLoading, setPathLoading] = useState(false);
+  const [pathError, setPathError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    setApiPath(null);
+    setDetails({});
+    setPathError(null);
+    if (!useApiPath) return;
+    let cancelled = false;
+    setPathLoading(true);
+    const url = clusterId
+      ? `/api/learning-paths/cluster/${encodeURIComponent(clusterId)}`
+      : `/api/learning-paths/concept/${encodeURIComponent(node.id)}`;
+    api<ApiLearningPath>(url)
+      .then(async p => {
+        if (cancelled) return;
+        const path: ApiLearningPath = {
+          ...p,
+          ordered: Array.isArray(p?.ordered) ? p.ordered : [],
+          unordered: Array.isArray(p?.unordered) ? p.unordered : [],
+        };
+        setApiPath(path);
+        // Pull claims + prerequisite edges for each step (bounded to keep it light).
+        const ids = [...path.ordered, ...path.unordered].map(s => s.concept_id).slice(0, 20);
+        const results = await Promise.all(ids.map(id => fetchConceptDetail(id).catch(() => null)));
+        if (cancelled) return;
+        const map: Record<string, ConceptDetail> = {};
+        results.forEach(d => { if (d) map[d.id] = d; });
+        setDetails(map);
+      })
+      .catch(err => { if (!cancelled) setPathError(describeApiError(err, 'Could not build this learning path.')); })
+      .finally(() => { if (!cancelled) setPathLoading(false); });
+    return () => { cancelled = true; };
+  }, [useApiPath, clusterId, node.id, reloadKey]);
+
+  const allNodes: GraphNode[] = (() => {
+    if (!apiPath) return baseNodes;
+    const byId = new Map(baseNodes.map(n => [n.id, n]));
+    const extra: GraphNode[] = [];
+    [...apiPath.ordered, ...apiPath.unordered].forEach(s => {
+      if (!byId.has(s.concept_id)) {
+        extra.push({
+          id: s.concept_id, label: s.concept_label, x: 0, y: 0,
+          recall: recallToPercent(s.recall), locked: !!s.is_locked,
+        });
+      }
+    });
+    return [...baseNodes, ...extra].map(n => {
+      const d = details[n.id];
+      return d ? { ...n, claims: d.claims, prerequisites: d.prerequisites, related: d.related } : n;
+    });
+  })();
+
+  const steps: DeepPathStep[] = (() => {
+    if (!useApiPath) return buildDeepPath(node, allNodes);
+    if (!apiPath) return [];
+    return buildApiPath(apiPath, allNodes);
+  })();
   const totalSteps = steps.length;
   const currentStep = steps[activeStep];
   const isLast = activeStep === totalSteps - 1;
@@ -278,6 +394,35 @@ export default function PathLearning({ node, nodes, onClose, onBack }: Props) {
   };
 
   const recall = recallStatus(currentStep?.node.recall ?? null);
+
+  if (!currentStep) {
+    const title = pathLoading ? 'Building your path…'
+      : pathError ? "Couldn't load this path"
+      : 'No path available yet';
+    const body = pathLoading ? null
+      : pathError ? pathError
+      : 'This concept has no prerequisite path to follow yet.';
+    return (
+      <>
+        <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 195 }} />
+        <div role="dialog" aria-label="Learn This Path" style={{
+          position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 200,
+          width: 'min(360px, calc(100vw - 32px))', background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+          borderRadius: 14, padding: '20px 22px', textAlign: 'center',
+        }}>
+          <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 4 }}>Learn This Path</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)', marginBottom: 6 }}>{title}</div>
+          {body && <div style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.55 }}>{body}</div>}
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 14 }}>
+            {pathError && (
+              <button onClick={() => setReloadKey(k => k + 1)} style={{ padding: '8px 14px', borderRadius: 8, background: 'var(--blue)', border: 'none', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit' }}>Retry</button>
+            )}
+            <button onClick={onBack ?? onClose} style={{ padding: '8px 14px', borderRadius: 8, background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-2)', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit' }}>{onBack ? '← Back' : 'Close'}</button>
+          </div>
+        </div>
+      </>
+    );
+  }
 
   if (isMobile) {
     return (
