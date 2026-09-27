@@ -27,3 +27,15 @@ def test_never_below_learner_band_dedupe_and_cap():
     out = clamp_explanations(items, "university")
     assert out[0] == {"label": "Bonds", "teaser": "About Bonds.", "level_band": "university"}
     assert len(out) == MAX_EXPLANATIONS
+
+
+def test_step_reading_level_guard_and_legacy_source_stripping():
+    from app.deeper.service import learner_text, too_hard_for
+    kid_q = "But why does sugar give us energy?"
+    kid_p = "Even this has a reason. Your body breaks sugar into tiny bits. That lets the energy out."
+    hard_p = ("Solar photons induce ultrafast charge separation within membrane-bound pigment-protein "
+              "complexes, translating photonic flux into a trans-thylakoid proton-motive force.")
+    assert not too_hard_for("young_child", kid_q, kid_p)
+    assert too_hard_for("young_child", kid_q, hard_p)
+    assert not too_hard_for("expert", kid_q, hard_p)
+    assert learner_text("Plants make food.\n\n## Source: Wikipedia\n\nPhotosynthesis is...") == "Plants make food."

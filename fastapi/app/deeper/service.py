@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 UNRESOLVED = "UNRESOLVED_PREREQUISITE"
 MAX_EXPLANATIONS = 6          # safety cap; the model decides how many are needed
-DEEPER_VARIANT = "deeper-v1"
+DEEPER_VARIANT = "deeper-v2"
 
 DEEPER_SCHEMA = strict_object({
     "is_bedrock": {"type": "boolean"},
@@ -55,21 +55,44 @@ DEEPER_SCHEMA = strict_object({
     },
 })
 
-DEEPER_PROMPT = """A learner wrote the note below about "{label}". They want to go ONE level deeper: what explains what they wrote?
+DEEPER_PROMPT = """A learner wrote the note below about "{label}". They want to go ONE small step deeper: what is the very next "why" underneath what they wrote?
 
-Learner level: {level_text}. Write everything for that person, in the simple words they use.
+Learner level: {level_text}. Write everything for that person, in the plain words they use.
 {chain}
+The most important rule: take the SMALLEST possible step. Do not explain the whole mechanism, do not skip ahead to the final scientific answer, and do not name the specialist machinery behind it. Go down exactly one layer, the one this learner is ready for right now. There will be more steps later if they want them.
+
 Return:
-- is_bedrock: true ONLY if nothing deeper explains this (an axiom or definition in maths, a fundamental law of physics, or a plain observed fact). Then give bedrock_reason (one simple sentence saying why this is where the "why" stops) and leave question, primer and explanations empty.
-- question: ONE short, enticing "why"/"how" question that makes the learner curious about what is behind their note (e.g. "But why does sugar give energy?"). Ask about what THEY wrote.
-- primer: 2-4 short sentences at the learner's level. Start by saying that even what they just learnt has an explanation behind it, then give a simple first taste of that explanation. No jargon they would not know. It is a teaser, not a lesson.
-- simplification: if the deeper explanation shows the learner's note is a simplification or not quite right (e.g. "the Sun moves around the Earth"), say so kindly in one sentence; otherwise "".
-- explanations: as many as are actually needed (often 1-3, never padding), each a separate idea the learner would learn next to answer the question:
-  - label: a short concept name (2-5 words) in words this learner would use
-  - teaser: one enticing sentence about what this idea will reveal
-  - level: who could understand it (young_child, school, university, expert). Use the learner's level or at most ONE level higher; never jump further.
+- is_bedrock: true ONLY if nothing deeper explains this (an axiom or definition in maths, a fundamental law of physics, or a plain observed fact). Then give bedrock_reason (one simple sentence saying why the "why" stops here) and leave question, primer and explanations empty.
+- question: ONE short, curious "why"/"how" question (max 15 words) about what THEY wrote, in everyday words (e.g. "But why does sugar give us energy?").
+- primer: 2-3 short sentences. Open by saying that even what they just learnt has a reason behind it, then give a simple first taste of just the next layer. No technical names, numbers, formulas or jargon the learner did not use. A teaser, not a lesson.
+- simplification: ONLY if a sentence the learner actually wrote is wrong or misleading (e.g. "the Sun moves around the Earth"), say so kindly in one plain sentence. Never comment on facts they did not write. Otherwise "".
+- explanations: only the ideas needed for this one step (usually 1-3, never padding):
+  - label: a short plain name (2-5 words) this learner would understand
+  - teaser: one enticing plain sentence (max 20 words) about what this idea will reveal
+  - level: who could understand it (young_child, school, university, expert). Prefer the learner's own level; one level higher only if the next step truly needs it.
 
 Return JSON matching the schema."""
+
+# Reading-level rank the step's question + primer may reach, per band (see
+# app.probes.style.reading_level): a child's step must read "very simple" or
+# "simple", and so on. One retry with feedback if it reads harder.
+_READING_RANK = {"very simple": 0, "simple": 1, "standard": 2, "technical": 3}
+MAX_READING_RANK = {"young_child": 1, "school": 1, "university": 2, "expert": 3}
+
+
+def too_hard_for(band: str, question: str, primer: str) -> bool:
+    from app.probes.style import reading_level
+    text = f"{question or ''} {primer or ''}".strip()
+    if not text:
+        return False
+    return _READING_RANK[reading_level(text)] > MAX_READING_RANK[band]
+
+
+def learner_text(note_text: str) -> str:
+    """Only the learner's own words: drop '## Source: ...' sections that older
+    versions pasted into the note body (sources now live separately)."""
+    import re
+    return re.split(r"(?m)^## Source:", note_text or "", maxsplit=1)[0].strip() or (note_text or "")
 
 
 class DeeperError(Exception):
@@ -231,7 +254,7 @@ class DeeperService:
         if has_step and (current or not regenerate):
             return await self._serialise(c)
 
-        note_text = await self._note_text(concept_id)
+        note_text = learner_text(await self._note_text(concept_id))
         if not note_text:
             raise DeeperError(422, "This concept has no note to go deeper from.")
         band = c.get("level_band") or note_level_band(note_text, c.get("c_bloom"))
@@ -254,6 +277,19 @@ class DeeperService:
             variant=f"{DEEPER_VARIANT}-v{c['version']}",
         )
         data = result.data or {}
+        if not data.get("is_bedrock") and too_hard_for(band, data.get("question"), data.get("primer")):
+            # Went too far / too hard in one go: ask once more for a smaller, plainer step.
+            logger.info("Deeper step too hard for %s; retrying smaller", band)
+            retry = await self._gen().generate_structured(
+                system=system + (
+                    "\n\nYour previous answer was too advanced for this learner. Take an even smaller "
+                    "step, use shorter sentences and only everyday words."
+                ),
+                prompt=note_text[:4000],
+                schema=DEEPER_SCHEMA,
+                variant=f"{DEEPER_VARIANT}-v{c['version']}-simpler",
+            )
+            data = retry.data or data
         explanations = [] if data.get("is_bedrock") else clamp_explanations(data.get("explanations") or [], band)
         is_bedrock = bool(data.get("is_bedrock")) or not explanations
         question = " ".join(str(data.get("question") or "").split())[:300] or None

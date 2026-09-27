@@ -28,6 +28,25 @@ const ANALOGY_COLOR = "#a78bfa"
 const DEEP_COLOR = "#f5b942"
 const CLUSTER_RADIUS = 58
 
+const POSITIONS_KEY = "kaizou.nodePositions"
+
+function loadNodePositions(): Record<string, { x: number; y: number }> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(POSITIONS_KEY) || "{}")
+    return raw && typeof raw === "object" ? raw : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveNodePositions(p: Record<string, { x: number; y: number }>) {
+  try {
+    localStorage.setItem(POSITIONS_KEY, JSON.stringify(p))
+  } catch {
+    /* storage full or disabled: positions just won't persist */
+  }
+}
+
 export default function KnowledgeGraph({
   nodes,
   edges,
@@ -52,6 +71,11 @@ export default function KnowledgeGraph({
   const [zoom, setZoom] = useState(compact ? 0.65 : 0.85)
   const [isPanning, setIsPanning] = useState(false)
   const panStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 })
+  // Individual node dragging (positions persist per browser).
+  const [dragPos, setDragPos] = useState<Record<string, { x: number; y: number }>>(loadNodePositions)
+  const [draggingId, setDraggingId] = useState<string | null>(null)
+  const drag = useRef<{ id: string; startX: number; startY: number; nodeX: number; nodeY: number; moved: boolean } | null>(null)
+  const suppressClick = useRef(false)
   const lastClickTime = useRef<Record<string, number>>({})
   const [floatOffsets] = useState(() =>
     Object.fromEntries(nodes.map((n) => [n.id, Math.random() * 2 * Math.PI])),
@@ -125,16 +149,44 @@ export default function KnowledgeGraph({
 
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
+      const d = drag.current
+      if (d) {
+        const dx = (e.clientX - d.startX) / zoom
+        const dy = (e.clientY - d.startY) / zoom
+        if (!d.moved && Math.abs(dx) + Math.abs(dy) < 3) return
+        d.moved = true
+        setDraggingId(d.id)
+        setDragPos((p) => ({ ...p, [d.id]: { x: d.nodeX + dx, y: d.nodeY + dy } }))
+        return
+      }
       if (!isPanning) return
       setPan({
         x: panStart.current.panX + (e.clientX - panStart.current.x),
         y: panStart.current.panY + (e.clientY - panStart.current.y),
       })
     },
-    [isPanning],
+    [isPanning, zoom],
   )
 
-  const handleMouseUp = useCallback(() => setIsPanning(false), [])
+  const handleMouseUp = useCallback(() => {
+    const d = drag.current
+    drag.current = null
+    setDraggingId(null)
+    if (d?.moved) {
+      suppressClick.current = true // the drag's mouseup must not also select
+      setDragPos((p) => {
+        saveNodePositions(p)
+        return p
+      })
+    }
+    setIsPanning(false)
+  }, [])
+
+  const startNodeDrag = (e: React.MouseEvent, node: GraphNode) => {
+    if (e.button !== 0) return
+    e.stopPropagation()
+    drag.current = { id: node.id, startX: e.clientX, startY: e.clientY, nodeX: node.x, nodeY: node.y, moved: false }
+  }
 
   // Double-click detection for cluster toggle
   const handleClusterClick = useCallback(
@@ -173,7 +225,10 @@ export default function KnowledgeGraph({
     if (selectedNodeId) visibleNodeIds.add(selectedNodeId)
   }
 
-  const visibleNodes = nodes.filter((n) => visibleNodeIds.has(n.id))
+  // Dragged nodes keep their position (saved in this browser).
+  const visibleNodes = nodes
+    .filter((n) => visibleNodeIds.has(n.id))
+    .map((n) => (dragPos[n.id] ? { ...n, ...dragPos[n.id] } : n))
 
   const getNodeFloat = (nodeId: string) => {
     const phase = floatOffsets[nodeId] ?? 0
@@ -741,13 +796,20 @@ export default function KnowledgeGraph({
               <g
                 key={node.id}
                 className="graph-node"
-                transform={`translate(${node.x}, ${node.y + floatY})`}
+                transform={`translate(${node.x}, ${node.y + (draggingId === node.id || dragPos[node.id] ? 0 : floatY)})`}
                 style={{
                   opacity,
                   transition: "opacity 0.25s",
-                  cursor: "pointer",
+                  cursor: draggingId === node.id ? "grabbing" : "pointer",
                 }}
-                onClick={() => onNodeSelect(isSelected ? null : node.id)}
+                onMouseDown={(e) => startNodeDrag(e, node)}
+                onClick={() => {
+                  if (suppressClick.current) {
+                    suppressClick.current = false
+                    return
+                  }
+                  onNodeSelect(isSelected ? null : node.id)
+                }}
                 onMouseEnter={() => setHoveredId(node.id)}
                 onMouseLeave={() => setHoveredId(null)}
                 role="button"
