@@ -1,19 +1,39 @@
 // Response shapes for /api/auth/* and /api/management/* (see routes/management/*.js).
 // Learner-derived values are null (and lists empty) when below the N=5 privacy floor.
 
-export type Role = 'learner' | 'admin';
+export type AdminRole = 'owner' | 'moderator';
 
-export interface AuthLearner {
+export interface AdminUser {
   id: string;
   email: string;
   name: string | null;
-  role: Role;
+  admin_role: AdminRole;
 }
 
-export interface AuthResponse {
-  learner: AuthLearner;
+export interface AdminAuthResponse {
+  admin: AdminUser;
   accessToken: string;
   refreshToken: string;
+}
+
+// Signup allowlist (invite-only learner signup, managed from the portal).
+export interface AllowlistEntry {
+  id: string;
+  email: string;
+  note: string | null;
+  created_at: string;
+  used_at: string | null;
+  added_by_email: string | null;
+}
+
+// Admin accounts (owner-only management).
+export interface AdminAccount {
+  id: string;
+  email: string;
+  name: string | null;
+  admin_role: AdminRole;
+  created_at: string;
+  last_login_at: string | null;
 }
 
 export interface PrivacyEnvelope {

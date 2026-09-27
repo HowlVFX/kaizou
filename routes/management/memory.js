@@ -1,6 +1,5 @@
 const express = require('express');
 const db = require('../../database/db');
-const verifyToken = require('../../middleware/auth');
 const managementAuth = require('../../middleware/management-auth');
 const { num, meetsFloor, ok, suppressed, floorRows, sendError } = require('./_shared');
 
@@ -10,7 +9,7 @@ const router = express.Router();
 const REVIEW_THRESHOLD = 0.6;
 
 // GET /api/management/memory
-router.get('/', verifyToken, managementAuth, async (req, res) => {
+router.get('/', managementAuth, async (req, res) => {
   try {
     const summary = await db.query(`
       SELECT

@@ -23,6 +23,7 @@ CREATE TYPE learner_role AS ENUM ('learner', 'admin');
 CREATE TYPE capability_event_type AS ENUM ('SOLO_ADVANCE', 'PERTURBATION_PASS', 'TRANSFER_PASS', 'MASTERY');
 CREATE TYPE review_mode AS ENUM ('Understand', 'Abstract');
 CREATE TYPE decay_sensitivity AS ENUM ('Low', 'Standard', 'High');
+CREATE TYPE admin_role AS ENUM ('owner', 'moderator');
 
 -- Tables
 
@@ -31,7 +32,6 @@ CREATE TABLE learners (
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     name VARCHAR(100),
-    role learner_role DEFAULT 'learner',
     preferred_language VARCHAR(10) DEFAULT 'en',
     portal_optin BOOLEAN DEFAULT false,
     -- Learning preferences (migration 005). decay_sensitivity feeds the memory scheduler.
@@ -40,6 +40,37 @@ CREATE TABLE learners (
     decay_sensitivity decay_sensitivity NOT NULL DEFAULT 'Standard',
     solo_notifications BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Admins are a separate identity domain from learners (own credentials, own
+-- tokens signed with a separate secret). Two tiers: owner (protected) and
+-- moderator. No admin signup route — provisioned by an operator/owner.
+CREATE TABLE admins (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    name VARCHAR(100),
+    admin_role admin_role NOT NULL DEFAULT 'moderator',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TIMESTAMPTZ
+);
+
+CREATE TABLE admin_refresh_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    admin_id UUID REFERENCES admins(id) ON DELETE CASCADE NOT NULL,
+    token TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+-- Invite-only signup: only emails here may create a learner account.
+CREATE TABLE signup_allowlist (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    added_by UUID REFERENCES admins(id) ON DELETE SET NULL,
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    used_at TIMESTAMPTZ
 );
 
 CREATE TABLE refresh_tokens (

@@ -1,9 +1,17 @@
-// Must run after verifyToken. The access token carries `role` (see
-// services/tokens.js); tokens minted before that change have no role and
-// are rejected here until the admin logs in again.
+// Management-API guard. Admins are a SEPARATE identity domain (own table, own
+// token secret, aud='admin') — NOT learners with a role flag. This delegates
+// to verifyAdmin and, for backward compatibility with routers that read
+// req.user.id as the acting rater, also exposes the admin as req.user.
+//
+// Returns 401 (never 403 for "not admin") and does not confirm the route
+// exists, so probing the secret admin base path reveals nothing.
+const { verifyAdmin } = require('./admin-auth');
+
 const managementAuth = (req, res, next) => {
-  if (req.user && req.user.role === 'admin') return next();
-  return res.status(403).json({ error: 'Forbidden: Admin access required' });
+  verifyAdmin(req, res, () => {
+    req.user = req.admin; // { id, admin_role } — grader.js uses req.user.id as the rater
+    next();
+  });
 };
 
 module.exports = managementAuth;

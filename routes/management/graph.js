@@ -1,13 +1,12 @@
 const express = require('express');
 const db = require('../../database/db');
-const verifyToken = require('../../middleware/auth');
 const managementAuth = require('../../middleware/management-auth');
 const { num, meetsFloor, ok, suppressed, floorRows, gated, sendError } = require('./_shared');
 
 const router = express.Router();
 
 // GET /api/management/graph
-router.get('/', verifyToken, managementAuth, async (req, res) => {
+router.get('/', managementAuth, async (req, res) => {
   try {
     const summary = await db.query(`
       SELECT

@@ -1,6 +1,5 @@
 const express = require('express');
 const db = require('../../database/db');
-const verifyToken = require('../../middleware/auth');
 const managementAuth = require('../../middleware/management-auth');
 const { MIN_LEARNERS, num, ok, sendError } = require('./_shared');
 
@@ -10,7 +9,7 @@ const router = express.Router();
 // System-trust metrics (design §5.25) live only in portal_aggregates; they are
 // never mixed into learner analytics. Only unsuppressed rows with
 // sample_size >= 5 are returned (latest per metric_key + cohort_key + dimensions).
-router.get('/', verifyToken, managementAuth, async (req, res) => {
+router.get('/', managementAuth, async (req, res) => {
   try {
     const [metrics, lastRun] = await Promise.all([
       db.query(`

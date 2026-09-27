@@ -1,8 +1,11 @@
-import type { AuthLearner, AuthResponse, ExportFormat, ExportReport, PrivacyEnvelope } from './types';
+import type { AdminUser, AdminAuthResponse, ExportFormat, ExportReport, PrivacyEnvelope } from './types';
 
 // Empty = same origin (the Vite dev server proxies /api to Express).
 const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
-const MANAGEMENT_BASE = '/api/management';
+// The admin API lives at a secret, non-obvious base (NOT /api/management). It
+// must match the server's ADMIN_API_BASE; override with VITE_ADMIN_API_BASE.
+const ADMIN_BASE = (import.meta.env.VITE_ADMIN_API_BASE || '/api/_ctrl').replace(/\/$/, '');
+const MANAGEMENT_BASE = `${ADMIN_BASE}/management`;
 
 const ACCESS_KEY = 'portal_access_token';
 const REFRESH_KEY = 'portal_refresh_token';
@@ -27,24 +30,31 @@ export function getAccessToken(): string | null {
   return localStorage.getItem(ACCESS_KEY);
 }
 
-export function getSessionUser(): AuthLearner | null {
+export function getSessionUser(): AdminUser | null {
   const raw = localStorage.getItem(USER_KEY);
   if (!raw) return null;
   try {
-    return JSON.parse(raw) as AuthLearner;
+    return JSON.parse(raw) as AdminUser;
   } catch {
     return null;
   }
 }
 
+// Any valid admin (owner or moderator) has a portal session; role gates
+// specific actions, not access to the portal itself.
 export function hasAdminSession(): boolean {
-  return Boolean(getAccessToken()) && getSessionUser()?.role === 'admin';
+  const role = getSessionUser()?.admin_role;
+  return Boolean(getAccessToken()) && (role === 'owner' || role === 'moderator');
 }
 
-function storeSession(data: AuthResponse): void {
+export function isOwner(): boolean {
+  return getSessionUser()?.admin_role === 'owner';
+}
+
+function storeSession(data: AdminAuthResponse): void {
   localStorage.setItem(ACCESS_KEY, data.accessToken);
   localStorage.setItem(REFRESH_KEY, data.refreshToken);
-  localStorage.setItem(USER_KEY, JSON.stringify(data.learner));
+  localStorage.setItem(USER_KEY, JSON.stringify(data.admin));
 }
 
 function clearSession(): void {
@@ -76,21 +86,19 @@ function postJson(path: string, body: unknown): Promise<Response> {
 // Auth
 // ---------------------------------------------------------------------------
 
-export async function login(email: string, password: string): Promise<AuthLearner> {
-  const res = await postJson('/api/auth/login', { email, password });
+export async function login(email: string, password: string): Promise<AdminUser> {
+  const res = await postJson(`${ADMIN_BASE}/login`, { email, password });
   if (!res.ok) {
     throw new ApiError(res.status, res.status === 401
       ? 'Invalid email or password.'
       : await readError(res, 'Login failed. Please try again.'));
   }
-  const data = (await res.json()) as AuthResponse;
-  if (data.learner?.role !== 'admin') {
-    // Revoke the learner session we were just issued; the portal is admin-only.
-    postJson('/api/auth/logout', { refreshToken: data.refreshToken }).catch(() => undefined);
-    throw new ApiError(403, 'This account does not have admin access to the management portal.');
+  const data = (await res.json()) as AdminAuthResponse;
+  if (!data.admin) {
+    throw new ApiError(500, 'Login failed.');
   }
   storeSession(data);
-  return data.learner;
+  return data.admin;
 }
 
 export async function logout(): Promise<void> {
@@ -98,7 +106,7 @@ export async function logout(): Promise<void> {
   clearSession();
   if (refreshToken) {
     try {
-      await postJson('/api/auth/logout', { refreshToken });
+      await postJson(`${ADMIN_BASE}/logout`, { refreshToken });
     } catch {
       // Local session is already cleared; the refresh token will expire server-side.
     }
@@ -114,10 +122,10 @@ function refreshSession(): Promise<boolean> {
       const refreshToken = localStorage.getItem(REFRESH_KEY);
       if (!refreshToken) return false;
       try {
-        const res = await postJson('/api/auth/refresh', { refreshToken });
+        const res = await postJson(`${ADMIN_BASE}/refresh`, { refreshToken });
         if (!res.ok) return false;
-        const data = (await res.json()) as AuthResponse;
-        if (data.learner?.role !== 'admin') return false;
+        const data = (await res.json()) as AdminAuthResponse;
+        if (!data.admin) return false;
         storeSession(data);
         return true;
       } catch {
@@ -171,6 +179,32 @@ export async function fetchApi<T>(path: string): Promise<T> {
   }
   return (await res.json()) as T;
 }
+
+// --- Admin control-plane calls (allowlist + admin management) ----------------
+// These hit ADMIN_BASE directly (not the /management sub-base).
+
+async function adminJson<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const res = await authFetch(`${ADMIN_BASE}${path}`, {
+    method,
+    headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    throw new ApiError(res.status, await readError(res, `Request failed (${res.status}).`));
+  }
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
+export const adminApi = {
+  listAllowlist: () => adminJson('GET', '/allowlist'),
+  addAllowlist: (email: string, note?: string) => adminJson('POST', '/allowlist', { email, note }),
+  removeAllowlist: (id: string) => adminJson('DELETE', `/allowlist/${encodeURIComponent(id)}`),
+  listAdmins: () => adminJson('GET', '/admins'),
+  createModerator: (email: string, password: string, name?: string) =>
+    adminJson('POST', '/admins', { email, password, name }),
+  removeAdmin: (id: string) => adminJson('DELETE', `/admins/${encodeURIComponent(id)}`),
+};
 
 export type ExportResult =
   | { status: 'downloaded'; filename: string }

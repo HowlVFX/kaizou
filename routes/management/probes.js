@@ -1,6 +1,5 @@
 const express = require('express');
 const db = require('../../database/db');
-const verifyToken = require('../../middleware/auth');
 const managementAuth = require('../../middleware/management-auth');
 const { MIN_LEARNERS, num, meetsFloor, ok, suppressed, floorRows, sendError } = require('./_shared');
 
@@ -17,7 +16,7 @@ const BAND_SQL = `
   END`;
 
 // GET /api/management/probes
-router.get('/', verifyToken, managementAuth, async (req, res) => {
+router.get('/', managementAuth, async (req, res) => {
   try {
     // Probes are owned through their concept's learner.
     const summary = await db.query(`

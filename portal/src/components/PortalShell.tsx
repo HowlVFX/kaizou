@@ -15,6 +15,7 @@ const NAV_ITEMS = [
   { to: '/clusters', label: 'Clusters', icon: '🧲' },
   { to: '/evaluation', label: 'Evaluation', icon: '🎯' },
   { to: '/export', label: 'Export', icon: '📤' },
+  { to: '/access', label: 'Access', icon: '🔑' },
 ];
 
 export const PortalShell: React.FC = () => {

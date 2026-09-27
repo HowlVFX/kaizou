@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AppProvider, useApp } from './context/AppContext';
+import SiteGate from './components/SiteGate';
 import AppShell from './components/AppShell';
 import LandingPage from './pages/LandingPage';
 import AuthPage from './pages/AuthPage';
@@ -36,10 +37,12 @@ function AppRoutes() {
 
 export default function App() {
   return (
-    <AppProvider>
-      <BrowserRouter>
-        <AppRoutes />
-      </BrowserRouter>
-    </AppProvider>
+    <SiteGate>
+      <AppProvider>
+        <BrowserRouter>
+          <AppRoutes />
+        </BrowserRouter>
+      </AppProvider>
+    </SiteGate>
   );
 }

@@ -1,6 +1,5 @@
 const express = require('express');
 const db = require('../../database/db');
-const verifyToken = require('../../middleware/auth');
 const managementAuth = require('../../middleware/management-auth');
 const { num, meetsFloor, ok, suppressed, floorRows, latestAggregates, sendError } = require('./_shared');
 
@@ -11,7 +10,7 @@ const router = express.Router();
 const SYSTEM_KEYS = ['cohens_kappa', 'kappa', 'generation_agreement'];
 
 // GET /api/management/grader
-router.get('/', verifyToken, managementAuth, async (req, res) => {
+router.get('/', managementAuth, async (req, res) => {
   try {
     const aggregates = await latestAggregates(SYSTEM_KEYS);
     const system_metrics = {
@@ -110,7 +109,7 @@ function cohensKappa(predicted, actual) {
 
 // GET /api/management/grader/labels/sample?limit=50
 // A sample of graded attempts for a rater to label, unlabelled ones first.
-router.get('/labels/sample', verifyToken, managementAuth, async (req, res) => {
+router.get('/labels/sample', managementAuth, async (req, res) => {
   try {
     let limit = parseInt(req.query.limit, 10);
     if (!Number.isFinite(limit) || limit <= 0) limit = 50;
@@ -152,7 +151,7 @@ router.get('/labels/sample', verifyToken, managementAuth, async (req, res) => {
 
 // POST /api/management/grader/labels {attempt_id, human_band, note?}
 // Upsert this rater's gold band for an attempt.
-router.post('/labels', verifyToken, managementAuth, async (req, res) => {
+router.post('/labels', managementAuth, async (req, res) => {
   try {
     const { attempt_id, human_band, note } = req.body || {};
     if (!attempt_id) {
@@ -190,7 +189,7 @@ router.post('/labels', verifyToken, managementAuth, async (req, res) => {
 // GET /api/management/grader/labels/agreement
 // Live Cohen's κ from this rater's gold labels joined to machine bands, plus
 // the canonical value the aggregates job wrote to portal_aggregates.
-router.get('/labels/agreement', verifyToken, managementAuth, async (req, res) => {
+router.get('/labels/agreement', managementAuth, async (req, res) => {
   try {
     const rater = String(req.user.id);
     const result = await db.query(

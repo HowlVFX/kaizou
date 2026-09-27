@@ -7,6 +7,49 @@ export const API_BASE: string = import.meta.env.VITE_API_URL || 'http://localhos
 
 const ACCESS_KEY = 'accessToken';
 const REFRESH_KEY = 'refreshToken';
+const GATE_KEY = 'gateToken';
+
+// ── Site gate (global shared credentials) ─────────────────────────────────────
+export function getGateToken(): string | null {
+  return localStorage.getItem(GATE_KEY);
+}
+export function setGateToken(token: string): void {
+  localStorage.setItem(GATE_KEY, token);
+}
+export function clearGateToken(): void {
+  localStorage.removeItem(GATE_KEY);
+}
+
+type GateListener = () => void;
+const gateFailureListeners = new Set<GateListener>();
+/** Subscribe to "gate no longer valid" so the app can re-show the gate screen. */
+export function onGateRequired(listener: GateListener): () => void {
+  gateFailureListeners.add(listener);
+  return () => { gateFailureListeners.delete(listener); };
+}
+function emitGateRequired() {
+  gateFailureListeners.forEach(l => { try { l(); } catch { /* ignore */ } });
+}
+
+/** Exchange the shared gate credentials for a gate token. Throws ApiError on failure. */
+export async function clearGate(username: string, password: string): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/api/gate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+  } catch {
+    throw new ApiError(0, 'Could not reach the server.', null, 'network');
+  }
+  if (!res.ok) {
+    throw new ApiError(res.status, 'Incorrect access credentials.', null, 'gate_invalid');
+  }
+  const data = await res.json();
+  if (!data?.gateToken) throw new ApiError(500, 'Gate failed.', null, 'gate_invalid');
+  setGateToken(data.gateToken);
+}
 
 export class ApiError extends Error {
   status: number;
@@ -115,6 +158,10 @@ function send(path: string, opts: ApiOptions): Promise<Response> {
     const token = getAccessToken();
     if (token) headers['Authorization'] = `Bearer ${token}`;
   }
+  // Every learner API call carries the site-gate token (the server rejects
+  // ungated calls with 401 gate_required).
+  const gate = getGateToken();
+  if (gate) headers['X-Gate-Token'] = gate;
   return fetch(`${API_BASE}${path}`, {
     method: opts.method || 'GET',
     headers,
@@ -134,6 +181,13 @@ export async function api<T = unknown>(path: string, opts: ApiOptions = {}): Pro
   }
 
   let data = await parseBody(res);
+
+  // Site gate expired/invalid → clear it and prompt the gate screen again.
+  if (res.status === 401 && (data as { code?: string } | null)?.code === 'gate_required') {
+    clearGateToken();
+    emitGateRequired();
+    throw new ApiError(401, 'Site access has expired. Please re-enter the access credentials.', data, 'gate_required');
+  }
 
   if (res.status === 401 && opts.auth !== false && (data as { code?: string } | null)?.code === 'token_expired') {
     const ok = await refreshSession();

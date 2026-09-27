@@ -1,6 +1,8 @@
 // Single source of truth for JWT issuing and verification.
 //
-// Access token payload:  { id, role, type: 'access' }  (15 min)
+// Access token payload:  { id, type: 'access' }  (15 min). Learner tokens
+// carry no role — admin access is a wholly separate identity domain
+// (services/admin-tokens.js), not a flag on a learner.
 // Refresh token payload: { id, jti, type: 'refresh' }  (7 days, stored in
 //   refresh_tokens so it can be revoked; rotated on every /refresh).
 //
@@ -21,7 +23,7 @@ function getJwtSecret() {
 
 function signAccessToken(learner) {
   return jwt.sign(
-    { id: learner.id, role: learner.role || 'learner', type: 'access' },
+    { id: learner.id, type: 'access' },
     getJwtSecret(),
     { expiresIn: ACCESS_TTL },
   );
@@ -64,7 +66,7 @@ async function rotateRefreshToken(refreshToken) {
   );
   if (del.rowCount === 0) return null;
 
-  const result = await db.query('SELECT id, email, name, role FROM learners WHERE id = $1', [del.rows[0].learner_id]);
+  const result = await db.query('SELECT id, email, name FROM learners WHERE id = $1', [del.rows[0].learner_id]);
   const learner = result.rows[0];
   if (!learner) return null;
 

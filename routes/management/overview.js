@@ -1,6 +1,5 @@
 const express = require('express');
 const db = require('../../database/db');
-const verifyToken = require('../../middleware/auth');
 const managementAuth = require('../../middleware/management-auth');
 const { meetsFloor, ok, suppressed, gated, sendError } = require('./_shared');
 
@@ -9,11 +8,11 @@ const router = express.Router();
 // GET /api/management/overview
 // Always returns 200. Below the privacy floor it returns
 // { suppressed: true, reason, min_learners, total_learners, jobs } only.
-router.get('/', verifyToken, managementAuth, async (req, res) => {
+router.get('/', managementAuth, async (req, res) => {
   try {
     // Non-learner-derived totals: safe to show regardless of the floor.
     const [learners, jobs, cohort] = await Promise.all([
-      db.query(`SELECT COUNT(*)::int AS total FROM learners WHERE role = 'learner'`),
+      db.query(`SELECT COUNT(*)::int AS total FROM learners`),
       db.query(`SELECT status::text AS status, COUNT(*)::int AS count FROM jobs GROUP BY status`),
       db.query(`SELECT COUNT(DISTINCT learner_id)::int AS n FROM notes`),
     ]);

@@ -2,7 +2,8 @@ import React from 'react';
 
 interface DataTableProps {
   headers: string[];
-  rows: (string | number)[][];
+  // Cells may be text, numbers, or small interactive nodes (e.g. a remove button).
+  rows: React.ReactNode[][];
   caption?: string;
   emptyMessage?: string;
 }

@@ -16,6 +16,7 @@ import { GenerationPage } from './pages/GenerationPage';
 import { ClustersPage } from './pages/ClustersPage';
 import { EvaluationPage } from './pages/EvaluationPage';
 import { ExportPage } from './pages/ExportPage';
+import { AccessPage } from './pages/AccessPage';
 
 const App: React.FC = () => {
   return (
@@ -35,6 +36,7 @@ const App: React.FC = () => {
         <Route path="clusters" element={<ClustersPage />} />
         <Route path="evaluation" element={<EvaluationPage />} />
         <Route path="export" element={<ExportPage />} />
+        <Route path="access" element={<AccessPage />} />
       </Route>
     </Routes>
   );

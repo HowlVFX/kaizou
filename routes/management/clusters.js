@@ -1,13 +1,12 @@
 const express = require('express');
 const db = require('../../database/db');
-const verifyToken = require('../../middleware/auth');
 const managementAuth = require('../../middleware/management-auth');
 const { num, meetsFloor, ok, suppressed, floorRows, sendError } = require('./_shared');
 
 const router = express.Router();
 
 // GET /api/management/clusters
-router.get('/', verifyToken, managementAuth, async (req, res) => {
+router.get('/', managementAuth, async (req, res) => {
   try {
     // Size comes from cluster_members (clusters.member_count is a cached copy).
     const health = await db.query(`

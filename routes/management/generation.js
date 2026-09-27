@@ -1,6 +1,5 @@
 const express = require('express');
 const db = require('../../database/db');
-const verifyToken = require('../../middleware/auth');
 const managementAuth = require('../../middleware/management-auth');
 const { num, meetsFloor, ok, suppressed, floorRows, latestAggregates, sendError } = require('./_shared');
 
@@ -11,7 +10,7 @@ const router = express.Router();
 const SYSTEM_KEYS = ['generation_agreement', 'leakage_rejection_rate', 'retry_rate'];
 
 // GET /api/management/generation
-router.get('/', verifyToken, managementAuth, async (req, res) => {
+router.get('/', managementAuth, async (req, res) => {
   try {
     const system_metrics = await latestAggregates(SYSTEM_KEYS);
 

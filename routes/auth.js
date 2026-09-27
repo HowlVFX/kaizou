@@ -25,12 +25,21 @@ router.post('/signup', async (req, res) => {
   }
 
   try {
+    // Invite-only: the email must be on the admin-managed allowlist.
+    const allow = await db.query('SELECT id FROM signup_allowlist WHERE email = $1', [email]);
+    if (allow.rowCount === 0) {
+      return res.status(403).json({ error: 'This email is not approved for signup. Ask an administrator for access.' });
+    }
+
     const passwordHash = await bcrypt.hash(password, 10);
     const result = await db.query(
-      'INSERT INTO learners (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, role',
+      'INSERT INTO learners (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name',
       [email, passwordHash, name || null]
     );
     const newLearner = result.rows[0];
+    // Mark the invite consumed (kept for audit; a used invite can't be reused
+    // because the learners.email UNIQUE constraint blocks a second signup).
+    await db.query('UPDATE signup_allowlist SET used_at = NOW() WHERE email = $1 AND used_at IS NULL', [email]);
     const { accessToken, refreshToken } = await issueTokens(newLearner);
 
     res.status(201).json({
@@ -73,7 +82,7 @@ router.post('/login', async (req, res) => {
 
     res.json({
       message: 'Login successful',
-      learner: { id: learner.id, email: learner.email, name: learner.name, role: learner.role },
+      learner: { id: learner.id, email: learner.email, name: learner.name },
       accessToken,
       refreshToken
     });

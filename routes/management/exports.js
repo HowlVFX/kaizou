@@ -1,6 +1,5 @@
 const express = require('express');
 const db = require('../../database/db');
-const verifyToken = require('../../middleware/auth');
 const managementAuth = require('../../middleware/management-auth');
 const { MIN_LEARNERS, num, meetsFloor, suppressed, sendError } = require('./_shared');
 
@@ -47,7 +46,7 @@ const REPORTS = {
                AVG(composite_score)::float8 AS avg_composite
         FROM attempts WHERE learner_id = l.id
       ) a ON true
-      WHERE l.portal_optin = true AND l.role = 'learner'
+      WHERE l.portal_optin = true
       ORDER BY random()
     `);
     if (!meetsFloor(result.rows.length)) {
@@ -85,7 +84,7 @@ function toCsv(rows) {
 
 // GET /api/management/exports/:reportType?format=json|csv
 // Suppressed reports return 200 JSON { suppressed: true, ... } without an attachment.
-router.get('/:reportType', verifyToken, managementAuth, async (req, res) => {
+router.get('/:reportType', managementAuth, async (req, res) => {
   const { reportType } = req.params;
   const build = Object.prototype.hasOwnProperty.call(REPORTS, reportType) ? REPORTS[reportType] : null;
   if (!build) {
