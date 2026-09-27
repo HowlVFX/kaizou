@@ -20,6 +20,7 @@ CREATE TYPE lineage_event AS ENUM ('SAME', 'EVOLVED', 'MERGED', 'SPLIT', 'NEW', 
 CREATE TYPE cluster_status AS ENUM ('ACTIVE', 'ARCHIVED');
 CREATE TYPE job_status AS ENUM ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED');
 CREATE TYPE learner_role AS ENUM ('learner', 'admin');
+CREATE TYPE capability_event_type AS ENUM ('SOLO_ADVANCE', 'PERTURBATION_PASS', 'TRANSFER_PASS', 'MASTERY');
 
 -- Tables
 
@@ -209,6 +210,30 @@ CREATE TABLE misconception_events (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Human expert band for a graded attempt (ground truth for Cohen's kappa,
+-- §5.25.1). Separate from attempts so labelling is an explicit admin action.
+CREATE TABLE attempt_gold_labels (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    attempt_id UUID REFERENCES attempts(id) ON DELETE CASCADE NOT NULL,
+    human_band grading_band NOT NULL,
+    rater TEXT NOT NULL,
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (attempt_id, rater)
+);
+
+-- Append-only log of demonstrated capabilities (SOLO advances, passed
+-- transfer/perturbation probes, mastery) so Insights can show a timeline.
+CREATE TABLE capability_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    learner_id UUID REFERENCES learners(id) ON DELETE CASCADE NOT NULL,
+    concept_id UUID REFERENCES concepts(id) ON DELETE CASCADE NOT NULL,
+    attempt_id UUID REFERENCES attempts(id) ON DELETE SET NULL,
+    event_type capability_event_type NOT NULL,
+    detail JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE clusters (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     learner_id UUID REFERENCES learners(id) ON DELETE CASCADE NOT NULL,
@@ -287,6 +312,8 @@ CREATE INDEX idx_memory_states_last_reviewed ON memory_states(last_reviewed);
 CREATE INDEX idx_jobs_status_run_after ON jobs(status, run_after) WHERE status = 'PENDING';
 CREATE INDEX idx_clusters_learner ON clusters(learner_id);
 CREATE INDEX idx_misconception_events_learner ON misconception_events(learner_id, concept_id);
+CREATE INDEX idx_attempt_gold_labels_attempt ON attempt_gold_labels(attempt_id);
+CREATE INDEX idx_capability_events_learner ON capability_events(learner_id, created_at);
 CREATE INDEX idx_portal_aggregates_key ON portal_aggregates(metric_key, computed_at);
 
 -- ---------------------------------------------------------------------------

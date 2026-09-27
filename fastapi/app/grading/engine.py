@@ -8,9 +8,16 @@
                        ordered, + branch leakage L                  (§5.8.1, §5.7)
     MISCONCEPTION_MCQ  exact match + misconception tag, payload only (§5.14)
     CONCEPT_SORT       ARI vs G_m and G_s + principle_ratio, payload only (§5.13)
-    others             claim-coverage path (PROCEDURAL execution, perturbation
-                       delta scoring and analogy structure-mapping are not
-                       implemented yet; they degrade to coverage)
+    PERTURBATION       delta scoring against the expected delta       (§5.12);
+                       falls back to coverage without a delta / for PROBABILISTIC
+    ANALOGY_SIMULATE   delta scoring over mapped relations             (§9.5)
+    ANALOGY_BREAKDOWN  coverage against authored known-divergences     (§9.5)
+    others             claim-coverage path. PROCEDURAL execution grading
+                       (§5.8.4) is intentionally deferred — it needs sandbox /
+                       symbolic-evaluation infra — and degrades to claim
+                       coverage + ordering. Full §9.4 analogy structural
+                       alignment is out of scope (§13 P13); ANALOGY_FORWARD
+                       stays on the coverage path.
 
 Empty answers are graded as a failed recall (score 0, Not_Yet_Engaged) so
 memory still updates.
@@ -507,8 +514,69 @@ async def grade_answer(
     if probe_type == "CONCEPT_SORT" and key.sort:
         return grade_concept_sort(key, answer_payload, settings)
 
+    if not key.claims:
+        raise GradingInputError("probe answer key has no claims")
+
+    # A perturbation / analogy-simulate answer can arrive as a two-part payload
+    # (what changes / what stays) with no free text, so the empty guard is
+    # "no text AND no payload" for those types.
+    has_payload = bool(answer_payload)
+    is_empty = not text.strip() and not has_payload
+
+    # Lazy imports: the perturbation/analogy graders import shared helpers from
+    # this module, so importing them at module load would be circular. By the
+    # time dispatch runs, engine is fully initialised.
+    if probe_type == "PERTURBATION":
+        if is_empty:
+            return grade_empty(key, settings)
+        from app.grading.perturbation import grade_perturbation
+        outcome = await grade_perturbation(
+            key, text, answer_payload, settings,
+            embed_texts=embed_texts, claim_embeddings=claim_embeddings,
+        )
+        if outcome is not None:
+            return outcome
+        # No usable expected delta (or PROBABILISTIC) → claim coverage (§5.12).
+        if not text.strip():
+            return grade_empty(key, settings)
+
+    elif probe_type == "ANALOGY_SIMULATE":
+        if is_empty:
+            return grade_empty(key, settings)
+        from app.grading.analogy import grade_analogy_simulate
+        outcome = await grade_analogy_simulate(
+            key, text, answer_payload, settings,
+            embed_texts=embed_texts, claim_embeddings=claim_embeddings,
+        )
+        if outcome is not None:
+            return outcome
+        # No mapped-relation delta → claim coverage over correspondences.
+        if not text.strip():
+            return grade_empty(key, settings)
+
+    elif probe_type == "ANALOGY_BREAKDOWN":
+        if not text.strip():
+            return grade_empty(key, settings)
+        from app.grading.analogy import grade_analogy_breakdown
+        outcome = await grade_analogy_breakdown(
+            key, text, settings,
+            embed_texts=embed_texts, claim_embeddings=claim_embeddings,
+            get_nli=get_nli,
+        )
+        if outcome is not None:
+            return outcome
+        # No authored divergences → claim coverage fallback.
+
     if not text.strip():
         return grade_empty(key, settings)
+
+    # PROCEDURAL (§5.8.4): execution / symbolic-evaluation grading is
+    # intentionally deferred — it needs sandbox infrastructure (code execution,
+    # a symbolic algebra system) not present here. Until then it degrades to
+    # the claim-coverage path below (with ordering weights via ORDERED_SHAPES),
+    # which scores the learner's described procedure rather than running it.
+    # ANALOGY_FORWARD (§9.5) is deliberately the coverage path over the
+    # correspondence relations.
 
     indices: Optional[list[int]] = None
     if probe_type == "CLOZE":
@@ -517,9 +585,6 @@ async def grade_answer(
             return exact
         if key.target_claim_index is not None:
             indices = [key.target_claim_index]
-
-    if not key.claims:
-        raise GradingInputError("probe answer key has no claims")
 
     return await grade_claim_coverage(
         key, text, settings,

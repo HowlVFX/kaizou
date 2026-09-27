@@ -233,6 +233,8 @@ class ProbeService:
             sort=chosen.sort,
             template=template_snapshot,
             target_branch=target_branch,
+            perturbation=chosen.perturbation,
+            divergences=chosen.divergences,
         )
         retries = max(0, attempts_made - 1) if not chosen.fallback else attempts_made
 
@@ -332,6 +334,51 @@ class ProbeService:
         report = f"semantic similarity {sem:.2f}, 4-gram overlap {lex:.2f}"
         return is_valid, check, report
 
+    # -- capability events --------------------------------------------------
+
+    async def _log_capability_event(
+        self,
+        learner_id: str,
+        concept_id: str,
+        event_type: str,
+        detail: dict,
+        attempt_id: str | None = None,
+    ) -> None:
+        """Append a capability_events row, idempotently (§5.25.1 timeline).
+
+        SOLO_ADVANCE is deduped on (learner, concept, from→to); the transfer /
+        perturbation events on their triggering attempt_id — so re-running
+        grading or SOLO re-evaluation never spams duplicate rows.
+        """
+        async with self._conn.cursor() as cur:
+            if attempt_id is not None:
+                await cur.execute(
+                    """INSERT INTO capability_events
+                           (learner_id, concept_id, attempt_id, event_type, detail)
+                       SELECT %s, %s, %s, %s, %s::jsonb
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM capability_events
+                           WHERE attempt_id = %s AND event_type = %s
+                       )""",
+                    (learner_id, concept_id, attempt_id, event_type,
+                     psycopg.types.json.Jsonb(detail), attempt_id, event_type),
+                )
+            else:
+                await cur.execute(
+                    """INSERT INTO capability_events
+                           (learner_id, concept_id, event_type, detail)
+                       SELECT %s, %s, %s, %s::jsonb
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM capability_events
+                           WHERE learner_id = %s AND concept_id = %s
+                             AND event_type = %s AND detail = %s::jsonb
+                       )""",
+                    (learner_id, concept_id, event_type,
+                     psycopg.types.json.Jsonb(detail),
+                     learner_id, concept_id, event_type,
+                     psycopg.types.json.Jsonb(detail)),
+                )
+
     # -- SOLO ---------------------------------------------------------------
 
     async def update_solo_level(
@@ -370,7 +417,14 @@ class ProbeService:
                      ) AS best_perturbation,
                      MAX(a.composite_score) FILTER (
                          WHERE p.type = 'FAR_TRANSFER' AND a.passed
-                     ) AS best_far_transfer
+                     ) AS best_far_transfer,
+                     (ARRAY_AGG(a.id::text ORDER BY a.delta_score DESC NULLS LAST)
+                          FILTER (WHERE p.type = 'PERTURBATION' AND a.passed))[1]
+                         AS perturbation_attempt_id,
+                     (ARRAY_AGG(a.id::text ORDER BY a.composite_score DESC NULLS LAST)
+                          FILTER (WHERE p.type IN ('NEAR_TRANSFER', 'FAR_TRANSFER')
+                                        AND a.passed))[1]
+                         AS transfer_attempt_id
                    FROM attempts a
                    JOIN probes p ON p.id = a.probe_id
                    WHERE a.concept_id = %s AND a.learner_id = %s""",
@@ -393,16 +447,34 @@ class ProbeService:
             far_transfer_score=float(best_far or 0.0),
         )
 
+        # Capability timeline (§5.25.1). Passed-transfer / perturbation events
+        # are deduped on their triggering attempt; SOLO_ADVANCE on from→to.
+        pert_attempt = ev.get('perturbation_attempt_id')
+        if best_pert is not None and pert_attempt:
+            await self._log_capability_event(
+                learner_id, concept_id, 'PERTURBATION_PASS',
+                {'delta_score': float(best_pert)}, attempt_id=pert_attempt,
+            )
+        transfer_attempt = ev.get('transfer_attempt_id')
+        if transfer_attempt:
+            await self._log_capability_event(
+                learner_id, concept_id, 'TRANSFER_PASS', {}, attempt_id=transfer_attempt,
+            )
+
         if new_level != current_level:
             async with self._conn.cursor() as cur:
                 await cur.execute(
                     'UPDATE concepts SET solo_level = %s WHERE id = %s',
                     (new_level, concept_id),
                 )
-            await self._conn.commit()
+            await self._log_capability_event(
+                learner_id, concept_id, 'SOLO_ADVANCE',
+                {'from': current_level, 'to': new_level},
+            )
             logger.info(
                 'SOLO level advanced: %s -> %s for concept %s',
                 current_level, new_level, concept_id,
             )
 
+        await self._conn.commit()
         return new_level

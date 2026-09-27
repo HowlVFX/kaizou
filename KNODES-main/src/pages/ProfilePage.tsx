@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
+import { api } from '../lib/api';
 
 function useVW() {
   const [vw, setVw] = useState(window.innerWidth);
@@ -17,15 +18,26 @@ const SECTIONS = ['Profile', 'Appearance', 'Learning', 'Account'] as const;
 type Section = typeof SECTIONS[number];
 
 export default function ProfilePage() {
-  const { user, theme, setTheme, logout, updateUser, learningPrefs, setLearningPrefs, nodes, edges, notes } = useApp();
+  const { user, theme, setTheme, logout, updateUser, learningPrefs, setLearningPrefs, nodes, edges, notes, isLoggedIn } = useApp();
   const navigate = useNavigate();
   const [activeSection, setActiveSection] = useState<Section>('Profile');
   const [showSignOut, setShowSignOut] = useState(false);
+  const [totalReviews, setTotalReviews] = useState<number | null>(null);
 
   const handleSignOut = () => {
     logout();
     navigate('/');
   };
+
+  // Real review count from the analytics activity endpoint (logged-in only).
+  useEffect(() => {
+    if (!isLoggedIn) { setTotalReviews(null); return; }
+    let cancelled = false;
+    api<{ total_attempts?: number }>('/api/analytics/activity')
+      .then(d => { if (!cancelled) setTotalReviews(Number(d?.total_attempts) || 0); })
+      .catch(() => { if (!cancelled) setTotalReviews(null); });
+    return () => { cancelled = true; };
+  }, [isLoggedIn]);
 
   const reviewCount = nodes.filter(n => n.recall !== null && n.recall < 50).length;
   const vw = useVW();
@@ -35,8 +47,7 @@ export default function ProfilePage() {
     { label: 'Concepts', value: nodes.filter(n => !n.locked).length },
     { label: 'Connections', value: edges.length },
     { label: 'Notes', value: notes.length },
-    // No review-history endpoint yet; don't show a made-up number.
-    { label: 'Reviews', value: '—' },
+    { label: 'Reviews', value: totalReviews === null ? '—' : totalReviews },
   ];
 
   return (

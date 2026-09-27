@@ -76,10 +76,12 @@ async def handle_compute_aggregates_job(payload: dict, conn: psycopg.AsyncConnec
 
 
 async def handle_evaluation_run_job(payload: dict, conn: psycopg.AsyncConnection) -> None:
-    """Evaluation metrics from live data: memory calibration + probe discrimination.
+    """Evaluation metrics from live data: memory calibration, probe
+    discrimination, and grading agreement (Cohen's κ).
 
-    Cohen's kappa needs hand-labelled bands, which the schema does not store,
-    so it is not computed here.
+    Cohen's κ is computed from attempt_gold_labels joined to attempts once at
+    least Settings.kappa_min_labels attempts carry a human band (§5.25.1);
+    below that the metric row is suppressed.
     """
     from app.config import get_settings
     from app.evaluation.aggregates import run_evaluation_metrics

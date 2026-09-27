@@ -32,6 +32,7 @@ class FakeDB:
         self.memory: dict[tuple[str, str], dict] = {}
         self.attempts: list[dict] = []
         self.misconceptions: list[dict] = []
+        self.capability_events: list[dict] = []
         self.edges: list[dict] = []
         self.log: list[str] = []
         self.commits = 0
@@ -158,6 +159,11 @@ class FakeCursor:
             self._rows = [{"id": aid}]
         elif s.startswith("INSERT INTO misconception_events"):
             db.misconceptions.append(dict(learner_id=p[0], concept_id=p[1], attempt_id=p[2], tag=p[3]))
+        elif s.startswith("INSERT INTO capability_events"):
+            # Capability timeline (§5.25.1). Both the attempt-tagged and the
+            # SOLO_ADVANCE variants land here; record enough to assert on.
+            db.capability_events.append(dict(learner_id=p[0], concept_id=p[1],
+                                             rest=list(p[2:])))
         elif s.startswith("UPDATE memory_states SET half_life"):
             m = db.memory[(str(p[5]), str(p[6]))]
             m.update(half_life=p[0], last_reviewed=p[1], streak=p[2], attempts=p[3], passes=p[4])

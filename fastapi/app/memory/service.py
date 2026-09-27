@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import psycopg
+import psycopg.types.json
 from psycopg.rows import dict_row
 
 from app.memory.decay import (
@@ -263,6 +264,25 @@ class MemoryService:
                     """UPDATE memory_states SET mastered_at = NOW()
                        WHERE concept_id = %s AND learner_id = %s AND mastered_at IS NULL""",
                     (concept_id, learner_id),
+                )
+                # Capability timeline (§5.25.1): one MASTERY event on the first
+                # time this concept is mastered, tagged with the latest attempt.
+                await cur.execute(
+                    """INSERT INTO capability_events
+                           (learner_id, concept_id, attempt_id, event_type, detail)
+                       SELECT %s, %s,
+                              (SELECT id FROM attempts
+                               WHERE concept_id = %s AND learner_id = %s
+                               ORDER BY submitted_at DESC LIMIT 1),
+                              'MASTERY', %s::jsonb
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM capability_events
+                           WHERE learner_id = %s AND concept_id = %s
+                             AND event_type = 'MASTERY'
+                       )""",
+                    (learner_id, concept_id, concept_id, learner_id,
+                     psycopg.types.json.Jsonb({"n_req": n_req, "streak": streak}),
+                     learner_id, concept_id),
                 )
             newly = True
         await self._conn.commit()

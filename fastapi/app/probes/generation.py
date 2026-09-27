@@ -70,6 +70,21 @@ SORT_SCHEMA = strict_object({
     "surface_groups": _GROUPS,
 })
 
+# §5.12 / §9.5: the model returns the prompt PLUS which listed claims flip and
+# which stay invariant when the stated condition changes (0-based indices into
+# the provided claims). Used by PERTURBATION and ANALOGY_SIMULATE.
+PERTURBATION_SCHEMA = strict_object({
+    "prompt_text": {"type": "string"},
+    "flipped_indices": {"type": "array", "items": {"type": "integer"}},
+    "invariant_indices": {"type": "array", "items": {"type": "integer"}},
+})
+
+# §9.5 ANALOGY_BREAKDOWN: the model lists where the analogy stops holding.
+BREAKDOWN_SCHEMA = strict_object({
+    "prompt_text": {"type": "string"},
+    "divergences": {"type": "array", "items": {"type": "string"}},
+})
+
 MAX_CONTEXT_CLAIMS = 10
 BLANK = "_____"
 
@@ -115,9 +130,13 @@ PROBE_TEMPLATES = {
         "groups, and the two groupings must differ."
     ),
     "PERTURBATION": (
-        "Create a perturbation question about '{label}'. Change one "
-        "condition in the process and ask which downstream claims change "
-        "and which remain invariant."
+        "Create a perturbation question about '{label}'. Pick ONE condition in "
+        "the process and change it. Ask the learner which of the listed claims "
+        "change (flip) as a result and which stay the same (invariant). Return "
+        "'flipped_indices' (0-based indices of the claims that change) and "
+        "'invariant_indices' (0-based indices of the claims that stay the "
+        "same). The two lists must not overlap and must reference the provided "
+        "claims. Do NOT restate the claims in prompt_text."
     ),
     "NEAR_TRANSFER": (
         "Create a near-transfer question about '{label}'. Present a "
@@ -135,12 +154,18 @@ PROBE_TEMPLATES = {
         "given a change in the source domain."
     ),
     "ANALOGY_SIMULATE": (
-        "Ask the learner to simulate the behaviour of '{label}' "
-        "by reasoning through the analogy step by step."
+        "Ask the learner to simulate the behaviour of '{label}' by reasoning "
+        "through the analogy step by step after ONE condition is changed. "
+        "Return which of the listed claims change (flip) as a result in "
+        "'flipped_indices' and which stay the same in 'invariant_indices' "
+        "(0-based indices into the provided claims). The two lists must not "
+        "overlap. Do NOT restate the claims in prompt_text."
     ),
     "ANALOGY_BREAKDOWN": (
-        "Ask the learner where the analogy for '{label}' breaks down. "
-        "Which aspects of the source do NOT transfer to the target?"
+        "Ask the learner where the analogy for '{label}' breaks down — which "
+        "aspects of the source do NOT transfer to the target. Return a list of "
+        "'divergences': short statements of where the analogy stops holding. "
+        "Do NOT restate the claims verbatim in prompt_text."
     ),
 }
 
@@ -200,6 +225,8 @@ class GeneratedProbe:
     cloze: Optional[dict] = None
     mcq: Optional[dict] = None
     sort: Optional[dict] = None
+    perturbation: Optional[dict] = None                  # §5.12 expected delta
+    divergences: Optional[list[str]] = None              # §9.5 known divergences
     fallback: bool = False
 
 
@@ -290,6 +317,50 @@ def validate_cloze(data: dict, claims: list[dict]) -> tuple[str, dict, Optional[
     return prompt, {"answer": answer, "aliases": aliases}, claim_index
 
 
+def validate_perturbation(data: dict, n_claims: int) -> tuple[str, dict]:
+    """Return (prompt, expected_delta) for a PERTURBATION/ANALOGY_SIMULATE probe.
+
+    expected_delta = {"flipped": [idx...], "invariant": [idx...]} referencing
+    the provided claims. Both lists must be in range and disjoint (a claim
+    cannot both flip and stay). At least one classification is required (an
+    all-empty delta carries no signal). Raises ProbeValidationError otherwise.
+    """
+    prompt = (data.get("prompt_text") or "").strip()
+    if not prompt:
+        raise ProbeValidationError("perturbation has no question text")
+
+    def _clean(key: str) -> list[int]:
+        out: list[int] = []
+        for v in data.get(key) or []:
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, int) and 0 <= v < n_claims and v not in out:
+                out.append(v)
+        return out
+
+    flipped = _clean("flipped_indices")
+    invariant = _clean("invariant_indices")
+    if set(flipped) & set(invariant):
+        raise ProbeValidationError("perturbation flipped/invariant sets overlap")
+    if not flipped and not invariant:
+        raise ProbeValidationError("perturbation classifies no claims")
+    return prompt, {"flipped": flipped, "invariant": invariant}
+
+
+def validate_breakdown(data: dict) -> tuple[str, list[str]]:
+    """Return (prompt, divergences) for an ANALOGY_BREAKDOWN probe (§9.5)."""
+    prompt = (data.get("prompt_text") or "").strip()
+    if not prompt:
+        raise ProbeValidationError("analogy breakdown has no question text")
+    divergences = [
+        d.strip() for d in (data.get("divergences") or [])
+        if isinstance(d, str) and d.strip()
+    ]
+    if not divergences:
+        raise ProbeValidationError("analogy breakdown lists no divergences")
+    return prompt, divergences
+
+
 def fallback_probe(probe_type: str, concept: dict, claims: list[dict]) -> GeneratedProbe:
     """Hand-authored probe, no AI (§6.7 step 5)."""
     label = concept.get("canonical_label") or "this concept"
@@ -302,6 +373,24 @@ def fallback_probe(probe_type: str, concept: dict, claims: list[dict]) -> Genera
                 cloze={"answer": answer, "aliases": []}, fallback=True,
             )
         probe_type = "RECALL"
+
+    # §5.12 / §9.5: a delta-scored probe still needs an expected_delta to grade
+    # against. Hand-author a conservative one: for a CONVENTIONAL concept the
+    # correct answer is "nothing changes" (all claims invariant); otherwise the
+    # first claim flips and the rest stay invariant. This degrades without AI
+    # while keeping the delta grader active.
+    if probe_type in {"PERTURBATION", "ANALOGY_SIMULATE"} and claims:
+        n = len(claims)
+        if concept.get("category") == "CONVENTIONAL":
+            delta = {"flipped": [], "invariant": list(range(n))}
+        else:
+            delta = {"flipped": [0], "invariant": list(range(1, n))}
+        template = FALLBACK_TEMPLATES.get(probe_type, FALLBACK_TEMPLATES["PERTURBATION"])
+        return GeneratedProbe(
+            probe_type=probe_type, prompt_text=template.format(label=label),
+            perturbation=delta, fallback=True,
+        )
+
     probe_type = FALLBACK_TYPE.get(probe_type, probe_type)
     template = FALLBACK_TEMPLATES.get(probe_type, FALLBACK_TEMPLATES["RECALL"])
     return GeneratedProbe(
@@ -432,6 +521,9 @@ class ProbeGenerator:
             "CLOZE": CLOZE_SCHEMA,
             "MISCONCEPTION_MCQ": MCQ_SCHEMA,
             "CONCEPT_SORT": SORT_SCHEMA,
+            "PERTURBATION": PERTURBATION_SCHEMA,
+            "ANALOGY_SIMULATE": PERTURBATION_SCHEMA,
+            "ANALOGY_BREAKDOWN": BREAKDOWN_SCHEMA,
         }.get(probe_type, PROBE_SCHEMA)
 
         # `variant` gives each leakage retry its own cache entry, so a retry is
@@ -453,6 +545,12 @@ class ProbeGenerator:
         if probe_type == "CLOZE":
             prompt, cloze, ci = validate_cloze(data, claims)
             return GeneratedProbe(probe_type, prompt, cloze=cloze, target_claim_index=ci)
+        if probe_type in {"PERTURBATION", "ANALOGY_SIMULATE"}:
+            prompt, delta = validate_perturbation(data, min(len(claims), MAX_CONTEXT_CLAIMS))
+            return GeneratedProbe(probe_type, prompt, perturbation=delta)
+        if probe_type == "ANALOGY_BREAKDOWN":
+            prompt, divergences = validate_breakdown(data)
+            return GeneratedProbe(probe_type, prompt, divergences=divergences)
 
         prompt = (data.get("prompt_text") or "").strip()
         if not prompt:

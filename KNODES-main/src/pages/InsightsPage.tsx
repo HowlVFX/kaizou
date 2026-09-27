@@ -23,6 +23,109 @@ interface Dashboard {
   absorption: { absorbed: number; ingested: number };
 }
 
+// GET /api/analytics/activity
+interface Activity {
+  total_attempts: number;
+  total_passes: number;
+  concepts_reviewed: number;
+  recent: { date: string; attempts: number; passes: number }[];
+}
+
+// GET /api/analytics/transfer
+interface TransferItem {
+  concept_id: string;
+  concept_label: string;
+  probe_type: string;
+  score: number | null;
+  passed: boolean;
+  at: string;
+}
+
+// GET /api/analytics/misconceptions
+interface MisconceptionItem {
+  tag: string;
+  concept_id: string;
+  concept_label: string;
+  count: number;
+  last_seen: string;
+}
+
+// GET /api/analytics/capabilities
+interface CapabilityEvent {
+  event_type: string;
+  concept_id: string;
+  concept_label: string;
+  detail: Record<string, unknown>;
+  at: string;
+}
+
+const PROBE_LABELS: Record<string, string> = {
+  NEAR_TRANSFER: 'Near transfer',
+  FAR_TRANSFER: 'Far transfer',
+  ANALOGY_FORWARD: 'Analogy (forward)',
+  ANALOGY_SIMULATE: 'Analogy (simulate)',
+  ANALOGY_BREAKDOWN: 'Analogy (breakdown)',
+};
+
+const CAPABILITY_LABELS: Record<string, string> = {
+  SOLO_ADVANCE: 'Structural level up',
+  PERTURBATION_PASS: 'Handled a perturbation',
+  TRANSFER_PASS: 'Demonstrated transfer',
+  MASTERY: 'Reached mastery',
+};
+
+function fmtDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function mapActivity(a: any): Activity {
+  return {
+    total_attempts: Number(a?.total_attempts) || 0,
+    total_passes: Number(a?.total_passes) || 0,
+    concepts_reviewed: Number(a?.concepts_reviewed) || 0,
+    recent: Array.isArray(a?.recent) ? a.recent.map((r: any) => ({
+      date: String(r?.date ?? ''),
+      attempts: Number(r?.attempts) || 0,
+      passes: Number(r?.passes) || 0,
+    })) : [],
+  };
+}
+
+function mapTransfer(d: any): TransferItem[] {
+  return Array.isArray(d?.items) ? d.items.map((r: any) => ({
+    concept_id: String(r?.concept_id ?? ''),
+    concept_label: String(r?.concept_label ?? 'Untitled concept'),
+    probe_type: String(r?.probe_type ?? ''),
+    score: typeof r?.score === 'number' ? r.score : null,
+    passed: Boolean(r?.passed),
+    at: String(r?.at ?? ''),
+  })) : [];
+}
+
+function mapMisconceptions(d: any): MisconceptionItem[] {
+  return Array.isArray(d?.items) ? d.items.map((r: any) => ({
+    tag: String(r?.tag ?? ''),
+    concept_id: String(r?.concept_id ?? ''),
+    concept_label: String(r?.concept_label ?? 'Untitled concept'),
+    count: Number(r?.count) || 0,
+    last_seen: String(r?.last_seen ?? ''),
+  })) : [];
+}
+
+function mapCapabilities(d: any): CapabilityEvent[] {
+  return Array.isArray(d?.events) ? d.events.map((r: any) => ({
+    event_type: String(r?.event_type ?? ''),
+    concept_id: String(r?.concept_id ?? ''),
+    concept_label: String(r?.concept_label ?? 'Untitled concept'),
+    detail: r?.detail && typeof r.detail === 'object' ? r.detail : {},
+    at: String(r?.at ?? ''),
+  })) : [];
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
 const SOLO_ORDER = ['Extended Abstract', 'Relational', 'Multistructural', 'Unistructural', 'Prestructural'] as const;
 const SOLO_COLORS: Record<string, string> = {
   'Extended Abstract': 'var(--green)',
@@ -52,7 +155,7 @@ function mapDashboard(d: any): Dashboard {
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 export default function InsightsPage() {
-  const { nodes, graphStatus } = useApp();
+  const { nodes, graphStatus, isLoggedIn } = useApp();
   const navigate = useNavigate();
   const vw = useVW();
   const isMobile = vw < 640;
@@ -61,6 +164,22 @@ export default function InsightsPage() {
   const [dash, setDash] = useState<Dashboard | null>(null);
   const [dashStatus, setDashStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [dashError, setDashError] = useState<string | null>(null);
+
+  const [activity, setActivity] = useState<Activity | null>(null);
+  const [activityStatus, setActivityStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [activityError, setActivityError] = useState<string | null>(null);
+
+  const [transfer, setTransfer] = useState<TransferItem[] | null>(null);
+  const [transferStatus, setTransferStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [transferError, setTransferError] = useState<string | null>(null);
+
+  const [misconceptions, setMisconceptions] = useState<MisconceptionItem[] | null>(null);
+  const [misconceptionsStatus, setMisconceptionsStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [misconceptionsError, setMisconceptionsError] = useState<string | null>(null);
+
+  const [capabilities, setCapabilities] = useState<CapabilityEvent[] | null>(null);
+  const [capabilitiesStatus, setCapabilitiesStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [capabilitiesError, setCapabilitiesError] = useState<string | null>(null);
 
   const loadDashboard = useCallback(async () => {
     setDashStatus('loading');
@@ -75,7 +194,74 @@ export default function InsightsPage() {
     }
   }, []);
 
-  useEffect(() => { loadDashboard(); }, [loadDashboard]);
+  const loadActivity = useCallback(async () => {
+    setActivityStatus('loading');
+    setActivityError(null);
+    try {
+      const d = await api<unknown>('/api/analytics/activity');
+      setActivity(mapActivity(d));
+      setActivityStatus('ready');
+    } catch (err) {
+      setActivityError(describeApiError(err, 'Could not load review activity.'));
+      setActivityStatus('error');
+    }
+  }, []);
+
+  const loadTransfer = useCallback(async () => {
+    setTransferStatus('loading');
+    setTransferError(null);
+    try {
+      const d = await api<unknown>('/api/analytics/transfer');
+      setTransfer(mapTransfer(d));
+      setTransferStatus('ready');
+    } catch (err) {
+      setTransferError(describeApiError(err, 'Could not load transfer evidence.'));
+      setTransferStatus('error');
+    }
+  }, []);
+
+  const loadMisconceptions = useCallback(async () => {
+    setMisconceptionsStatus('loading');
+    setMisconceptionsError(null);
+    try {
+      const d = await api<unknown>('/api/analytics/misconceptions');
+      setMisconceptions(mapMisconceptions(d));
+      setMisconceptionsStatus('ready');
+    } catch (err) {
+      setMisconceptionsError(describeApiError(err, 'Could not load misconceptions.'));
+      setMisconceptionsStatus('error');
+    }
+  }, []);
+
+  const loadCapabilities = useCallback(async () => {
+    setCapabilitiesStatus('loading');
+    setCapabilitiesError(null);
+    try {
+      const d = await api<unknown>('/api/analytics/capabilities');
+      setCapabilities(mapCapabilities(d));
+      setCapabilitiesStatus('ready');
+    } catch (err) {
+      setCapabilitiesError(describeApiError(err, 'Could not load capabilities.'));
+      setCapabilitiesStatus('error');
+    }
+  }, []);
+
+  // Don't fetch on logged-out (demo) views; show resolved empty states instead.
+  useEffect(() => {
+    if (!isLoggedIn) {
+      setDashStatus('ready');
+      setActivity(null); setActivityStatus('ready');
+      setTransfer([]); setTransferStatus('ready');
+      setMisconceptions([]); setMisconceptionsStatus('ready');
+      setCapabilities([]); setCapabilitiesStatus('ready');
+      return;
+    }
+    loadDashboard();
+    loadActivity();
+    loadTransfer();
+    loadMisconceptions();
+    loadCapabilities();
+  }, [isLoggedIn, loadDashboard, loadActivity, loadTransfer, loadMisconceptions, loadCapabilities]);
 
   const band = (b: Dashboard['recallDistribution'][number]['band']) =>
     dash?.recallDistribution.find(r => r.band === b)?.count;
@@ -146,8 +332,18 @@ export default function InsightsPage() {
         <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '3fr 1.4fr', gap: 20 }}>
           {/* Left column */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <Panel title="Recall Over Time" isMobile={isMobile}>
-              <NotAvailable text="Recall history isn't tracked yet. This chart will fill in once review history is available." />
+            <Panel title="Review Activity" isMobile={isMobile}>
+              <p style={{ fontSize: 12, color: 'var(--text-dim)', margin: '0 0 14px' }}>
+                Attempts per day over the last 30 days. A continuous recall curve isn&apos;t stored, so this shows your review events instead.
+              </p>
+              {activityStatus === 'loading' ? <Muted>Loading…</Muted>
+                : activityStatus === 'error' ? (
+                  <PanelError message={activityError} onRetry={loadActivity} />
+                ) : !activity || activity.recent.length === 0 ? (
+                  <Muted>No review activity in the last 30 days. Start a review session to build this up.</Muted>
+                ) : (
+                  <ActivityChart recent={activity.recent} />
+                )}
             </Panel>
 
             <Panel title="Structural Level Distribution" isMobile={isMobile}>
@@ -247,7 +443,26 @@ export default function InsightsPage() {
             </Panel>
 
             <Panel title="Recent Capabilities" isMobile={isMobile}>
-              <NotAvailable text="Capability history isn't available yet." />
+              {capabilitiesStatus === 'loading' ? <Muted>Loading…</Muted>
+                : capabilitiesStatus === 'error' ? (
+                  <PanelError message={capabilitiesError} onRetry={loadCapabilities} />
+                ) : !capabilities || capabilities.length === 0 ? (
+                  <Muted>No capability milestones logged yet. These appear as you pass transfer and perturbation probes.</Muted>
+                ) : (
+                  capabilities.slice(0, 6).map((ev, i) => (
+                    <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12 }}>
+                      <div style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--green)', marginTop: 5, flexShrink: 0 }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, color: 'var(--text-2)' }}>
+                          {CAPABILITY_LABELS[ev.event_type] || ev.event_type}
+                        </div>
+                        <div style={{ fontSize: 12, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {ev.concept_label}{ev.at ? ` · ${fmtDate(ev.at)}` : ''}
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
             </Panel>
           </div>
         </div>
@@ -257,7 +472,27 @@ export default function InsightsPage() {
         <div style={{ maxWidth: 860 }}>
           <Panel title="Transfer Evidence" isMobile={isMobile}>
             <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 20 }}>Concepts where you have demonstrated transfer: applying knowledge outside the original example.</p>
-            <NotAvailable text="Transfer evidence isn't available yet. It will appear here once transfer probes are graded." />
+            {transferStatus === 'loading' ? <Muted>Loading…</Muted>
+              : transferStatus === 'error' ? (
+                <PanelError message={transferError} onRetry={loadTransfer} />
+              ) : !transfer || transfer.length === 0 ? (
+                <NotAvailable text="No transfer evidence yet. It will appear here once you pass transfer or analogy probes." />
+              ) : (
+                transfer.map((t, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+                    <CheckCircle size={16} style={{ color: 'var(--green)', flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 14, color: 'var(--text-2)' }}>{t.concept_label}</div>
+                      <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+                        {PROBE_LABELS[t.probe_type] || t.probe_type}{t.at ? ` · ${fmtDate(t.at)}` : ''}
+                      </div>
+                    </div>
+                    {t.score !== null && (
+                      <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--green)', flexShrink: 0 }}>{Math.round(t.score * 100)}%</span>
+                    )}
+                  </div>
+                ))
+              )}
           </Panel>
         </div>
       )}
@@ -265,8 +500,26 @@ export default function InsightsPage() {
       {activeTab === 'misconceptions' && (
         <div style={{ maxWidth: 860 }}>
           <Panel title="Misconception Tracker" isMobile={isMobile}>
-            <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 20 }}>Incorrect beliefs detected in your answers and whether you have corrected them.</p>
-            <NotAvailable text="Misconception tracking isn't available yet." />
+            <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 20 }}>Incorrect beliefs detected in your answers, grouped by pattern.</p>
+            {misconceptionsStatus === 'loading' ? <Muted>Loading…</Muted>
+              : misconceptionsStatus === 'error' ? (
+                <PanelError message={misconceptionsError} onRetry={loadMisconceptions} />
+              ) : !misconceptions || misconceptions.length === 0 ? (
+                <NotAvailable text="No misconceptions detected yet. Nice work." />
+              ) : (
+                misconceptions.map((m, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+                    <AlertTriangle size={16} style={{ color: 'var(--orange)', flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 14, color: 'var(--text-2)' }}>{m.tag}</div>
+                      <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+                        {m.concept_label}{m.last_seen ? ` · last ${fmtDate(m.last_seen)}` : ''}
+                      </div>
+                    </div>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--orange)', flexShrink: 0 }}>×{m.count}</span>
+                  </div>
+                ))
+              )}
           </Panel>
         </div>
       )}
@@ -283,6 +536,49 @@ function NotAvailable({ text }: { text: string }) {
     <div style={{ padding: '18px 0', textAlign: 'center', color: 'var(--text-dim)', fontSize: 13 }}>
       <RefreshCw size={20} style={{ marginBottom: 8, opacity: 0.4 }} />
       <div>{text}</div>
+    </div>
+  );
+}
+
+function PanelError({ message, onRetry }: { message: string | null; onRetry: () => void }) {
+  return (
+    <div role="alert" style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, color: 'var(--red)' }}>
+      <span style={{ flex: 1 }}>{message || 'Something went wrong.'}</span>
+      <button
+        onClick={onRetry}
+        style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 8, background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-2)', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
+      >
+        <RefreshCw size={12} /> Retry
+      </button>
+    </div>
+  );
+}
+
+function ActivityChart({ recent }: { recent: { date: string; attempts: number; passes: number }[] }) {
+  const max = recent.reduce((m, r) => Math.max(m, r.attempts), 0) || 1;
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 120 }}>
+        {recent.map((r, i) => (
+          <div
+            key={i}
+            title={`${fmtDate(r.date)}: ${r.attempts} attempt${r.attempts === 1 ? '' : 's'}, ${r.passes} passed`}
+            style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', height: '100%' }}
+          >
+            <div style={{ position: 'relative', height: `${(r.attempts / max) * 100}%`, background: 'var(--bg-input)', borderRadius: 4, minHeight: 3, overflow: 'hidden' }}>
+              <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: `${r.attempts ? (r.passes / r.attempts) * 100 : 0}%`, background: 'var(--green)' }} />
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 12, fontSize: 11, color: 'var(--text-dim)' }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 8, height: 8, borderRadius: 2, background: 'var(--green)' }} /> Passed
+        </span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 8, height: 8, borderRadius: 2, background: 'var(--bg-input)' }} /> Attempts
+        </span>
+      </div>
     </div>
   );
 }

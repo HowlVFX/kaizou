@@ -15,7 +15,8 @@ Metric keys written:
         contradiction_rate, probe_leak_rate, cluster_modularity_mean
     evaluation job: brier_score, ece, auc (memory calibration from
         attempts.predicted_recall vs passed), probe_discrimination_share
-        {discrimination}, probes_evaluated
+        {discrimination}, probes_evaluated, cohens_kappa (grading agreement
+        from attempt_gold_labels joined attempts, §5.25.1)
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from psycopg.rows import dict_row
 from app.evaluation.metrics import (
     calculate_auc,
     calculate_brier_score,
+    calculate_cohens_kappa,
     calculate_ece,
     calculate_point_biserial,
     classify_probe_discrimination,
@@ -122,6 +124,30 @@ def compute_probe_discrimination(rows: list[dict], floor: int) -> list[dict]:
         out.append(privacy_row("probe_discrimination_share", share, len(learners_used), floor,
                                {"discrimination": cls}))
     return out
+
+
+def compute_cohens_kappa(rows: list[dict], min_labels: int, floor: int) -> dict:
+    """Grading agreement κ from hand-labelled attempts (§5.25.1).
+
+    rows: [{'machine_band', 'human_band'}] — one per labelled attempt whose
+    machine band is present. κ is written as a single ``cohens_kappa`` row
+    (no dimensions, so the portal read picks it up) with sample_size = the
+    number of labelled pairs. Suppressed below ``min_labels`` (too small a
+    sample) — the effective threshold is max(min_labels, floor) so the row is
+    never surfaced below the privacy floor either.
+    """
+    threshold = max(int(min_labels), int(floor))
+    pairs = [
+        (str(r["machine_band"]), str(r["human_band"]))
+        for r in rows
+        if r.get("machine_band") is not None and r.get("human_band") is not None
+    ]
+    n = len(pairs)
+    if n < threshold:
+        return privacy_row("cohens_kappa", None, n, threshold)
+    predicted = [p for p, _ in pairs]
+    actual = [a for _, a in pairs]
+    return privacy_row("cohens_kappa", calculate_cohens_kappa(predicted, actual), n, threshold)
 
 
 async def _write_rows(conn, rows: list[dict], window_start, window_end) -> None:
@@ -225,8 +251,21 @@ async def run_evaluation_metrics(conn: psycopg.AsyncConnection, payload: dict, s
             (start,),
         )
         attempts = await cur.fetchall()
+        # Grading agreement κ: pair the machine band with the human gold band
+        # for every labelled attempt. Not window-scoped — labelling is a slow
+        # manual effort, so all gold labels count toward the sample.
+        await cur.execute(
+            """SELECT a.band::text AS machine_band, g.human_band::text AS human_band
+               FROM attempt_gold_labels g
+               JOIN attempts a ON a.id = g.attempt_id"""
+        )
+        labels = await cur.fetchall()
 
-    rows = compute_calibration(calib, floor) + compute_probe_discrimination(attempts, floor)
+    rows = (
+        compute_calibration(calib, floor)
+        + compute_probe_discrimination(attempts, floor)
+        + [compute_cohens_kappa(labels, settings.kappa_min_labels, floor)]
+    )
     await _write_rows(conn, rows, start, end)
     await conn.commit()
     return len(rows)

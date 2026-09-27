@@ -111,6 +111,9 @@ class Settings(BaseSettings):
 
     # Composite score
     pass_threshold: float = 0.50                # s_pass
+    # §5.12/§5.24.1: a perturbation probe passes (and gates Relational) at its
+    # own delta-score threshold, independent of the composite pass gate.
+    perturbation_pass_threshold: float = 0.70   # δ_pass
     w_coverage: float = 0.55
     w_ordering: float = 0.15
     w_precision: float = 0.30
@@ -161,6 +164,11 @@ class Settings(BaseSettings):
 
     # Privacy
     privacy_floor: int = 5                      # N=5 (D-10)
+
+    # Grading agreement (§5.25.1) — Cohen's kappa is only written to
+    # portal_aggregates once at least this many attempts carry a human gold
+    # label; below it the row is suppressed (too small a sample to trust).
+    kappa_min_labels: int = 20
 
     # Embedding — must equal the vector(N) columns in database/schema.sql
     embedding_dimensions: int = 1536
