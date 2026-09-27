@@ -35,6 +35,34 @@ PREREQUISITES_SCHEMA = strict_object({
     "prerequisites": {"type": "array", "items": {"type": "string"}},
 })
 
+EMBEDDED_ANALOGY_SCHEMA = strict_object({
+    "has_analogy": {"type": "boolean"},
+    "analogy_label": {"type": "string"},
+    "analogy_claims": {"type": "array", "items": {"type": "string"}},
+})
+
+# Cheap deterministic gate: the paid analogy-detection call only runs when the
+# note contains wording that usually introduces a comparison.
+ANALOGY_CUE_PATTERN = re.compile(
+    r"\b(is like|are like|was like|just like|kind of like|sort of like|works like|"
+    r"acts like|like a|like an|similar to|think of (?:it|this|them|that) as|"
+    r"imagine|analog(?:y|ies|ous)|as if|compared? to|comparable to|"
+    r"the same way (?:as|that))\b",
+    re.IGNORECASE,
+)
+
+
+def has_analogy_cue(text: str) -> bool:
+    """True when the text contains wording that typically introduces an analogy."""
+    return bool(text and ANALOGY_CUE_PATTERN.search(text))
+
+
+@dataclass
+class EmbeddedAnalogy:
+    """An analogy the learner wrote inside a note about another concept."""
+    label: str
+    claims: list[str]
+
 
 @dataclass
 class ExtractedClaim:
@@ -67,7 +95,12 @@ def extract_wikilinks(markdown: str) -> list[str]:
 class ClaimExtractor:
     """Extracts claims and prerequisites from note text via LLM."""
 
-    CLAIM_PROMPT = """You are an expert knowledge analyst. Extract the distinct factual claims from this text.
+    CLAIM_PROMPT = """You extract the distinct claims a learner made in their own note.
+
+Faithfulness rules (strict):
+- Only include what the text itself states. Never add outside knowledge, extra detail, technical terms, numbers or examples the learner did not write.
+- Keep the learner's own words, vocabulary and level. If the note is written simply (e.g. for a child), the claims must be equally simple.
+- Do not generalise or broaden a claim beyond what was written. Fewer faithful claims are better than many embellished ones.
 
 For each claim provide:
 - text: the claim as a standalone sentence
@@ -86,6 +119,7 @@ Rules:
 - When an existing concept label below fits, return that label exactly.
 - Otherwise return a short canonical concept name (2-5 words, no explanation).
 - Do not list "{label}" itself or concepts the text merely mentions in passing.
+- Stay at the level the text is written at. Only list ideas the learner would genuinely need to already understand to follow THIS text as written; never list advanced or broad topics the text does not rely on.
 - Return an empty list if the text needs no prior knowledge.
 
 Return JSON: {"prerequisites": ["concept_label_1", "concept_label_2"]}
@@ -164,3 +198,39 @@ Existing concepts: {concepts}"""
             seen.add(key)
             out.append(cleaned)
         return out[: self.MAX_PREREQUISITES]
+
+    ANALOGY_PROMPT = """A learner wrote a note about "{label}". Decide whether the note explains "{label}" through an analogy or comparison to something else (e.g. "the leaf is like a kitchen").
+
+Rules:
+- has_analogy is true ONLY if the learner actually uses an analogy/comparison to explain "{label}". A passing use of words like "like" or "imagine" is not enough.
+- analogy_label: a short name for the analogy, e.g. "{label} as a kitchen" (3-8 words). Empty string if none.
+- analogy_claims: the correspondences the learner states, each as one short sentence in the learner's own words and level (e.g. "The sun is like the stove's heat."). Never add correspondences the learner did not write. Empty list if none.
+
+Return JSON: {"has_analogy": true/false, "analogy_label": "...", "analogy_claims": ["..."]}"""
+
+    ANALOGY_VARIANT = "embedded-analogy-v1"
+    MAX_ANALOGY_CLAIMS = 8
+
+    async def extract_embedded_analogy(self, text: str, concept_label: str) -> EmbeddedAnalogy | None:
+        """Detect an analogy the learner used inside a note (None if absent)."""
+        if not text.strip():
+            return None
+        label = concept_label.strip() or "this concept"
+        result = await self._client.generate_structured(
+            system=self.ANALOGY_PROMPT.replace("{label}", label),
+            prompt=text[:6000],
+            schema=EMBEDDED_ANALOGY_SCHEMA,
+            variant=self.ANALOGY_VARIANT,
+        )
+        data = result.data or {}
+        if not data.get("has_analogy"):
+            return None
+        claims = [
+            " ".join(c.split())[:400]
+            for c in (data.get("analogy_claims") or [])
+            if isinstance(c, str) and c.strip()
+        ][: self.MAX_ANALOGY_CLAIMS]
+        name = " ".join(str(data.get("analogy_label") or "").split())[:120]
+        if not claims:
+            return None
+        return EmbeddedAnalogy(label=name or f"Analogy for {label}", claims=claims)

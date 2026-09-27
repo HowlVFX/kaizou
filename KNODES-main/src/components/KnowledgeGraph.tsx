@@ -22,6 +22,8 @@ interface Props {
 
 const NODE_RADIUS = 22
 const LOCKED_RADIUS = 18
+// Analogy nodes (diamonds) and their ANALOGY_OF links.
+const ANALOGY_COLOR = "#a78bfa"
 const CLUSTER_RADIUS = 58
 
 export default function KnowledgeGraph({
@@ -193,11 +195,13 @@ export default function KnowledgeGraph({
     return {
       stroke: isActive
         ? "var(--green)"
-        : isRelevant
-          ? edge.type === "requires"
-            ? "var(--green)"
-            : "var(--blue)"
-          : "var(--text-dim)",
+        : edge.type === "analogy"
+          ? ANALOGY_COLOR
+          : isRelevant
+            ? edge.type === "requires"
+              ? "var(--green)"
+              : "var(--blue)"
+            : "var(--text-dim)",
       strokeWidth: isActive ? 2 : isRelevant ? 1.5 : 1,
       opacity:
         focusId && !isRelevant && !isActive
@@ -212,7 +216,9 @@ export default function KnowledgeGraph({
           ? "5,4"
           : edge.type === "requires"
             ? "6,3"
-            : "none",
+            : edge.type === "analogy"
+              ? "2,4"
+              : "none",
     }
   }
 
@@ -773,27 +779,47 @@ export default function KnowledgeGraph({
                     strokeDasharray="4,4"
                   />
                 )}
-                {/* Node body */}
-                <circle
-                  r={r}
-                  fill={
-                    node.locked
-                      ? "var(--bg-elevated)"
-                      : "var(--bg-card, var(--bg-elevated))"
-                  }
-                  stroke={
-                    node.locked
-                      ? "var(--text-dim)"
-                      : isSelected || isHovered || isActivePath
-                        ? status.color
+                {/* Node body: analogy nodes are diamonds, concepts are circles */}
+                {node.isAnalogy && !node.locked ? (
+                  <polygon
+                    points={`0,${-r * 1.25} ${r * 1.25},0 0,${r * 1.25} ${-r * 1.25},0`}
+                    fill="var(--bg-card, var(--bg-elevated))"
+                    stroke={
+                      isSelected || isHovered || isActivePath
+                        ? ANALOGY_COLOR
                         : "var(--text-dim)"
-                  }
-                  strokeWidth={
-                    isSelected ? 2 : isActivePath ? 1.5 : isHovered ? 1.5 : 1
-                  }
-                  filter={filterAttr}
-                  style={{ transition: "r 0.15s, stroke 0.15s" }}
-                />
+                    }
+                    strokeWidth={
+                      isSelected ? 2 : isActivePath ? 1.5 : isHovered ? 1.5 : 1.2
+                    }
+                    strokeLinejoin="round"
+                    filter={filterAttr}
+                    style={{ transition: "stroke 0.15s" }}
+                  >
+                    <title>Analogy</title>
+                  </polygon>
+                ) : (
+                  <circle
+                    r={r}
+                    fill={
+                      node.locked
+                        ? "var(--bg-elevated)"
+                        : "var(--bg-card, var(--bg-elevated))"
+                    }
+                    stroke={
+                      node.locked
+                        ? "var(--text-dim)"
+                        : isSelected || isHovered || isActivePath
+                          ? status.color
+                          : "var(--text-dim)"
+                    }
+                    strokeWidth={
+                      isSelected ? 2 : isActivePath ? 1.5 : isHovered ? 1.5 : 1
+                    }
+                    filter={filterAttr}
+                    style={{ transition: "r 0.15s, stroke 0.15s" }}
+                  />
+                )}
                 {/* Locked overlay */}
                 {node.locked && (
                   <g transform="translate(-7,-7)">

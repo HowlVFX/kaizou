@@ -141,9 +141,9 @@ async def fetch(
 async def extract_text(request: ExtractTextRequest):
     """Fetch a URL and return its cleaned text — no DB write, no concept needed.
 
-    Backs the learner "Add web link" source action: the extracted text is
-    appended to the note body client-side and ingested through the normal
-    note pipeline. Uses the same SSRF-protected fetcher as /fetch.
+    Backs the learner "Add web link" source action: Express stores the
+    extracted text as a separate note source (never merged into the note
+    body). Uses the same SSRF-protected fetcher as /fetch.
     """
     from urllib.parse import urlparse
 
@@ -153,6 +153,11 @@ async def extract_text(request: ExtractTextRequest):
         raise HTTPException(status_code=400, detail=f"URL not allowed: {e}")
     except FetchTooLargeError as e:
         raise HTTPException(status_code=413, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        hint = (" This site blocks automated fetching; paste the text or upload a file instead."
+                if code in (401, 403, 429) else "")
+        raise HTTPException(status_code=502, detail=f"The site returned HTTP {code}.{hint}")
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch source: {type(e).__name__}")
 
@@ -163,7 +168,7 @@ async def extract_text(request: ExtractTextRequest):
     # fetch_url already caps content at 50k chars; flag if we hit that ceiling.
     return ExtractTextResponse(
         url=fetched.get("url") or str(request.url),
-        title=domain,
+        title=fetched.get("title") or domain,
         text=text,
         truncated=len(text) >= 50000,
     )

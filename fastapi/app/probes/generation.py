@@ -514,7 +514,15 @@ class ProbeGenerator:
             "Generate ONLY what the learner will see plus the structured fields "
             "requested. Do NOT include the answer in the question text. Do NOT "
             "reproduce any claim verbatim — the question must test "
-            "understanding, not recognition. Return JSON matching the schema."
+            "understanding, not recognition.\n"
+            "Faithfulness and tone (these claims come from the learner's own note):\n"
+            "- Test ONLY what the listed claims say. Never introduce facts, terms, "
+            "numbers, examples or details that are not in the claims.\n"
+            "- Write in the same plain language, vocabulary and reading level as "
+            "the claims. If the claims are simple, the question must be simple.\n"
+            "- Keep the question short: one or two sentences, everyday words, no "
+            "jargon the learner did not use.\n"
+            "Return JSON matching the schema."
         )
 
         schema = {

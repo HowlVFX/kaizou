@@ -144,8 +144,8 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
             <span style={{ color: 'var(--text-dim)', marginTop: 1, flexShrink: 0 }}><Lock size={16} /></span>
             <div>
               <div style={{ fontWeight: 600, color: 'var(--text-2)', fontSize: 13, marginBottom: 4 }}>Missing prerequisite</div>
-              <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55 }}>KNODES identified this as a prerequisite not yet established in your Brain.</div>
-              <button onClick={() => navigate('/notes')} style={{
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55 }}>Kaizou identified this as a prerequisite not yet established in your Brain.</div>
+              <button onClick={() => navigate('/notes', { state: { learnConcept: { id: node.id, label: node.label } } })} style={{
                 marginTop: 10, padding: '6px 14px', borderRadius: 7, background: 'var(--blue)',
                 border: 'none', color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
               }}>Learn this concept</button>

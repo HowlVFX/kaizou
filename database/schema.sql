@@ -24,6 +24,8 @@ CREATE TYPE capability_event_type AS ENUM ('SOLO_ADVANCE', 'PERTURBATION_PASS', 
 CREATE TYPE review_mode AS ENUM ('Understand', 'Abstract');
 CREATE TYPE decay_sensitivity AS ENUM ('Low', 'Standard', 'High');
 CREATE TYPE admin_role AS ENUM ('owner', 'moderator');
+CREATE TYPE note_type AS ENUM ('SOURCE_BACKED', 'USER_DEFINED', 'ANALOGY');
+CREATE TYPE note_source_kind AS ENUM ('link', 'file', 'paste');
 
 -- Tables
 
@@ -89,6 +91,7 @@ CREATE TABLE notes (
     markdown_hash TEXT,
     language VARCHAR(10) DEFAULT 'en',
     ingestion_status note_status DEFAULT 'PENDING',
+    note_type note_type NOT NULL DEFAULT 'SOURCE_BACKED',
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
@@ -115,6 +118,22 @@ CREATE TABLE concepts (
     source_trust_tier source_trust_tier,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Added after concepts exists (FKs to concepts).
+ALTER TABLE notes ADD COLUMN analogy_target_concept_id UUID REFERENCES concepts(id) ON DELETE SET NULL;
+ALTER TABLE notes ADD COLUMN target_concept_id UUID REFERENCES concepts(id) ON DELETE SET NULL;
+
+-- Sources attached to a note. Stored separately; never merged into body_md.
+CREATE TABLE note_sources (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    note_id UUID REFERENCES notes(id) ON DELETE CASCADE NOT NULL,
+    kind note_source_kind NOT NULL,
+    title TEXT,
+    url TEXT,
+    content_text TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_note_sources_note ON note_sources(note_id);
 
 CREATE TABLE note_concepts (
     note_id UUID REFERENCES notes(id) ON DELETE CASCADE,

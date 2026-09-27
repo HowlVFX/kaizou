@@ -18,6 +18,7 @@ from app.grading.answer_key import PROBE_TYPES, build_snapshot
 from app.grading.coverage import as_vector
 from app.memory.telemetry import evaluate_solo_advancement
 from app.probes.generation import (
+    MAX_CONTEXT_CLAIMS,
     ORDER_DEPENDENT_TYPES,
     GeneratedProbe,
     ProbeGenerator,
@@ -30,6 +31,9 @@ from app.providers.shared.errors import ProviderError
 logger = logging.getLogger(__name__)
 
 MAX_LEAKAGE_RETRIES = 3  # default; Settings.probe_leakage_max_retries overrides
+
+# Probe types that test one specific claim; repeat probes rotate the claim.
+CLAIM_TARGETED_TYPES = frozenset({"CLOZE", "MISCONCEPTION_MCQ"})
 
 
 class ProbeServiceError(Exception):
@@ -119,7 +123,9 @@ class ProbeService:
         concept = dict(concept)
         if concept.get('status') == 'UNRESOLVED_PREREQUISITE':
             raise ProbeServiceError(422, 'Concept is a locked prerequisite; write a note to unlock it')
-        if concept.get('probe_eligible') is False or concept.get('category') == 'OUT_OF_SCOPE':
+        # Every note the learner wrote is testable, including user-defined
+        # notes the classifier would label OUT_OF_SCOPE (meta/non-academic).
+        if concept.get('probe_eligible') is False:
             raise ProbeServiceError(422, 'Concept is not probe-eligible')
         current_version = concept['version']
         if concept_version is not None and concept_version != current_version:
@@ -171,6 +177,37 @@ class ProbeService:
                 target_branch = random.choice(sorted(branches))
                 focus = f"Focus the question on the '{target_branch}' case/branch only."
 
+        # Analogy nodes: name what the analogy is FOR, so analogy probes can
+        # refer to the real concept instead of "its target concept".
+        if concept.get('track') == 'ANALOGY':
+            async with self._conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT c.canonical_label FROM edges e JOIN concepts c ON c.id = e.target_id "
+                    "WHERE e.source_id = %s AND e.type = 'ANALOGY_OF' LIMIT 1",
+                    (concept_id,),
+                )
+                target_row = await cur.fetchone()
+            if target_row:
+                note = f"'{concept.get('canonical_label')}' is the learner's analogy for '{target_row['canonical_label']}'."
+                focus = f"{focus}\n{note}" if focus else note
+
+        # Variety: the Nth probe of this type for this concept version is its
+        # own cache sample (otherwise a retest replays the identical question)
+        # and, for claim-targeted types, rotates onto a different claim.
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT COUNT(*) AS n FROM probes WHERE concept_id = %s "
+                "AND concept_version = %s AND type = %s",
+                (concept_id, current_version, probe_type),
+            )
+            row = await cur.fetchone()
+            prior_probes = int(row['n']) if row else 0
+        sample_prefix = f"s{prior_probes}-" if prior_probes else ""
+        if prior_probes and probe_type in CLAIM_TARGETED_TYPES and len(claims) > 1:
+            k = prior_probes % min(len(claims), MAX_CONTEXT_CLAIMS)
+            rotate = f"Base the question on claim {k} (0-based) this time."
+            focus = f"{focus}\n{rotate}" if focus else rotate
+
         max_attempts = max(1, int(getattr(self._s, 'probe_leakage_max_retries', MAX_LEAKAGE_RETRIES)))
         claim_embeddings = [as_vector(c['embedding']) for c in claims if c.get('embedding') is not None]
         claim_token_lists = [c['text'].split() for c in claims]
@@ -189,7 +226,7 @@ class ProbeService:
                     concept=concept,
                     claims=claims,
                     probe_type=probe_type,
-                    variant=f"leak-retry-{attempt}",
+                    variant=f"{sample_prefix}leak-retry-{attempt}",
                     violation=violation,
                     focus=focus,
                 )

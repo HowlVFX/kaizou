@@ -6,7 +6,8 @@ const { computeRecall } = require('../services/recall');
 const router = express.Router();
 
 // Graph payload is deliberately slim: no embeddings (1536 floats per concept).
-//   node: { id, label, canonical_label, category, status, summary, solo_level,
+//   node: { id, label, canonical_label, category, status, track, analogy_of,
+//           summary, solo_level,
 //           recall, half_life, last_reviewed, claims_count, x, y }
 //   edge: { source_id, target_id, type, weight }
 // recall = 2^(-dt_days / half_life_days), null if never reviewed (1.0 if
@@ -19,7 +20,9 @@ const EDGE_COLS = 'source_id, target_id, type, weight';
 router.get('/', verifyToken, async (req, res) => {
   try {
     const conceptsResult = await db.query(
-      `SELECT c.id, c.canonical_label, c.category, c.status, c.solo_level,
+      `SELECT c.id, c.canonical_label, c.category, c.status, c.solo_level, c.track,
+              (SELECT e.target_id FROM edges e
+                WHERE e.source_id = c.id AND e.type = 'ANALOGY_OF' LIMIT 1) AS analogy_of,
               m.half_life, m.last_reviewed, m.decay_exempt,
               (SELECT COUNT(*)::int FROM claims cl
                 WHERE cl.concept_id = c.id AND cl.concept_version = c.version) AS claims_count
@@ -37,6 +40,9 @@ router.get('/', verifyToken, async (req, res) => {
       canonical_label: c.canonical_label,
       category: c.category,
       status: c.status,
+      track: c.track,
+      // Concept this node is an analogy for (ANALOGY_OF target), if any.
+      analogy_of: c.analogy_of ?? null,
       summary: null,
       solo_level: soloToUi(c.solo_level),
       recall: computeRecall(c.last_reviewed, c.half_life, c.decay_exempt, now),

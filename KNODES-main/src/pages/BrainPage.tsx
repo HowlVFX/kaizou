@@ -653,6 +653,12 @@ export default function BrainPage() {
               <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--text-dim)", flexShrink: 0 }} />
               <span style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>Concept</span>
             </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+              <svg width="10" height="10" viewBox="0 0 10 10" style={{ flexShrink: 0 }} aria-hidden="true">
+                <polygon points="5,0 10,5 5,10 0,5" fill="none" stroke="#a78bfa" strokeWidth="1.3" />
+              </svg>
+              <span style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>Analogy</span>
+            </div>
             {[
               { color: "var(--green)", label: "Healthy (75–100%)" },
               { color: "var(--orange)", label: "Weakening (50–74%)" },

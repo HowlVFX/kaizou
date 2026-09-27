@@ -19,13 +19,14 @@ const corsOrigins = (process.env.CORS_ORIGIN || 'http://localhost:8443,http://lo
   .filter(Boolean);
 app.use(cors({ origin: corsOrigins }));
 
-app.use(express.json()); // Middleware to parse JSON bodies
+// 1 MB: room for a note body plus an uploaded/pasted source (capped at 200k chars).
+app.use(express.json({ limit: '1mb' }));
 
-// --- Global site gate --------------------------------------------------------
-// Everyone must clear a shared username/password before the learner app is
-// usable. POST /api/gate exchanges the credentials for a short-lived gate
-// token; requireGate then guards every learner route (auth included), so the
-// gate cannot be bypassed by faking client state.
+// --- Site gate --------------------------------------------------------------
+// A shared username/password that guards the MANAGEMENT PORTAL (a dev-site
+// splash before the admin login). POST /api/gate exchanges the shared
+// credentials for a short-lived gate token; requireGate guards the admin API.
+// The learner app is NOT gated — learners use normal signup/login (invite-only).
 app.post('/api/gate', (req, res) => {
   const { username, password } = req.body || {};
   if (!checkGateCredentials(username, password)) {
@@ -34,36 +35,34 @@ app.post('/api/gate', (req, res) => {
   res.json({ gateToken: issueGateToken() });
 });
 
-// --- Learner routes (behind the global gate) ---------------------------------
-app.use('/api/auth', requireGate, authRoutes);
-// OAuth is a browser-redirect flow (provider -> callback) that can't carry the
-// X-Gate-Token header, so it isn't behind the site gate. Signup is still
-// invite-only via the allowlist, so this doesn't widen who can get an account.
+// --- Learner routes (public-facing app; no site gate) ------------------------
+app.use('/api/auth', authRoutes);
 app.use('/api/oauth', oauthRoutes);
-app.use('/api/users', requireGate, userRoutes);
-app.use('/api/notes', requireGate, require('./routes/notes'));
-app.use('/api/concepts', requireGate, require('./routes/concepts'));
-app.use('/api/graph', requireGate, require('./routes/graph'));
-app.use('/api/clusters', requireGate, require('./routes/clusters'));
-app.use('/api/review', requireGate, require('./routes/review'));
-app.use('/api/analytics', requireGate, require('./routes/analytics'));
-app.use('/api/learning-paths', requireGate, require('./routes/learning-paths'));
+app.use('/api/users', userRoutes);
+app.use('/api/notes', require('./routes/notes'));
+app.use('/api/concepts', require('./routes/concepts'));
+app.use('/api/graph', require('./routes/graph'));
+app.use('/api/clusters', require('./routes/clusters'));
+app.use('/api/review', require('./routes/review'));
+app.use('/api/analytics', require('./routes/analytics'));
+app.use('/api/learning-paths', require('./routes/learning-paths'));
 
 // --- Admin control plane (separate identity domain, secret base path) --------
-// Not gated by the site gate: admins reach the portal directly, not through the
-// learner app. Guarded per-route by admin token verification instead.
-app.use(ADMIN_API_BASE, require('./routes/admin'));
-app.use(`${ADMIN_API_BASE}/management/overview`, require('./routes/management/overview'));
-app.use(`${ADMIN_API_BASE}/management/population`, require('./routes/management/population'));
-app.use(`${ADMIN_API_BASE}/management/grader`, require('./routes/management/grader'));
-app.use(`${ADMIN_API_BASE}/management/memory`, require('./routes/management/memory'));
-app.use(`${ADMIN_API_BASE}/management/probes`, require('./routes/management/probes'));
-app.use(`${ADMIN_API_BASE}/management/graph`, require('./routes/management/graph'));
-app.use(`${ADMIN_API_BASE}/management/sources`, require('./routes/management/sources'));
-app.use(`${ADMIN_API_BASE}/management/generation`, require('./routes/management/generation'));
-app.use(`${ADMIN_API_BASE}/management/clusters`, require('./routes/management/clusters'));
-app.use(`${ADMIN_API_BASE}/management/evaluation`, require('./routes/management/evaluation'));
-app.use(`${ADMIN_API_BASE}/management/exports`, require('./routes/management/exports'));
+// Behind the site gate (shared splash credentials) AND per-route admin-token
+// auth: the portal must clear the gate before it can even reach admin login.
+app.use(ADMIN_API_BASE, requireGate, require('./routes/admin'));
+const mgmt = `${ADMIN_API_BASE}/management`;
+app.use(`${mgmt}/overview`, requireGate, require('./routes/management/overview'));
+app.use(`${mgmt}/population`, requireGate, require('./routes/management/population'));
+app.use(`${mgmt}/grader`, requireGate, require('./routes/management/grader'));
+app.use(`${mgmt}/memory`, requireGate, require('./routes/management/memory'));
+app.use(`${mgmt}/probes`, requireGate, require('./routes/management/probes'));
+app.use(`${mgmt}/graph`, requireGate, require('./routes/management/graph'));
+app.use(`${mgmt}/sources`, requireGate, require('./routes/management/sources'));
+app.use(`${mgmt}/generation`, requireGate, require('./routes/management/generation'));
+app.use(`${mgmt}/clusters`, requireGate, require('./routes/management/clusters'));
+app.use(`${mgmt}/evaluation`, requireGate, require('./routes/management/evaluation'));
+app.use(`${mgmt}/exports`, requireGate, require('./routes/management/exports'));
 
 // Original test routes
 app.get('/', (req, res) => {

@@ -17,6 +17,9 @@ function useVW() {
   return vw;
 }
 
+/** Questions in a single-concept retest (Retest on a concept panel). */
+const FOCUSED_ROUNDS = 3;
+
 // ── API shapes (coded defensively; the queue is being revised server-side) ──
 interface QueueItem {
   conceptId: string;
@@ -163,7 +166,8 @@ export default function RetestPage() {
       let items = rawItems
         .map(r => mapQueueItem(r, recallById, subjectById))
         .filter((i): i is QueueItem => i !== null);
-      // "Retest" from a concept panel: put that concept first (add it if the queue doesn't have it).
+      // "Retest" from a concept panel: the session tests ONLY that concept,
+      // several different questions in a row (each round fetches a fresh probe).
       if (focusNodeId) {
         const existing = items.find(i => i.conceptId === focusNodeId);
         const n = nodes.find(x => x.id === focusNodeId);
@@ -171,7 +175,9 @@ export default function RetestPage() {
           conceptId: n.id, label: n.label, recall: n.recall, subject: n.subject,
           isDetour: false, detourReason: null, probeId: null, prompt: null,
         } : null);
-        if (focused) items = [focused, ...items.filter(i => i.conceptId !== focusNodeId)];
+        items = focused
+          ? Array.from({ length: FOCUSED_ROUNDS }, () => ({ ...focused, isDetour: false, detourReason: null, probeId: null, prompt: null }))
+          : [];
       }
       setQueue(items);
       setQueueStatus('ready');
@@ -208,7 +214,9 @@ export default function RetestPage() {
       setProbeError(describeApiError(err, 'Could not prepare a question for this concept.'));
       setProbeStatus('error');
     }
-  }, [mode, currentConceptId]);
+    // queueIndex: a focused retest repeats the same concept, and each round
+    // needs its own new question.
+  }, [mode, currentConceptId, queueIndex]);
 
   useEffect(() => { loadProbe(); }, [loadProbe]);
 
@@ -299,7 +307,7 @@ export default function RetestPage() {
             const active = i === queueIndex;
             const irs = recallStatus(item.recall);
             return (
-              <div key={item.conceptId} title={item.label} style={{
+              <div key={`${item.conceptId}-${i}`} title={item.label} style={{
                 width: 8, height: 8, borderRadius: '50%',
                 background: done ? 'var(--green)' : active ? irs.color : 'var(--bg-input)',
                 border: `1.5px solid ${done ? 'var(--green)' : active ? irs.color : 'var(--border-strong)'}`,
@@ -485,7 +493,8 @@ export default function RetestPage() {
               <button
                 onClick={() => advance(false)}
                 style={{ flex: 1, padding: '13px', borderRadius: 12, background: 'var(--green)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 14, fontWeight: 700, fontFamily: 'inherit' }}
-              >{queueIndex + 1 >= queue.length ? 'Finish session →' : 'Next concept →'}</button>
+              >{queueIndex + 1 >= queue.length ? 'Finish session →'
+                : queue[queueIndex + 1]?.conceptId === currentItem.conceptId ? 'Next question →' : 'Next concept →'}</button>
             )}
           </div>
         </div>
@@ -505,7 +514,10 @@ function ModeSelector({ queue, status, error, onRetry, onSelect }: {
   const navigate = useNavigate();
   const vw = useVW();
   const isMobile = vw < 640;
-  const shown = queue.slice(0, 8);
+  // A focused retest repeats one concept; show it once.
+  const unique = queue.filter((item, i) => queue.findIndex(q => q.conceptId === item.conceptId) === i);
+  const shown = unique.slice(0, 8);
+  const focused = queue.length > 1 && unique.length === 1;
 
   return (
     <div style={{ height: '100%', overflowY: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: isMobile ? '32px 16px' : '48px 40px', background: 'var(--bg)' }}>
@@ -520,6 +532,7 @@ function ModeSelector({ queue, status, error, onRetry, onSelect }: {
             {status === 'loading' ? 'Loading your review queue…'
               : status === 'error' ? (error || 'Could not load your review queue.')
               : queue.length === 0 ? 'Nothing is due for review right now.'
+              : focused ? `Retesting ${unique[0].label}: ${queue.length} questions on this concept only`
               : `${queue.length} concept${queue.length === 1 ? '' : 's'} due for review`}
           </p>
           {status === 'error' && (

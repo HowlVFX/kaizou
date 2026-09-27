@@ -9,20 +9,23 @@ function useVW() {
   }, []);
   return vw;
 }
-import { useApp } from '../context/AppContext';
-import type { Note } from '../types';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { useApp, mapNoteSource } from '../context/AppContext';
+import type { Note, NoteSource, NoteType } from '../types';
 import { api, describeApiError } from '../lib/api';
 import { FileText, Network, Link, Puzzle, Brain, RefreshCw, Check, X as XIcon, Search, AlertTriangle } from '../components/Icon';
 
-// Cap appended source text so a huge page can't blow up the note body.
-const MAX_SOURCE_CHARS = 20000;
+// Sources are stored separately from the note (never merged into the body):
+// your note is what gets tested, sources are reference material beside it.
 
-/** Append extracted source text to a note body under a labelled heading. */
-function appendSource(body: string, label: string, text: string): string {
-  const clean = text.trim().slice(0, MAX_SOURCE_CHARS);
-  const base = body.trimEnd();
-  return `${base}${base ? '\n\n' : ''}## Source: ${label}\n\n${clean}\n`;
-}
+const NOTE_TYPE_OPTIONS: { value: NoteType; label: string; hint: string }[] = [
+  { value: 'SOURCE_BACKED', label: 'Source-backed', hint: 'Your note, with sources beside it for reference.' },
+  { value: 'USER_DEFINED', label: 'User-defined', hint: 'Your own understanding. No sources.' },
+  { value: 'ANALOGY', label: 'Analogy', hint: 'This note is an analogy for another concept.' },
+];
+
+/** State passed by "Learn this concept" on a locked node. */
+interface LearnConceptState { learnConcept?: { id: string; label: string } }
 
 // ── Pipeline steps (learner-friendly labels) ─────────────────────
 const PIPELINE_STEPS = [
@@ -45,38 +48,45 @@ function wordCount(text: string) {
 }
 
 // ── Source types ──────────────────────────────────────────────────
-type SourceType = 'file' | 'link' | 'paste';
-interface Source {
+type SourceKind = NoteSource['kind'];
+
+/** A source attached to a not-yet-saved note; uploaded right after the note is created. */
+interface PendingSource {
   id: string;
-  type: SourceType;
+  kind: SourceKind;
   title: string;
-  meta: string;
-  status: 'attached' | 'reading' | 'extracted' | 'unavailable' | 'failed';
+  url?: string;
+  text?: string;
 }
 
-function sourceIcon(type: SourceType) {
-  if (type === 'file') return '📄';
-  if (type === 'link') return '🌐';
+/** What a source card shows (saved or pending). */
+interface SourceView {
+  id: string;
+  kind: SourceKind;
+  title: string;
+  meta: string;
+  pending: boolean;
+  url?: string | null;
+}
+
+function sourceIcon(kind: SourceKind) {
+  if (kind === 'file') return '📄';
+  if (kind === 'link') return '🌐';
   return '📝';
 }
 
-function sourceStatusColor(status: Source['status']) {
-  if (status === 'extracted') return 'var(--green)';
-  if (status === 'reading') return 'var(--blue)';
-  if (status === 'unavailable' || status === 'failed') return 'var(--red)';
-  return 'var(--text-dim)';
-}
-
-function sourceStatusLabel(status: Source['status']) {
-  const map: Record<Source['status'], string> = { attached: '○ Attached', reading: '● Reading', extracted: '✓ Extracted', unavailable: '△ Unavailable', failed: '! Failed' };
-  return map[status];
+function formatChars(n: number) {
+  const words = Math.round(n / 6);
+  return words >= 1000 ? `~${(words / 1000).toFixed(1)}k words` : `~${words} words`;
 }
 
 type FilterTab = 'all' | 'attention' | 'processing' | 'completed';
 
 // ── Main page ────────────────────────────────────────────────────
 export default function NotesPage() {
-  const { notes, addNote, updateNoteStatus, updateNoteTitle, updateNoteBody, deleteNote } = useApp();
+  const { notes, nodes, addNote, updateNoteType, setNoteSources, updateNoteStatus, updateNoteTitle, updateNoteBody, deleteNote } = useApp();
+  const location = useLocation();
+  const navigate = useNavigate();
   const vw = useVW();
   const isMobile = vw < 640;
   const isTablet = vw >= 640 && vw < 1024;
@@ -89,12 +99,17 @@ export default function NotesPage() {
   const [search, setSearch] = useState('');
   const [filterTab, setFilterTab] = useState<FilterTab>('all');
 
-  // Source state
-  const [sources, setSources] = useState<Record<string, Source[]>>(() => {
-    const init: Record<string, Source[]> = {};
-    // No sources endpoint yet: sources are local-only attachments for this session.
-    return init;
-  });
+  // New-note type + "learn this concept" binding
+  const [newNoteType, setNewNoteType] = useState<NoteType>('SOURCE_BACKED');
+  const [newAnalogyTarget, setNewAnalogyTarget] = useState<string | null>(null);
+  const [newTargetConcept, setNewTargetConcept] = useState<string | null>(null);
+  const [typeError, setTypeError] = useState('');
+  // Existing note switched to "Analogy" but no target picked yet (not saved until picked).
+  const [pendingAnalogyNoteId, setPendingAnalogyNoteId] = useState<string | null>(null);
+
+  // Sources: saved ones live on the note (server), pending ones belong to the unsaved new note.
+  const [pendingSources, setPendingSources] = useState<PendingSource[]>([]);
+  const [viewingSource, setViewingSource] = useState<{ title: string; url?: string | null; text: string } | null>(null);
   const [sourcesExpanded, setSourcesExpanded] = useState(true);
   const [showSourceChooser, setShowSourceChooser] = useState(false);
   const [addingLink, setAddingLink] = useState(false);
@@ -150,7 +165,26 @@ export default function NotesPage() {
     return true;
   });
 
-  const currentSources = selectedNote ? (sources[selectedNote.id] ?? []) : [];
+  const currentNoteType: NoteType = isNewNote
+    ? newNoteType
+    : (selectedNote && pendingAnalogyNoteId === selectedNote.id ? 'ANALOGY' : (selectedNote?.noteType ?? 'SOURCE_BACKED'));
+  const currentAnalogyTarget = isNewNote ? newAnalogyTarget : (selectedNote?.analogyTargetId ?? null);
+  const currentSources: SourceView[] = isNewNote
+    ? pendingSources.map(p => ({
+        id: p.id, kind: p.kind, title: p.title, pending: true, url: p.url,
+        meta: p.kind === 'link' ? 'Attaches when saved' : `${formatChars(p.text?.length ?? 0)} · attaches when saved`,
+      }))
+    : (selectedNote?.sources ?? []).map(s => ({
+        id: s.id, kind: s.kind, title: s.title, pending: false, url: s.url,
+        meta: formatChars(s.chars),
+      }));
+
+  // Concepts an analogy note can point at: real (unlocked), non-analogy nodes,
+  // excluding the concept(s) this note itself produced.
+  const ownConceptLabels = new Set((selectedNote?.concepts ?? []).map(c => c.toLowerCase()));
+  const analogyTargets = nodes
+    .filter(n => !n.locked && !n.isAnalogy && !ownConceptLabels.has(n.label.toLowerCase()))
+    .sort((a, b) => a.label.localeCompare(b.label));
 
   // Advance the visual stepper while the backend works. It walks up to the
   // SECOND-TO-LAST step and then waits: the final "Updating your Brain" step
@@ -189,16 +223,40 @@ export default function NotesPage() {
   // Clean up the stepper timer on unmount.
   useEffect(() => () => { if (stepTimerRef.current) clearTimeout(stepTimerRef.current); }, []);
 
-  const handleProcessNew = () => {
+  const handleProcessNew = async () => {
     if (isProcessing) return;
+    if (newNoteType === 'ANALOGY' && !newAnalogyTarget) {
+      setTypeError('Pick the concept this note is an analogy for.');
+      return;
+    }
+    setTypeError('');
     // Backend requires a UUID primary key; timestamp ids get rejected on later PUTs.
     const id = crypto.randomUUID();
-    const note: Note = { id, title: newTitle, body: newBody, status: 'processing', updatedAt: 'Just now' };
-    addNote(note);
+    const note: Note = {
+      id, title: newTitle, body: newBody, status: 'processing', updatedAt: 'Just now',
+      noteType: newNoteType, analogyTargetId: newNoteType === 'ANALOGY' ? newAnalogyTarget : null,
+      targetConceptId: newTargetConcept, sources: [],
+    };
+    const queued = newNoteType === 'USER_DEFINED' ? [] : pendingSources;
+    setPendingSources([]);
+    setNewTargetConcept(null);
     setSelectedNoteId(id);
     setIsNewNote(false);
     setExtractedBodies(prev => ({ ...prev, [id]: newBody }));
     runPipeline(id);
+    const ok = await addNote(note);
+    if (!ok || queued.length === 0) return;
+    // Upload sources queued while the note was unsaved. They never touch the body.
+    const saved: NoteSource[] = [];
+    for (const p of queued) {
+      try {
+        const body = p.kind === 'link' ? { kind: 'link', url: p.url } : { kind: p.kind, title: p.title, text: p.text };
+        saved.push(mapNoteSource(await api(`/api/notes/${id}/sources`, { method: 'POST', body })));
+      } catch (err) {
+        console.error('Could not attach source:', describeApiError(err));
+      }
+    }
+    setNoteSources(id, saved);
   };
 
   const handleReExtract = () => {
@@ -207,11 +265,16 @@ export default function NotesPage() {
     runPipeline(selectedNote.id);
   };
 
-  const handleNewNote = () => {
+  const handleNewNote = (opts?: { title?: string; targetConceptId?: string }) => {
     setIsNewNote(true);
     setSelectedNoteId(null);
-    setNewTitle('Untitled Note');
+    setNewTitle(opts?.title ?? 'Untitled Note');
     setNewBody(NEW_NOTE_TEMPLATE);
+    setNewNoteType('SOURCE_BACKED');
+    setNewAnalogyTarget(null);
+    setNewTargetConcept(opts?.targetConceptId ?? null);
+    setPendingSources([]);
+    setTypeError('');
     if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
     setProcessingNoteId(null);
     setShowSourceChooser(false);
@@ -222,6 +285,8 @@ export default function NotesPage() {
   const handleSelectNote = (id: string) => {
     setSelectedNoteId(id);
     setIsNewNote(false);
+    setPendingAnalogyNoteId(null);
+    setTypeError('');
     if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
     setProcessingNoteId(null);
     setShowSourceChooser(false);
@@ -229,23 +294,26 @@ export default function NotesPage() {
     setLinkUrl('');
   };
 
-  // Append extracted source text into the current note body (new or existing).
-  // The appended text becomes part of the note and is ingested normally.
-  const applyToBody = (label: string, text: string): boolean => {
-    if (!text.trim()) return false;
-    if (isNewNote) {
-      setNewBody(prev => appendSource(prev, label, text));
-    } else if (selectedNote) {
-      updateNoteBody(selectedNote.id, appendSource(selectedNote.body, label, text));
-    } else {
+  // ── Sources: stored beside the note, never merged into its body ──
+  // Saved note → POST /api/notes/:id/sources. Unsaved new note → queued
+  // locally and uploaded right after the note is created.
+  const addSource = async (src: Omit<PendingSource, 'id'>): Promise<boolean> => {
+    if (currentNoteType === 'USER_DEFINED') {
+      setLinkError('User-defined notes have no sources.');
       return false;
     }
+    if (isNewNote) {
+      setPendingSources(prev => [...prev, { ...src, id: crypto.randomUUID() }]);
+      return true;
+    }
+    if (!selectedNote) {
+      setLinkError('Open or create a note first.');
+      return false;
+    }
+    const body = src.kind === 'link' ? { kind: 'link', url: src.url } : { kind: src.kind, title: src.title, text: src.text };
+    const saved = mapNoteSource(await api(`/api/notes/${selectedNote.id}/sources`, { method: 'POST', body }));
+    setNoteSources(selectedNote.id, [...(selectedNote.sources ?? []), saved]);
     return true;
-  };
-
-  const recordSource = (source: Source) => {
-    const noteId = selectedNote?.id ?? 'new';
-    setSources(prev => ({ ...prev, [noteId]: [...(prev[noteId] ?? []), source] }));
   };
 
   const closeSourceUi = () => {
@@ -257,7 +325,7 @@ export default function NotesPage() {
     setPasteText('');
   };
 
-  // Web link: server fetches + extracts the page text (SSRF-safe), we append it.
+  // Web link: the server fetches the page's readable text (SSRF-safe) and stores it.
   const handleAddLink = async () => {
     const raw = linkUrl.trim();
     if (!raw || sourceBusy) return;
@@ -271,15 +339,13 @@ export default function NotesPage() {
     setLinkError('');
     setSourceBusy(true);
     try {
-      const res = await api<{ url: string; title?: string; text: string; truncated?: boolean }>(
-        '/api/notes/fetch-source', { method: 'POST', body: { url } },
-      );
-      const domain = (res.title || url.replace(/^https?:\/\//, '').split('/')[0]);
-      if (!applyToBody(domain, res.text)) {
-        setLinkError('Open or create a note first.');
-        return;
+      if (isNewNote) {
+        // Validate now (so errors show immediately); stored once the note is saved.
+        const res = await api<{ url: string; title?: string }>('/api/notes/fetch-source', { method: 'POST', body: { url } });
+        await addSource({ kind: 'link', url: res.url || url, title: res.title || new URL(url).hostname });
+      } else {
+        await addSource({ kind: 'link', url, title: '' });
       }
-      recordSource({ id: crypto.randomUUID(), type: 'link', title: domain, meta: res.truncated ? `${domain} · truncated` : domain, status: 'extracted' });
       closeSourceUi();
     } catch (err) {
       setLinkError(describeApiError(err, 'Could not fetch that link.'));
@@ -288,16 +354,17 @@ export default function NotesPage() {
     }
   };
 
-  // Paste text: append the pasted content directly.
-  const handlePasteConfirm = () => {
+  const handlePasteConfirm = async () => {
     const text = pasteText.trim();
     if (!text) return;
-    if (!applyToBody('Pasted text', text)) return;
-    recordSource({ id: crypto.randomUUID(), type: 'paste', title: 'Pasted text', meta: `${wordCount(text)} words`, status: 'extracted' });
-    closeSourceUi();
+    try {
+      if (await addSource({ kind: 'paste', title: 'Pasted text', text })) closeSourceUi();
+    } catch (err) {
+      setLinkError(describeApiError(err, 'Could not add that text.'));
+    }
   };
 
-  // File upload: read a plain-text / markdown file client-side and append.
+  // File upload: read a plain-text / markdown file client-side.
   const handleFilePicked = async (file: File | undefined) => {
     if (!file) return;
     const isText = /\.(txt|md|markdown|text)$/i.test(file.name) || file.type.startsWith('text/');
@@ -308,19 +375,99 @@ export default function NotesPage() {
     }
     try {
       const text = await file.text();
-      if (!applyToBody(file.name, text)) return;
-      recordSource({ id: crypto.randomUUID(), type: 'file', title: file.name, meta: `${wordCount(text)} words`, status: 'extracted' });
-      closeSourceUi();
-    } catch {
-      setLinkError('Could not read that file.');
+      if (await addSource({ kind: 'file', title: file.name, text })) closeSourceUi();
+    } catch (err) {
+      setLinkError(describeApiError(err, 'Could not read that file.'));
       setShowSourceChooser(true);
     }
   };
 
-  const handleRemoveSource = (sourceId: string) => {
-    const noteId = selectedNote?.id ?? 'new';
-    setSources(prev => ({ ...prev, [noteId]: (prev[noteId] ?? []).filter(s => s.id !== sourceId) }));
+  const handleRemoveSource = async (sourceId: string) => {
+    if (isNewNote) {
+      setPendingSources(prev => prev.filter(s => s.id !== sourceId));
+      return;
+    }
+    if (!selectedNote) return;
+    const before = selectedNote.sources ?? [];
+    setNoteSources(selectedNote.id, before.filter(s => s.id !== sourceId));
+    try {
+      await api(`/api/notes/${selectedNote.id}/sources/${sourceId}`, { method: 'DELETE' });
+    } catch (err) {
+      setNoteSources(selectedNote.id, before);
+      console.error('Could not remove source:', describeApiError(err));
+    }
   };
+
+  const handleOpenSource = async (src: SourceView) => {
+    if (src.pending) {
+      const p = pendingSources.find(s => s.id === src.id);
+      setViewingSource({ title: src.title, url: p?.url, text: p?.text ?? 'This link is fetched when the note is saved.' });
+      return;
+    }
+    if (!selectedNote) return;
+    try {
+      const full = await api<{ title: string; url?: string | null; content_text: string }>(
+        `/api/notes/${selectedNote.id}/sources/${src.id}`,
+      );
+      setViewingSource({ title: full.title || src.title, url: full.url, text: full.content_text });
+    } catch (err) {
+      console.error('Could not open source:', describeApiError(err));
+    }
+  };
+
+  // ── Note type ──
+  const handleChangeNoteType = async (type: NoteType) => {
+    setTypeError('');
+    if (isNewNote) {
+      if (type === 'USER_DEFINED' && pendingSources.length > 0
+          && !window.confirm('A user-defined note has no sources. Remove the sources you added?')) return;
+      if (type === 'USER_DEFINED') setPendingSources([]);
+      setNewNoteType(type);
+      if (type !== 'ANALOGY') setNewAnalogyTarget(null);
+      return;
+    }
+    if (!selectedNote || type === currentNoteType) return;
+    if (type === 'USER_DEFINED' && (selectedNote.sources?.length ?? 0) > 0
+        && !window.confirm('A user-defined note has no sources. Remove its sources?')) return;
+    if (type === 'ANALOGY') {
+      // Saved once a target is picked (an analogy needs something to be an analogy OF).
+      setPendingAnalogyNoteId(selectedNote.id);
+      return;
+    }
+    try {
+      await updateNoteType(selectedNote.id, type);
+      runPipeline(selectedNote.id);
+    } catch (err) {
+      setTypeError(describeApiError(err, 'Could not change the note type.'));
+    }
+  };
+
+  const handlePickAnalogyTarget = async (targetId: string | null) => {
+    setTypeError('');
+    if (isNewNote) {
+      setNewAnalogyTarget(targetId);
+      return;
+    }
+    if (!selectedNote || !targetId) return;
+    try {
+      await updateNoteType(selectedNote.id, 'ANALOGY', targetId);
+      setPendingAnalogyNoteId(null);
+      runPipeline(selectedNote.id);
+    } catch (err) {
+      setTypeError(describeApiError(err, 'Could not save the analogy target.'));
+    }
+  };
+
+  // "Learn this concept" on a locked node → open a fresh note titled with that
+  // concept and bound to it (ingestion promotes that exact locked node).
+  useEffect(() => {
+    const learn = (location.state as LearnConceptState | null)?.learnConcept;
+    if (!learn) return;
+    const existing = notes.find(n => n.targetConceptId === learn.id);
+    if (existing) handleSelectNote(existing.id);
+    else handleNewNote({ title: learn.label, targetConceptId: learn.id });
+    navigate(location.pathname, { replace: true, state: null });
+  }, [location.state]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (selectedNote && selectedNote.status === 'completed' && !(selectedNote.id in extractedBodies)) {
@@ -361,7 +508,7 @@ export default function NotesPage() {
         {/* Header */}
         <div style={{ padding: '14px 14px 10px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
           <button
-            onClick={handleNewNote}
+            onClick={() => handleNewNote()}
             style={{
               width: '100%', padding: '8px 12px', borderRadius: 8,
               background: 'var(--green)', color: '#fff', border: 'none',
@@ -434,6 +581,9 @@ export default function NotesPage() {
               onSelect={() => handleSelectNote(note.id)}
               onRename={t => updateNoteTitle(note.id, t)}
               onDelete={() => {
+                // Deleting a note also removes its node(s) from your Brain, plus
+                // any locked prerequisites that only it needed.
+                if (!window.confirm(`Delete "${note.title}"? Its node and any locked prerequisites only it needed are removed from your Brain.`)) return;
                 deleteNote(note.id);
                 const remaining = notes.filter(n => n.id !== note.id);
                 if (selectedNoteId === note.id) {
@@ -538,7 +688,66 @@ export default function NotesPage() {
           ) : null}
         </div>
 
-        {/* ── Sources section ── */}
+        {/* ── Note type ── */}
+        <div style={{
+          padding: '8px 28px', borderBottom: '1px solid var(--border)', background: 'var(--bg)',
+          display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', flexShrink: 0,
+        }}>
+          <span id="note-type-label" style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>Type</span>
+          <div role="radiogroup" aria-labelledby="note-type-label" style={{ display: 'flex', gap: 3, background: 'var(--bg-input)', padding: 3, borderRadius: 8 }}>
+            {NOTE_TYPE_OPTIONS.map(opt => {
+              const active = currentNoteType === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  role="radio"
+                  aria-checked={active}
+                  title={opt.hint}
+                  disabled={isProcessing}
+                  onClick={() => handleChangeNoteType(opt.value)}
+                  style={{
+                    padding: '4px 10px', borderRadius: 6, border: 'none',
+                    background: active ? 'var(--bg-elevated)' : 'transparent',
+                    color: active ? (opt.value === 'ANALOGY' ? 'var(--purple, #a78bfa)' : 'var(--text)') : 'var(--text-dim)',
+                    fontSize: 11, fontWeight: 600, fontFamily: 'inherit',
+                    cursor: isProcessing ? 'default' : 'pointer',
+                    boxShadow: active ? 'var(--shadow)' : 'none',
+                  }}
+                >{opt.value === 'ANALOGY' ? '◆ ' : ''}{opt.label}</button>
+              );
+            })}
+          </div>
+          {currentNoteType === 'ANALOGY' && (
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)' }}>
+              Analogy for
+              <select
+                value={currentAnalogyTarget ?? ''}
+                onChange={e => handlePickAnalogyTarget(e.target.value || null)}
+                disabled={isProcessing}
+                style={{
+                  padding: '4px 8px', borderRadius: 6, border: '1px solid var(--border-strong)',
+                  background: 'var(--bg-input)', color: 'var(--text)', fontSize: 12, fontFamily: 'inherit', maxWidth: 240,
+                }}
+              >
+                <option value="">Choose a concept…</option>
+                {currentAnalogyTarget && !analogyTargets.some(n => n.id === currentAnalogyTarget) && (
+                  <option value={currentAnalogyTarget}>{selectedNote?.analogyTargetLabel ?? 'Current target'}</option>
+                )}
+                {analogyTargets.map(n => <option key={n.id} value={n.id}>{n.label}</option>)}
+              </select>
+            </label>
+          )}
+          {currentNoteType === 'USER_DEFINED' && (
+            <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>Your own understanding. No sources.</span>
+          )}
+          {isNewNote && newTargetConcept && (
+            <span style={{ fontSize: 11, color: 'var(--blue)' }}>Unlocks the locked concept “{newTitle}”</span>
+          )}
+          {typeError && <span role="alert" style={{ fontSize: 11, color: 'var(--red)' }}>{typeError}</span>}
+        </div>
+
+        {/* ── Sources section (not for user-defined notes) ── */}
+        {currentNoteType !== 'USER_DEFINED' && (
         <div style={{
           padding: '0 28px',
           borderBottom: '1px solid var(--border)',
@@ -564,7 +773,7 @@ export default function NotesPage() {
               {currentSources.length > 0 && (
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
                   {currentSources.map(src => (
-                    <SourceCard key={src.id} source={src} onRemove={() => handleRemoveSource(src.id)} />
+                    <SourceCard key={src.id} source={src} onOpen={() => handleOpenSource(src)} onRemove={() => handleRemoveSource(src.id)} />
                   ))}
                 </div>
               )}
@@ -594,9 +803,9 @@ export default function NotesPage() {
                   animation: 'fadeUp 0.15s ease',
                 }}>
                   {[
-                    // All three append extracted text into the note body, which is
-                    // then ingested normally. File reads .txt/.md client-side; web
-                    // link fetches server-side (SSRF-safe); paste is direct.
+                    // All three are stored as separate sources beside the note;
+                    // the note body is never changed. File reads .txt/.md
+                    // client-side; web link fetches server-side (SSRF-safe).
                     { icon: '📄', label: 'Upload file', action: () => fileInputRef.current?.click() },
                     { icon: '🔗', label: 'Add web link', action: () => { setAddingLink(true); setShowSourceChooser(false); setLinkError(''); } },
                     { icon: '📋', label: 'Paste text', action: () => { setPastingText(true); setShowSourceChooser(false); setPasteText(''); } },
@@ -660,6 +869,10 @@ export default function NotesPage() {
                 </div>
               )}
 
+              {linkError && !addingLink && (
+                <div role="alert" style={{ fontSize: 11, color: 'var(--red)', marginTop: 6 }}>{linkError}</div>
+              )}
+
               {/* Paste text input */}
               {pastingText && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, animation: 'fadeUp 0.15s ease' }}>
@@ -692,6 +905,7 @@ export default function NotesPage() {
             </div>
           )}
         </div>
+        )}
 
         {/* ── Markdown editor ── */}
         <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
@@ -895,6 +1109,32 @@ export default function NotesPage() {
           </div>
         </div>
       )}
+
+      {/* ── Source viewer (read-only; sources never edit the note) ── */}
+      {viewingSource && (
+        <>
+          <div onClick={() => setViewingSource(null)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 400 }} />
+          <div role="dialog" aria-modal="true" aria-label={`Source: ${viewingSource.title}`} style={{
+            position: 'fixed', top: '8vh', left: '50%', transform: 'translateX(-50%)',
+            width: 'min(720px, 92vw)', maxHeight: '84vh', display: 'flex', flexDirection: 'column',
+            background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 14,
+            boxShadow: 'var(--shadow)', zIndex: 401,
+          }}>
+            <div style={{ padding: '14px 18px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{viewingSource.title}</div>
+                {viewingSource.url && (
+                  <a href={viewingSource.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: 'var(--blue)' }}>{viewingSource.url}</a>
+                )}
+              </div>
+              <button onClick={() => setViewingSource(null)} aria-label="Close source" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-dim)', fontSize: 20, lineHeight: 1 }}>×</button>
+            </div>
+            <div style={{ padding: '14px 18px', overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.7, color: 'var(--text-2)' }}>
+              {viewingSource.text}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -927,7 +1167,7 @@ function IngestionFailed({ onRetry }: { onRetry: () => void }) {
 }
 
 // ── Source Card ───────────────────────────────────────────────────
-function SourceCard({ source, onRemove }: { source: Source; onRemove: () => void }) {
+function SourceCard({ source, onOpen, onRemove }: { source: SourceView; onOpen: () => void; onRemove: () => void }) {
   const [hovered, setHovered] = useState(false);
   return (
     <div
@@ -940,11 +1180,15 @@ function SourceCard({ source, onRemove }: { source: Source; onRemove: () => void
         transition: 'border-color 0.15s', cursor: 'default', maxWidth: 240,
       }}
     >
-      <span style={{ fontSize: 13 }}>{sourceIcon(source.type)}</span>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{source.title}</div>
-        <div style={{ fontSize: 10, color: sourceStatusColor(source.status) }}>{sourceStatusLabel(source.status)}</div>
-      </div>
+      <span style={{ fontSize: 13 }} aria-hidden="true">{sourceIcon(source.kind)}</span>
+      <button
+        onClick={onOpen}
+        title="View source"
+        style={{ flex: 1, minWidth: 0, background: 'none', border: 'none', padding: 0, textAlign: 'left', cursor: 'pointer', color: 'inherit', fontFamily: 'inherit' }}
+      >
+        <div style={{ fontWeight: 500, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{source.title}</div>
+        <div style={{ fontSize: 10, color: source.pending ? 'var(--text-dim)' : 'var(--green)' }}>{source.pending ? '○ ' : '✓ '}{source.meta}</div>
+      </button>
       {hovered && (
         <button
           onClick={onRemove}

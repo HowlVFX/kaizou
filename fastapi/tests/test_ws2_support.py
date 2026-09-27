@@ -228,6 +228,11 @@ class FakeCursor:
             self._rows = out
         elif "FROM edges WHERE learner_id" in s:
             self._rows = [dict(e) for e in db.edges if e["learner_id"] == str(p[0])]
+        elif s.startswith("SELECT COUNT(*) AS n FROM probes WHERE concept_id"):
+            cid, ver, typ = str(p[0]), p[1], p[2]
+            n = sum(1 for pr in db.probes.values()
+                    if pr["concept_id"] == cid and pr["concept_version"] == ver and pr["type"] == typ)
+            self._rows = [{"n": n}]
         else:
             raise AssertionError(f"FakeDB: unexpected SQL: {s[:160]}")
 

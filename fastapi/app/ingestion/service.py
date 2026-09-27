@@ -25,6 +25,7 @@ prerequisite). See app.graph.prerequisites.build_requires_forward.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 from uuid import uuid4
@@ -35,7 +36,7 @@ from psycopg.rows import dict_row
 from app.grading.coverage import as_vector
 from app.ingestion.classifier import NoteClassifier, ClassificationResult
 from app.ingestion.embedding import EmbeddingService
-from app.ingestion.extractor import ClaimExtractor, extract_wikilinks
+from app.ingestion.extractor import ClaimExtractor, extract_wikilinks, has_analogy_cue
 from app.ingestion.identity import (
     resolve_concept_identity,
     deduplicate_claims,
@@ -59,6 +60,18 @@ VERIFIED = "VERIFIED_CONCEPT"
 PLACEHOLDER_TRACK = "SELF_AUTHORED"
 PLACEHOLDER_SHAPE = "DEFINITION"
 PLACEHOLDER_CATEGORY = "DETERMINISTIC_MECHANISM"
+
+# The learner's declared note type (notes.note_type) → concept track.
+NOTE_TYPE_TRACK = {
+    "SOURCE_BACKED": "SOURCE_BACKED",
+    "USER_DEFINED": "SELF_AUTHORED",
+    "ANALOGY": "ANALOGY",
+}
+
+# Classification for an analogy node detected inside another note.
+EMBEDDED_ANALOGY_CLASSIFICATION = ClassificationResult(
+    track="ANALOGY", shape="DEFINITION", category="CONVENTIONAL", bloom_level=1.5,
+)
 
 
 def _vector_literal(vec) -> str | None:
@@ -148,10 +161,24 @@ class IngestionService:
 
         body = note["body_md"] or note.get("body", "") or ""
         title = note["title"]
+        # Migration 007 columns. Absent (older rows / test doubles) → the
+        # classifier alone decides and none of the note-type features run.
+        note_type = note.get("note_type")
+        has_note_type = "note_type" in note
+        analogy_target = (
+            str(note["analogy_target_concept_id"])
+            if note_type == "ANALOGY" and note.get("analogy_target_concept_id") else None
+        )
+        locked_target = str(note["target_concept_id"]) if note.get("target_concept_id") else None
 
         try:
-            # 2. Check if content changed (skip if hash matches)
-            content_hash = hashlib.sha256(body.encode()).hexdigest()
+            # 2. Check if content changed (skip if hash matches). The note type
+            # and analogy target are part of the "content": changing either
+            # must re-ingest even when the body is identical.
+            hash_input = body if not has_note_type else (
+                f"{body}\x00{note_type}\x00{analogy_target or ''}"
+            )
+            content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
             if note.get("markdown_hash") == content_hash:
                 logger.info("Note %s unchanged, skipping ingestion", note_id)
                 # Express set PENDING on save; restore READY so the UI doesn't spin forever.
@@ -163,8 +190,17 @@ class IngestionService:
                 await self._conn.commit()
                 return {"concept_id": None, "claims_count": 0, "status": "UNCHANGED"}
 
-            # 3. Classify the note
+            # 3. Classify the note. The learner's declared note type wins over
+            # the classifier's track guess, and a note the learner wrote is
+            # always testable (OUT_OF_SCOPE would block every probe).
             classification = await self._classifier.classify(body)
+            overrides = {}
+            if note_type in NOTE_TYPE_TRACK:
+                overrides["track"] = NOTE_TYPE_TRACK[note_type]
+            if classification.category == "OUT_OF_SCOPE":
+                overrides["category"] = "CONVENTIONAL"
+            if overrides:
+                classification = dataclasses.replace(classification, **overrides)
 
             # 4. Extract claims
             claims = await self._extractor.extract_claims(body, classification.shape)
@@ -190,10 +226,23 @@ class IngestionService:
 
             # 6. Resolve concept identity
             existing_concepts = await self._load_learner_concepts(learner_id)
-            identity = resolve_concept_identity(label_embedding, existing_concepts)
             by_id = {c["id"]: c for c in existing_concepts}
+            # An analogy note must never be merged into the concept it is an
+            # analogy OF (their labels are usually close in embedding space).
+            # Embedded-analogy children (owned by another concept) are not
+            # identity matches either.
+            child_ids = await self._analogy_child_ids(learner_id) if has_note_type else set()
+            identity_pool = [
+                c for c in existing_concepts
+                if c["id"] != analogy_target and c["id"] not in child_ids
+            ]
+            identity = resolve_concept_identity(label_embedding, identity_pool)
 
-            if identity.is_new:
+            if locked_target and locked_target in by_id:
+                # "Learn this concept" on a locked node: this note IS that node.
+                concept_id = locked_target
+                mode = "promote" if by_id[locked_target]["status"] == UNRESOLVED else "update"
+            elif identity.is_new:
                 # A placeholder created from an earlier note's prerequisite list
                 # with the same label is this concept: promote, don't duplicate.
                 placeholder = next(
@@ -229,15 +278,23 @@ class IngestionService:
             sole_source = other_notes == 0
 
             # 7. Prerequisites → concept ids (existing or placeholder)
-            prereq_labels = await self._extractor.extract_prerequisites(
-                body,
-                # Placeholder labels are included so the model reuses them.
-                [c["label"] for c in existing_concepts if c["id"] != concept_id],
-                concept_label=title,
-            )
+            prereq_pool = [
+                c for c in existing_concepts
+                if c["id"] != concept_id and c["id"] not in child_ids
+            ]
+            if note_type == "ANALOGY":
+                # An analogy hangs off its target via ANALOGY_OF; it has no
+                # prerequisite chain of its own (and this saves a paid call).
+                prereq_labels = []
+            else:
+                prereq_labels = await self._extractor.extract_prerequisites(
+                    body,
+                    # Placeholder labels are included so the model reuses them.
+                    [c["label"] for c in prereq_pool],
+                    concept_label=title,
+                )
             prereq_ids, placeholders_created = await self._resolve_prerequisites(
-                learner_id, prereq_labels,
-                [c for c in existing_concepts if c["id"] != concept_id],
+                learner_id, prereq_labels, prereq_pool,
             )
 
             # 8. REQUIRES plan with cycle check (D-15) → prerequisite depth
@@ -258,6 +315,14 @@ class IngestionService:
             else:
                 version = await self._bump_version(concept_id)
                 previous_claims = await self._load_claims(concept_id, version - 1)
+                if has_note_type and sole_source:
+                    # The note's declared type (and so the track) may have
+                    # changed since the concept was created.
+                    async with self._conn.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE concepts SET track = %s, category = %s WHERE id = %s",
+                            (classification.track, classification.category, concept_id),
+                        )
 
             # 10. Write the complete claim set for this version
             claim_set = compose_claim_version(previous_claims, new_claim_dicts, sole_source)
@@ -316,7 +381,8 @@ class IngestionService:
             semantic_neighbours = find_semantic_neighbours(
                 label_embedding,
                 [c for c in existing_concepts
-                 if c["id"] != concept_id and c["status"] == VERIFIED],
+                 if c["id"] != concept_id and c["status"] == VERIFIED
+                 and c["id"] not in child_ids],
             )
             for neighbour in semantic_neighbours:
                 async with self._conn.cursor() as cur:
@@ -330,6 +396,15 @@ class IngestionService:
                             learner_id, concept_id, neighbour["concept_id"],
                             neighbour["similarity"], neighbour["similarity"],
                         ),
+                    )
+
+            # 15b. Analogy links (migration 007 schema only).
+            analogy_children = 0
+            if has_note_type:
+                await self._write_explicit_analogy_edge(learner_id, concept_id, analogy_target)
+                if note_type != "ANALOGY":
+                    analogy_children = await self._sync_embedded_analogy(
+                        learner_id, concept_id, title, body,
                     )
 
             # 16. Update note status
@@ -360,6 +435,7 @@ class IngestionService:
                 "concept_version": version,
                 "prerequisites_count": len(planned_edges),
                 "placeholders_created": placeholders_created,
+                "analogy_children": analogy_children,
             }
 
         except Exception as e:
@@ -400,6 +476,115 @@ class IngestionService:
             }
             for r in rows
         ]
+
+    # -- analogy nodes (migration 007) ------------------------------------
+
+    _CHILD_ANALOGY_SQL = (
+        "SELECT DISTINCT c.id FROM concepts c "
+        "JOIN edges e ON e.source_id = c.id AND e.type = 'ANALOGY_OF' "
+        "WHERE c.learner_id = %s AND c.track = 'ANALOGY' "
+        "AND NOT EXISTS (SELECT 1 FROM note_concepts nc WHERE nc.concept_id = c.id)"
+    )
+
+    async def _analogy_child_ids(self, learner_id: str, parent_id: str | None = None) -> set[str]:
+        """Analogy nodes detected inside a note: owned by their parent concept
+        through an ANALOGY_OF edge and not linked to any note of their own."""
+        sql, params = self._CHILD_ANALOGY_SQL, [learner_id]
+        if parent_id:
+            sql += " AND e.target_id = %s"
+            params.append(parent_id)
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, params)
+            rows = await cur.fetchall()
+        return {str(r["id"]) for r in rows}
+
+    async def _write_explicit_analogy_edge(
+        self, learner_id: str, concept_id: str, target_id: str | None,
+    ) -> None:
+        """An ANALOGY note's concept ANALOGY_OF its declared target. Replaced
+        on every ingest so changing (or clearing) the target is reflected."""
+        async with self._conn.cursor() as cur:
+            # Children point child -> parent, so the parent's outgoing
+            # ANALOGY_OF edges are exactly its explicit analogy target.
+            await cur.execute(
+                "DELETE FROM edges WHERE source_id = %s AND type = 'ANALOGY_OF'",
+                (concept_id,),
+            )
+            if target_id and target_id != concept_id:
+                # Ownership enforced by the SELECT: a foreign id inserts nothing.
+                await cur.execute(
+                    """
+                    INSERT INTO edges (id, learner_id, source_id, target_id, type, weight)
+                    SELECT gen_random_uuid(), %s, %s, c.id, 'ANALOGY_OF', 1.0
+                    FROM concepts c WHERE c.id = %s AND c.learner_id = %s
+                    ON CONFLICT (source_id, target_id, type) DO NOTHING
+                    """,
+                    (learner_id, concept_id, target_id, learner_id),
+                )
+
+    async def _sync_embedded_analogy(
+        self, learner_id: str, parent_id: str, title: str, body: str,
+    ) -> int:
+        """Detect an analogy the learner wrote inside this note and keep one
+        ANALOGY child node for it (ANALOGY_OF → parent). The paid detection
+        call only runs when the body contains an analogy cue. Returns the
+        number of child nodes now attached (0 or 1)."""
+        existing = sorted(await self._analogy_child_ids(learner_id, parent_id))
+        detected = None
+        detect = getattr(self._extractor, "extract_embedded_analogy", None)
+        if detect is not None and has_analogy_cue(body):
+            try:
+                detected = await detect(body, title)
+            except Exception as exc:  # detection is best-effort; never fail ingest
+                logger.warning("Embedded analogy detection failed: %s", exc)
+                detected = None
+
+        keep: str | None = None
+        if detected and detected.claims:
+            label = detected.label
+            label_emb = as_vector(await self._embedding.compute_embedding(label))
+            claim_embs = await self._embedding.compute_batch_embeddings(detected.claims)
+            claim_set = [
+                {"text": t, "embedding": as_vector(e), "order_index": i,
+                 "is_transition": False, "is_load_bearing": False, "branch_id": None,
+                 "weight": 1.0, "aliases": []}
+                for i, (t, e) in enumerate(zip(detected.claims, claim_embs))
+            ]
+            if existing:
+                keep = existing[0]
+                async with self._conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE concepts SET canonical_label = %s, label_embedding = %s::vector "
+                        "WHERE id = %s AND learner_id = %s",
+                        (label, _vector_literal(label_emb), keep, learner_id),
+                    )
+                version = await self._bump_version(keep)
+            else:
+                keep = str(uuid4())
+                version = await self._write_verified_concept(
+                    "new", keep, learner_id, label, label_emb,
+                    EMBEDDED_ANALOGY_CLASSIFICATION, len(claim_set), 0,
+                    sum(len(t.split()) for t in detected.claims),
+                )
+                async with self._conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO edges (id, learner_id, source_id, target_id, type, weight)
+                        VALUES (gen_random_uuid(), %s, %s, %s, 'ANALOGY_OF', 1.0)
+                        ON CONFLICT (source_id, target_id, type) DO NOTHING
+                        """,
+                        (learner_id, keep, parent_id),
+                    )
+            await self._insert_claims(keep, version, claim_set)
+
+        stale = [cid for cid in existing if cid != keep]
+        if stale:
+            async with self._conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM concepts WHERE id = ANY(%s::uuid[]) AND learner_id = %s",
+                    (stale, learner_id),
+                )
+        return 1 if keep else 0
 
     async def _resolve_prerequisites(
         self, learner_id: str, labels: list[str], candidates: list[dict],

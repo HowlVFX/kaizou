@@ -29,12 +29,28 @@ export interface GraphNode {
   };
   halfLife?: number;
   lastReviewed?: string;
+  /** Analogy node (drawn as a diamond). */
+  isAnalogy?: boolean;
+  /** Concept id this node is an analogy for. */
+  analogyOf?: string | null;
 }
 
 export interface GraphEdge {
   source: string;
   target: string;
-  type: 'semantic' | 'wikilink' | 'requires';
+  type: 'semantic' | 'wikilink' | 'requires' | 'analogy';
+}
+
+/** SOURCE_BACKED: may have sources · USER_DEFINED: no sources · ANALOGY: analogy for another concept. */
+export type NoteType = 'SOURCE_BACKED' | 'USER_DEFINED' | 'ANALOGY';
+
+export interface NoteSource {
+  id: string;
+  kind: 'link' | 'file' | 'paste';
+  title: string;
+  url?: string | null;
+  chars: number;
+  createdAt?: string;
 }
 
 export interface Note {
@@ -46,6 +62,12 @@ export interface Note {
   claims?: number;
   connections?: number;
   updatedAt: string;
+  noteType?: NoteType;
+  analogyTargetId?: string | null;
+  analogyTargetLabel?: string | null;
+  /** Locked concept this note was written to unlock ("learn this concept"). */
+  targetConceptId?: string | null;
+  sources?: NoteSource[];
 }
 
 export interface User {

@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
-import type { AppState, GraphNode, GraphEdge, Note, MasterCluster } from '../types';
+import type { AppState, GraphNode, GraphEdge, Note, NoteSource, NoteType, MasterCluster } from '../types';
 import { demoNodes, demoEdges, demoUser } from '../data/demo';
 import { api, API_BASE, clearTokens, getAccessToken, getRefreshToken, onAuthFailure, describeApiError } from '../lib/api';
 import { invalidateConceptDetail } from '../lib/concepts';
@@ -19,7 +19,9 @@ interface AppContextType extends AppState {
   login: () => void;
   logout: () => void;
   setTheme: (t: 'dark' | 'light') => void;
-  addNote: (note: Note) => void;
+  addNote: (note: Note) => Promise<boolean>;
+  updateNoteType: (id: string, noteType: NoteType, analogyTargetId?: string | null) => Promise<void>;
+  setNoteSources: (id: string, sources: NoteSource[]) => void;
   updateNoteStatus: (id: string, status: Note['status']) => void;
   updateNoteTitle: (id: string, title: string) => void;
   updateNoteBody: (id: string, body: string) => void;
@@ -63,6 +65,22 @@ function mapNote(n: any): Note {
     status: mapNoteStatus(n),
     concepts,
     updatedAt: ts ? new Date(ts).toLocaleDateString() : '',
+    noteType: n.note_type === 'USER_DEFINED' || n.note_type === 'ANALOGY' ? n.note_type : 'SOURCE_BACKED',
+    analogyTargetId: n.analogy_target_concept_id ?? null,
+    analogyTargetLabel: n.analogy_target_label ?? null,
+    targetConceptId: n.target_concept_id ?? null,
+    sources: Array.isArray(n.sources) ? n.sources.map(mapNoteSource) : [],
+  };
+}
+
+export function mapNoteSource(s: any): NoteSource {
+  return {
+    id: String(s.id),
+    kind: s.kind === 'file' || s.kind === 'paste' ? s.kind : 'link',
+    title: s.title || (s.kind === 'link' ? s.url : 'Source') || 'Source',
+    url: s.url ?? null,
+    chars: Number(s.chars) || 0,
+    createdAt: s.created_at,
   };
 }
 
@@ -121,12 +139,15 @@ function mapNode(n: any): GraphNode {
     solo: mapSolo(n.solo_level),
     halfLife: typeof n.half_life === 'number' ? n.half_life : undefined,
     lastReviewed: n.last_reviewed || undefined,
+    isAnalogy: n.track === 'ANALOGY',
+    analogyOf: n.analogy_of ?? null,
   };
 }
 
 function mapEdgeType(t: unknown): GraphEdge['type'] {
   const s = String(t || '').toLowerCase();
   if (s === 'requires') return 'requires';
+  if (s === 'analogy_of') return 'analogy';
   if (s === 'wikilink') return 'wikilink';
   return 'semantic';
 }
@@ -188,6 +209,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // Pending debounced note saves: id -> { timer, fields }
   const pendingSaves = useRef<Map<string, { timer: ReturnType<typeof setTimeout>; fields: { title?: string; body?: string } }>>(new Map());
+  // flushNoteSave is defined below; updateNoteType (defined earlier) calls it via this ref.
+  const flushNoteSaveRef = useRef<(id: string) => void>(() => {});
 
   const resetSession = useCallback(() => {
     pendingSaves.current.forEach(p => clearTimeout(p.timer));
@@ -347,18 +370,49 @@ export function AppProvider({ children }: { children: ReactNode }) {
     document.documentElement.dataset.theme = t === 'light' ? 'light' : '';
   }, []);
 
-  const addNote = useCallback((note: Note) => {
+  /** Creates the note server-side. Resolves true once the POST succeeded. */
+  const addNote = useCallback(async (note: Note): Promise<boolean> => {
     setNotes(prev => [note, ...prev]);
-    api('/api/notes', {
-      method: 'POST',
-      body: { id: note.id, title: note.title.trim() || 'Untitled', body: note.body },
-    })
-      .then(() => fetchNotes())
-      .catch(err => {
-        console.error('Error saving note:', describeApiError(err));
-        setNotes(prev => prev.map(n => (n.id === note.id ? { ...n, status: 'failed' } : n)));
+    try {
+      await api('/api/notes', {
+        method: 'POST',
+        body: {
+          id: note.id,
+          title: note.title.trim() || 'Untitled',
+          body: note.body,
+          note_type: note.noteType ?? 'SOURCE_BACKED',
+          analogy_target_concept_id: note.noteType === 'ANALOGY' ? (note.analogyTargetId ?? null) : null,
+          target_concept_id: note.targetConceptId ?? null,
+        },
       });
+      fetchNotes();
+      return true;
+    } catch (err) {
+      console.error('Error saving note:', describeApiError(err));
+      setNotes(prev => prev.map(n => (n.id === note.id ? { ...n, status: 'failed' } : n)));
+      return false;
+    }
   }, [fetchNotes]);
+
+  /** Change a note's type / analogy target (saved immediately; re-ingests). */
+  const updateNoteType = useCallback(async (id: string, noteType: NoteType, analogyTargetId: string | null = null) => {
+    setNotes(prev => prev.map(n => (n.id === id ? {
+      ...n, noteType, analogyTargetId: noteType === 'ANALOGY' ? analogyTargetId : null,
+      sources: noteType === 'USER_DEFINED' ? [] : n.sources,
+    } : n)));
+    // Flush any pending body/title edit first so it isn't lost or reordered.
+    flushNoteSaveRef.current(id);
+    await api(`/api/notes/${id}`, {
+      method: 'PUT',
+      body: { note_type: noteType, analogy_target_concept_id: noteType === 'ANALOGY' ? analogyTargetId : null },
+    });
+    fetchNotes();
+  }, [fetchNotes]);
+
+  /** Replace a note's local source list (after a sources API call). */
+  const setNoteSources = useCallback((id: string, sources: NoteSource[]) => {
+    setNotes(prev => prev.map(n => (n.id === id ? { ...n, sources } : n)));
+  }, []);
 
   /** Local-only: ingestion status is owned by the backend. */
   const updateNoteStatus = useCallback((id: string, status: Note['status']) => {
@@ -375,6 +429,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     api(`/api/notes/${id}`, { method: 'PUT', body: fields })
       .catch(err => console.error('Error updating note:', describeApiError(err)));
   }, []);
+
+  flushNoteSaveRef.current = flushNoteSave;
 
   const scheduleNoteSave = useCallback((id: string, fields: { title?: string; body?: string }) => {
     const existing = pendingSaves.current.get(id);
@@ -466,7 +522,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     <AppContext.Provider value={{
       isLoggedIn, theme, user, nodes, edges, notes, learningPrefs,
       graphStatus, graphError, clusters, clustersStatus,
-      login, logout, setTheme, addNote, updateNoteStatus, updateNoteTitle, updateNoteBody, deleteNote, updateUser, setLearningPrefs,
+      login, logout, setTheme, addNote, updateNoteType, setNoteSources, updateNoteStatus, updateNoteTitle, updateNoteBody, deleteNote, updateUser, setLearningPrefs,
       refreshGraph, refreshNotes, resetProgress,
     }}>
       {children}

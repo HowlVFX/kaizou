@@ -25,41 +25,139 @@ logger = logging.getLogger(__name__)
 
 
 class HTMLTextExtractor(HTMLParser):
-    """Simple HTML to text converter."""
+    """Readable-text extractor for HTML pages.
 
-    SKIP_TAGS = {'script', 'style', 'nav', 'header', 'footer', 'aside'}
+    Drops page chrome (scripts, navigation, menus, headers/footers, sidebars,
+    cookie banners, citation markers, edit links) and, when the page marks up
+    its main content (<main>, <article>, role=main), keeps only that. Block
+    elements become line breaks so paragraphs survive.
+    """
+
+    SKIP_TAGS = {
+        'script', 'style', 'noscript', 'template', 'svg', 'canvas', 'iframe',
+        'nav', 'header', 'footer', 'aside', 'form', 'button', 'select',
+        'menu', 'dialog', 'head',
+    }
+    VOID_TAGS = {
+        'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link',
+        'meta', 'source', 'track', 'wbr',
+    }
+    BLOCK_TAGS = {
+        'p', 'div', 'section', 'article', 'main', 'li', 'ul', 'ol', 'table',
+        'tr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'dd',
+        'dt', 'figcaption', 'br',
+    }
+    SKIP_ROLES = {'navigation', 'banner', 'contentinfo', 'search', 'complementary', 'menu', 'menubar'}
+    # Exact class/id tokens (Wikipedia and common CMS chrome).
+    SKIP_TOKENS = {
+        'reference', 'references', 'reflist', 'mw-references-wrap', 'mw-editsection',
+        'navbox', 'vertical-navbox', 'toc', 'catlinks', 'printfooter', 'mw-jump-link',
+        'noprint', 'metadata', 'sistersitebox', 'breadcrumb', 'breadcrumbs',
+        'share', 'social', 'advert', 'ads', 'comments',
+    }
+    SKIP_SUBSTRINGS = ('sidebar', 'cookie', 'navbar', 'menu', 'footer', 'banner', 'subscribe', 'popup')
+    MAIN_IDS = {'content', 'main', 'main-content', 'mw-content-text', 'bodycontent'}
 
     def __init__(self):
-        super().__init__()
-        self._text_parts: list[str] = []
-        self._skip_depth = 0
+        super().__init__(convert_charrefs=True)
+        self._all: list[str] = []
+        self._main: list[str] = []
+        self._skip_stack: list[str] = []
+        self._main_stack: list[str] = []
+
+    # Page-level containers carry site-wide classes (e.g. Wikipedia's <html
+    # class="... vector-feature-main-menu-...">); never skip them by class.
+    NEVER_SKIP = {'html', 'body', 'main', 'article'}
+
+    def _should_skip(self, tag: str, attrs: list[tuple[str, str | None]]) -> bool:
+        if tag in self.SKIP_TAGS:
+            return True
+        if tag in self.NEVER_SKIP:
+            return False
+        a = {k: (v or '') for k, v in attrs}
+        if a.get('role', '').lower() in self.SKIP_ROLES or 'hidden' in a or a.get('aria-hidden') == 'true':
+            return True
+        tokens = (a.get('class', '') + ' ' + a.get('id', '')).lower().split()
+        return any(t in self.SKIP_TOKENS or any(s in t for s in self.SKIP_SUBSTRINGS) for t in tokens)
+
+    def _is_main(self, tag: str, attrs: list[tuple[str, str | None]]) -> bool:
+        a = {k: (v or '') for k, v in attrs}
+        return (
+            tag in ('main', 'article')
+            or a.get('role', '').lower() == 'main'
+            or a.get('id', '').lower() in self.MAIN_IDS
+        )
+
+    def _emit(self, text: str) -> None:
+        self._all.append(text)
+        if self._main_stack:
+            self._main.append(text)
 
     def handle_starttag(self, tag, attrs):
-        if tag in self.SKIP_TAGS:
-            self._skip_depth += 1
+        void = tag in self.VOID_TAGS
+        if self._skip_stack:
+            if not void:
+                self._skip_stack.append(tag)
+            return
+        if not void and self._should_skip(tag, attrs):
+            self._skip_stack.append(tag)
+            return
+        if self._main_stack:
+            if not void:
+                self._main_stack.append(tag)
+        elif not void and self._is_main(tag, attrs):
+            self._main_stack.append(tag)
+        if tag in self.BLOCK_TAGS:
+            self._emit('\n')
+
+    def handle_startendtag(self, tag, attrs):
+        if not self._skip_stack and tag in self.BLOCK_TAGS:
+            self._emit('\n')
+
+    @staticmethod
+    def _pop(stack: list[str], tag: str) -> None:
+        # Tolerate unclosed children: pop up to and including the match.
+        if tag in stack:
+            while stack and stack.pop() != tag:
+                pass
 
     def handle_endtag(self, tag):
-        if tag in self.SKIP_TAGS and self._skip_depth > 0:
-            self._skip_depth -= 1
+        if self._skip_stack:
+            self._pop(self._skip_stack, tag)
+            return
+        if tag in self.BLOCK_TAGS:
+            self._emit('\n')
+        if self._main_stack:
+            self._pop(self._main_stack, tag)
 
     def handle_data(self, data):
-        if self._skip_depth == 0:
-            text = data.strip()
-            if text:
-                self._text_parts.append(text)
+        if self._skip_stack:
+            return
+        # Whitespace-only runs between inline tags still separate words.
+        text = re.sub(r'\s+', ' ', data)
+        if text:
+            self._emit(text)
 
     def get_text(self) -> str:
-        return ' '.join(self._text_parts)
+        main = ''.join(self._main)
+        # Prefer the page's main content when it holds real text.
+        chosen = main if len(main.strip()) >= 200 else ''.join(self._all)
+        lines = [re.sub(r'[ \t]+', ' ', ln).strip() for ln in chosen.split('\n')]
+        out: list[str] = []
+        for ln in lines:
+            if ln:
+                out.append(ln)
+            elif out and out[-1] != '':
+                out.append('')
+        return '\n'.join(out).strip()
 
 
 def extract_text_from_html(html: str) -> str:
-    """Extract clean text from HTML content."""
+    """Extract readable text (paragraphs separated by blank lines) from HTML."""
     parser = HTMLTextExtractor()
     parser.feed(html)
-    text = parser.get_text()
-    # Collapse whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    parser.close()
+    return parser.get_text()
 
 
 class FetchBlockedError(ValueError):
@@ -71,6 +169,15 @@ class FetchTooLargeError(ValueError):
 
 
 ALLOWED_SCHEMES = {'http', 'https'}
+
+# Wikipedia (and sites following its UA policy) return 403 to generic agents;
+# a descriptive bot UA with a contact URL is accepted there. Some CDNs block
+# every bot UA, so a 403 is retried once with a browser-style agent.
+BOT_USER_AGENT = 'KaizouBot/1.0 (https://github.com/HowlVFX/kaizou; learning-app source fetcher) httpx'
+BROWSER_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/124.0 Safari/537.36 KaizouBot/1.0'
+)
 TEXT_CONTENT_TYPES = ('text/', 'application/xhtml+xml', 'application/xml', 'application/json')
 
 Resolver = Callable[[str, int], Awaitable[list[str]]]
@@ -186,14 +293,20 @@ async def fetch_url(
     current = url
     async with httpx.AsyncClient(
         follow_redirects=False,
-        headers={'User-Agent': 'Kaizou/1.0 (educational-tool)'},
+        headers={
+            'Accept': 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5',
+            'Accept-Language': 'en;q=0.9',
+        },
         timeout=timeout,
         transport=transport,
         trust_env=False,  # never route through env-configured proxies
     ) as client:
-        for _hop in range(max_redirects + 1):
+        user_agent = BOT_USER_AGENT
+        redirects = 0
+        for _hop in range(max_redirects + 2):  # +1 for a single 403 UA retry
             parsed, ip = await validate_url(current, resolver)
             request = _pinned_request(client, parsed, ip)
+            request.headers['User-Agent'] = user_agent
             response = await client.send(request, stream=True)
             try:
                 if response.is_redirect:
@@ -201,6 +314,14 @@ async def fetch_url(
                     if not location:
                         raise FetchBlockedError('Redirect without Location header')
                     current = str(parsed.join(location))
+                    redirects += 1
+                    if redirects > max_redirects:
+                        raise FetchBlockedError(f'Too many redirects (max {max_redirects})')
+                    continue
+                if response.status_code == 403 and user_agent == BOT_USER_AGENT:
+                    # Some CDNs reject bot agents outright; retry the same URL
+                    # once with a browser agent (same SSRF checks apply).
+                    user_agent = BROWSER_USER_AGENT
                     continue
                 response.raise_for_status()
 
@@ -230,8 +351,13 @@ async def fetch_url(
             raise FetchBlockedError(f'Too many redirects (max {max_redirects})')
 
     # Extract clean text based on content type
+    title = ''
     if 'text/html' in content_type:
         clean_text = extract_text_from_html(raw_content)
+        m = re.search(r'<title[^>]*>(.*?)</title>', raw_content, re.IGNORECASE | re.DOTALL)
+        if m:
+            import html as _html
+            title = re.sub(r'\s+', ' ', _html.unescape(m.group(1))).strip()[:200]
     else:
         clean_text = raw_content
 
@@ -245,4 +371,5 @@ async def fetch_url(
         'content_hash': content_hash,
         'token_count': token_count,
         'content_type': content_type,
+        'title': title,
     }
