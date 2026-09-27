@@ -228,6 +228,9 @@ class FakeCursor:
             self._rows = out
         elif "FROM edges WHERE learner_id" in s:
             self._rows = [dict(e) for e in db.edges if e["learner_id"] == str(p[0])]
+        elif s.startswith("SELECT n.body_md FROM notes n JOIN note_concepts"):
+            body = getattr(db, "note_bodies", {}).get(str(p[0]))
+            self._rows = [{"body_md": body}] if body else []
         elif s.startswith("SELECT COUNT(*) AS n FROM probes WHERE concept_id"):
             cid, ver, typ = str(p[0]), p[1], p[2]
             n = sum(1 for pr in db.probes.values()

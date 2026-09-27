@@ -174,3 +174,73 @@ def check_cloze_leakage(prompt_text: str, expected_terms: list[str]) -> bool:
         if t and f" {t} " in prompt:
             return True
     return False
+
+
+# ── Answer-level leakage ────────────────────────────────────────────────────
+# A question has to be ABOUT its topic, and a question in the learner's own
+# words about a short, simple note is always close to one of its claims
+# ("How do plants make their food?" vs "Plants make their own food."). That is
+# not a leak: the answer (how) is in the other claims. So one claim may be
+# touched as the topic; the probe leaks when it restates a claim nearly
+# verbatim, or touches a large share of the answer's claims.
+VERBATIM_OVERLAP: float = 0.80
+TOUCHED_SHARE: float = 0.40
+
+
+def per_claim_overlap(probe_tokens: list[str], claim_token_lists: list[list[str]], n: int = 4) -> list[float]:
+    """4-gram overlap of the probe with each claim (fraction of the claim's n-grams)."""
+    probe_ngrams = extract_ngrams(probe_tokens, n)
+    out = []
+    for toks in claim_token_lists:
+        cg = extract_ngrams(toks, n)
+        out.append(len(probe_ngrams & cg) / len(cg) if cg and probe_ngrams else 0.0)
+    return out
+
+
+CONTENT_COVER: float = 0.5
+
+
+def content_coverage(probe_text: str, claim_texts: list[str]) -> list[float]:
+    """Share of each claim's content words (stemmed) that appear in the probe.
+
+    Embeddings of short on-topic sentences are all near-identical, so
+    similarity alone says "same topic", not "gives the answer away". A claim
+    is only given away if the probe also carries most of its content words.
+    """
+    from app.probes.style import SCAFFOLD_WORDS, vocabulary
+
+    probe_vocab = vocabulary(probe_text)
+    out = []
+    for c in claim_texts:
+        words = [w for w in vocabulary(c) if len(w) >= 3 and w not in SCAFFOLD_WORDS]
+        out.append(sum(1 for w in words if w in probe_vocab) / len(words) if words else 0.0)
+    return out
+
+
+def assess_answer_leakage(
+    similarities: list[float],
+    overlaps: list[float],
+    coverages: list[float] | None = None,
+    semantic_threshold: float = SEMANTIC_LEAK_THRESHOLD,
+    lexical_threshold: float = LEXICAL_LEAK_THRESHOLD,
+) -> tuple[bool, int, int]:
+    """Returns (leaked, touched_claims, allowed_touched).
+
+    A claim is touched when the probe shares its 4-grams (>= τ_ngram), or is
+    semantically close (>= τ_leak) AND carries most of its content words.
+    Leaked when any claim is restated near-verbatim (4-gram >= 0.8) or more
+    claims are touched than the topic allowance max(1, round(0.4 · n)).
+    """
+    n = max(len(similarities), len(overlaps))
+    cov = coverages if coverages is not None else [1.0] * n
+
+    def touched_claim(i: int) -> bool:
+        if i < len(overlaps) and overlaps[i] >= lexical_threshold:
+            return True
+        return (i < len(similarities) and similarities[i] >= semantic_threshold
+                and i < len(cov) and cov[i] >= CONTENT_COVER)
+
+    touched = sum(1 for i in range(n) if touched_claim(i))
+    allowed = max(1, round(TOUCHED_SHARE * n))
+    verbatim = any(o >= VERBATIM_OVERLAP for o in overlaps)
+    return verbatim or touched > allowed, touched, allowed

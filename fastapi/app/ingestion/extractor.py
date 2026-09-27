@@ -100,6 +100,7 @@ class ClaimExtractor:
 Faithfulness rules (strict):
 - Only include what the text itself states. Never add outside knowledge, extra detail, technical terms, numbers or examples the learner did not write.
 - Keep the learner's own words, vocabulary and level. If the note is written simply (e.g. for a child), the claims must be equally simple.
+- Write each claim with the learner's exact wording wherever possible: split or trim their sentences, but do not reword them or swap in synonyms (if they wrote "make", keep "make", not "produce").
 - Do not generalise or broaden a claim beyond what was written. Fewer faithful claims are better than many embellished ones.
 
 For each claim provide:

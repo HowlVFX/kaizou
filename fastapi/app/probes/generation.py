@@ -30,6 +30,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from app.probes.style import LEVEL_INSTRUCTIONS, reading_level
 from app.providers.generation import GenerationClient, strict_object
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,8 @@ BREAKDOWN_SCHEMA = strict_object({
 
 MAX_CONTEXT_CLAIMS = 10
 BLANK = "_____"
+# How much of the learner's note is shown to the generator as a style guide.
+NOTE_EXCERPT_CHARS = 2500
 
 # Probe type → prompt template
 PROBE_TEMPLATES = {
@@ -470,6 +473,8 @@ class ProbeGenerator:
         variant: str = "",
         violation: str | None = None,
         focus: str | None = None,
+        note_text: str | None = None,
+        style_feedback: str | None = None,
     ) -> GeneratedProbe:
         """Generate and validate one probe via the guarded LLM client.
 
@@ -501,12 +506,29 @@ class ProbeGenerator:
         )
         for i, ct in enumerate(claim_texts[:MAX_CONTEXT_CLAIMS]):
             context += f"  {i}. {ct}\n"
+        # The learner's own note: the question must sound like it was built
+        # from these words, at this level.
+        style_source = (note_text or "").strip() or "\n".join(claim_texts)
+        level = reading_level(style_source)
+        context += f"\nReading level: {level}. {LEVEL_INSTRUCTIONS[level]}\n"
+        if note_text and note_text.strip():
+            context += (
+                "\nThe learner's own note (reuse ITS words and phrasing so the "
+                "question sounds like the learner wrote it; do not copy whole "
+                "sentences):\n\"\"\"\n" + note_text.strip()[:NOTE_EXCERPT_CHARS] + "\n\"\"\"\n"
+            )
         if focus:
             context += f"\n{focus}\n"
         if violation:
             context += (
                 "\nYour previous question was rejected because it leaked the "
                 f"answer ({violation}). Rephrase it so it does not restate the claims.\n"
+            )
+        if style_feedback:
+            context += (
+                "\nYour previous question was rejected because it used words the "
+                f"learner never wrote: {style_feedback}. Rewrite it using only the "
+                "learner's own words from the note, as simply as they wrote it.\n"
             )
 
         system_prompt = (
@@ -516,12 +538,15 @@ class ProbeGenerator:
             "reproduce any claim verbatim — the question must test "
             "understanding, not recognition.\n"
             "Faithfulness and tone (these claims come from the learner's own note):\n"
-            "- Test ONLY what the listed claims say. Never introduce facts, terms, "
-            "numbers, examples or details that are not in the claims.\n"
-            "- Write in the same plain language, vocabulary and reading level as "
-            "the claims. If the claims are simple, the question must be simple.\n"
-            "- Keep the question short: one or two sentences, everyday words, no "
-            "jargon the learner did not use.\n"
+            "- Test ONLY what the learner wrote. Never introduce facts, terms, "
+            "numbers, examples or details that are not in their note.\n"
+            "- Use the learner's OWN words. If they wrote 'make', say 'make', not "
+            "'create' or 'produce'. Never swap their words for synonyms or "
+            "fancier terms.\n"
+            "- Match their difficulty and sentence style exactly. A simple note "
+            "gets a simple question; do not make it harder than the note.\n"
+            "- Keep it short: one or two sentences. Answer options (if any) must "
+            "also use the learner's words.\n"
             "Return JSON matching the schema."
         )
 

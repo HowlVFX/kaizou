@@ -25,7 +25,11 @@ from app.probes.generation import (
     ProbeValidationError,
     fallback_probe,
 )
-from app.probes.leakage import validate_probe
+from app.grading.coverage import cosine_similarity
+from app.probes.leakage import (
+    assess_answer_leakage, content_coverage, per_claim_overlap, validate_probe,
+)
+from app.probes.style import unfamiliar_words, vocabulary
 from app.providers.shared.errors import ProviderError
 
 logger = logging.getLogger(__name__)
@@ -34,6 +38,39 @@ MAX_LEAKAGE_RETRIES = 3  # default; Settings.probe_leakage_max_retries overrides
 
 # Probe types that test one specific claim; repeat probes rotate the claim.
 CLAIM_TARGETED_TYPES = frozenset({"CLOZE", "MISCONCEPTION_MCQ"})
+
+# Question types that must stay inside the learner's own vocabulary. Transfer
+# questions are exempt: they deliberately describe a new situation.
+VOCAB_CHECKED_TYPES = frozenset({
+    "CLOZE", "RECALL", "PROCESS_TRACE", "PROCEDURAL", "MISCONCEPTION_MCQ",
+    "CONCEPT_SORT", "PERTURBATION", "ANALOGY_FORWARD", "ANALOGY_SIMULATE",
+    "ANALOGY_BREAKDOWN",
+})
+# Content words a question may use that the learner never wrote.
+MAX_UNFAMILIAR_WORDS = 2
+
+
+_CONTENT_STOP = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "is", "are", "it",
+    "its", "they", "their", "them", "this", "that", "with", "for", "by", "as",
+    "at", "be", "do", "does", "what", "which", "how", "why",
+})
+
+
+def _content_words(text: str) -> list[str]:
+    import re as _re
+    return [w for w in _re.findall(r"[a-z0-9']+", (text or "").lower()) if w not in _CONTENT_STOP]
+
+
+def _learner_visible_text(p: GeneratedProbe) -> str:
+    """Everything the learner reads or must produce: question, options,
+    sort items, and a cloze answer (they can't fill in a word they never used)."""
+    parts = [p.prompt_text]
+    parts += [str(o) for o in (p.payload or {}).get('options', [])]
+    parts += [str(i) for i in (p.payload or {}).get('items', [])]
+    if p.cloze and p.cloze.get('answer'):
+        parts.append(str(p.cloze['answer']))
+    return "\n".join(parts)
 
 
 class ProbeServiceError(Exception):
@@ -212,12 +249,24 @@ class ProbeService:
         claim_embeddings = [as_vector(c['embedding']) for c in claims if c.get('embedding') is not None]
         claim_token_lists = [c['text'].split() for c in claims]
 
+        # The learner's own writing: shown to the generator as the style
+        # guide and used to reject questions in words they never wrote.
+        note_text = await self._note_text_for(concept_id)
+        vocab = vocabulary(note_text, *(c['text'] for c in claims))
+        # Only gate on vocabulary when the learner's actual note is available;
+        # extracted claims alone are too thin a sample of how they write.
+        check_vocab = probe_type in VOCAB_CHECKED_TYPES and bool(note_text)
+
         chosen: Optional[GeneratedProbe] = None
         leaked = False
         attempts_made = 0
         leakage_check = 'none'
         fallback_reason = None
         violation = None
+        style_feedback = None
+        # Best leak-free candidate that failed only the vocabulary check; used
+        # if every retry drifts from the learner's words (better than fallback).
+        best_off_style: Optional[tuple[int, GeneratedProbe, str]] = None
 
         for attempt in range(max_attempts):
             attempts_made = attempt + 1
@@ -229,6 +278,8 @@ class ProbeService:
                     variant=f"{sample_prefix}leak-retry-{attempt}",
                     violation=violation,
                     focus=focus,
+                    note_text=note_text,
+                    style_feedback=style_feedback,
                 )
             except ProbeValidationError as exc:
                 violation = f"invalid probe: {exc}"
@@ -242,10 +293,22 @@ class ProbeService:
             is_valid, leakage_check, report = await self._check_leakage(
                 candidate, claim_embeddings, claim_token_lists,
             )
-            if is_valid:
-                chosen = candidate
-                break
-            violation = report
+            if not is_valid:
+                violation, style_feedback = report, None
+                continue
+            if check_vocab:
+                foreign = unfamiliar_words(_learner_visible_text(candidate), vocab)
+                if len(foreign) > MAX_UNFAMILIAR_WORDS:
+                    logger.info('Probe off learner vocabulary (attempt %d): %s', attempt, foreign)
+                    if best_off_style is None or len(foreign) < best_off_style[0]:
+                        best_off_style = (len(foreign), candidate, leakage_check)
+                    violation, style_feedback = None, ", ".join(foreign[:8])
+                    continue
+            chosen = candidate
+            break
+
+        if chosen is None and best_off_style is not None:
+            _, chosen, leakage_check = best_off_style
 
         if chosen is None:
             if fallback_reason is None:
@@ -312,6 +375,24 @@ class ProbeService:
             'target_branch': target_branch,
         }
 
+    async def _note_text_for(self, concept_id: str) -> str:
+        """The learner's note(s) behind a concept. An embedded analogy node has
+        no note of its own, so it uses the note of the concept it belongs to.
+        Sources are never included: only the learner's own words."""
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT n.body_md FROM notes n JOIN note_concepts nc ON nc.note_id = n.id "
+                "WHERE nc.concept_id = %s "
+                "UNION ALL "
+                "SELECT n.body_md FROM notes n JOIN note_concepts nc ON nc.note_id = n.id "
+                "JOIN edges e ON e.target_id = nc.concept_id AND e.type = 'ANALOGY_OF' "
+                "WHERE e.source_id = %s "
+                "AND NOT EXISTS (SELECT 1 FROM note_concepts x WHERE x.concept_id = %s)",
+                (concept_id, concept_id, concept_id),
+            )
+            rows = await cur.fetchall()
+        return "\n\n".join((r.get('body_md') or '') for r in rows).strip()
+
     async def _template_for(self, concept: dict, claims: list[dict]) -> Optional[dict]:
         """Fetch or build the Process Template; never fails the probe."""
         try:
@@ -359,17 +440,30 @@ class ProbeService:
             except ProviderError as exc:
                 logger.warning('Leakage semantic check skipped: %s', exc)
 
-        is_valid, sem, lex = validate_probe(
-            probe_embedding if probe_embedding is not None else [],
-            text.split(),
-            claim_embeddings if probe_embedding is not None else [],
-            claim_token_lists,
+        sims = (
+            [cosine_similarity(probe_embedding, e) for e in claim_embeddings]
+            if probe_embedding is not None else []
+        )
+        overlaps = per_claim_overlap(text.split(), claim_token_lists, n=self._s.probe_leakage_ngram_n)
+        coverages = content_coverage(text, [' '.join(t) for t in claim_token_lists])
+        leaked, touched, allowed = assess_answer_leakage(
+            sims, overlaps, coverages,
             semantic_threshold=self._s.probe_leakage_semantic,
             lexical_threshold=self._s.probe_leakage_ngram,
-            ngram_n=self._s.probe_leakage_ngram_n,
         )
-        report = f"semantic similarity {sem:.2f}, 4-gram overlap {lex:.2f}"
-        return is_valid, check, report
+        report = (
+            f"it restates {touched} of {len(claim_token_lists)} claims (max {allowed}); "
+            f"semantic similarity {max(sims, default=0.0):.2f}, 4-gram overlap {max(overlaps, default=0.0):.2f}"
+        )
+        # MCQ: the correct option must not be spelled out in the question.
+        if not leaked and candidate.probe_type == 'MISCONCEPTION_MCQ' and candidate.mcq:
+            options = (candidate.payload or {}).get('options') or []
+            ci = candidate.mcq.get('correct_index')
+            if isinstance(ci, int) and 0 <= ci < len(options):
+                key = {w for w in _content_words(options[ci])}
+                if key and key <= set(_content_words(text)):
+                    leaked, report = True, "the correct option is spelled out in the question"
+        return not leaked, check, report
 
     # -- capability events --------------------------------------------------
 
