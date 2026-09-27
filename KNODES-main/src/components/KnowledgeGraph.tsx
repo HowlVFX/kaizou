@@ -848,12 +848,14 @@ export default function KnowledgeGraph({
                   />
                 )}
                 {/* Node body: analogy nodes are diamonds, concepts are circles */}
-                {node.isAnalogy && !node.locked ? (
+                {node.isAnalogy ? (
                   <polygon
                     points={`0,${-r * 1.25} ${r * 1.25},0 0,${r * 1.25} ${-r * 1.25},0`}
-                    fill="var(--bg-card, var(--bg-elevated))"
+                    fill={node.locked ? "var(--bg-elevated)" : "var(--bg-card, var(--bg-elevated))"}
+                    // Empty analogy node (waiting for "Write analogy"): dashed diamond.
+                    strokeDasharray={node.locked ? "4,3" : undefined}
                     stroke={
-                      isSelected || isHovered || isActivePath
+                      node.locked || isSelected || isHovered || isActivePath
                         ? ANALOGY_COLOR
                         : "var(--text-dim)"
                     }

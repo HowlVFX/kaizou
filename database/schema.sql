@@ -145,6 +145,20 @@ CREATE TABLE note_sources (
 );
 CREATE INDEX idx_note_sources_note ON note_sources(note_id);
 
+-- Analogy about a topic with no note yet (migration 009): resolved by ingestion.
+ALTER TABLE notes ADD COLUMN analogy_target_label TEXT;
+
+-- Replaced versions of a note (notes change only via "Update note").
+CREATE TABLE note_revisions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    note_id UUID REFERENCES notes(id) ON DELETE CASCADE NOT NULL,
+    title TEXT NOT NULL,
+    body_md TEXT NOT NULL,
+    written_at TIMESTAMPTZ,
+    replaced_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_note_revisions_note ON note_revisions(note_id, replaced_at);
+
 CREATE TABLE note_concepts (
     note_id UUID REFERENCES notes(id) ON DELETE CASCADE,
     concept_id UUID REFERENCES concepts(id) ON DELETE CASCADE,

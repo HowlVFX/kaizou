@@ -6,6 +6,15 @@ import { useApp } from '../context/AppContext';
 import { useConceptDetail, formatRelative, type ConceptDetail } from '../lib/concepts';
 import { Lock, FileText, X as XIcon, Target, RefreshCw, GitMerge, BarChart, Zap } from './Icon';
 import DeepDivePanel from './DeepDivePanel';
+import NoteViewerModal from './NoteViewerModal';
+import { api, describeApiError } from '../lib/api';
+
+const ANALOGY_COLOR = '#a78bfa';
+const secondaryBtn: React.CSSProperties = {
+  width: '100%', padding: '8px 0', borderRadius: 9, background: 'var(--bg-input)',
+  border: '1px solid var(--border)', color: 'var(--text-2)', fontSize: 12, fontWeight: 600,
+  cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+};
 
 interface Props {
   node: GraphNode;
@@ -44,11 +53,32 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
   const recallDash = node.recall !== null ? (node.recall / 100) * circumference : 0;
 
   // Claims + edges come from GET /api/concepts/:id; neighbours resolve against the loaded graph.
-  const { nodes: allNodes, edges: allEdges, isLoggedIn } = useApp();
+  const { nodes: allNodes, edges: allEdges, isLoggedIn, refreshGraph } = useApp();
   // Locked node created by "Go deeper" (not a prerequisite of a note).
   const isExplanation = node.locked && allEdges.some(e => e.type === 'explained' && e.target === node.id);
   const learnConcept = (id: string, label: string) => navigate('/notes', { state: { learnConcept: { id, label } } });
   const updateNote = () => navigate('/notes', { state: { openConceptId: node.id } });
+  // Analogy nodes: the concept an analogy node belongs to, and actions.
+  const analogyBase = node.analogyOf ? allNodes.find(n => n.id === node.analogyOf) ?? null : null;
+  const writeAnalogy = () => navigate('/notes', {
+    state: { learnConcept: { id: node.id, label: node.label, analogyFor: analogyBase ? { id: analogyBase.id, label: analogyBase.label } : undefined } },
+  });
+  const [addingAnalogy, setAddingAnalogy] = useState(false);
+  const [analogyMsg, setAnalogyMsg] = useState<string | null>(null);
+  const [viewingNote, setViewingNote] = useState(false);
+  const addAnalogyNode = async () => {
+    setAddingAnalogy(true);
+    setAnalogyMsg(null);
+    try {
+      await api(`/api/concepts/${node.id}/analogy`, { method: 'POST' });
+      setAnalogyMsg('Empty analogy node added. Click the new diamond to write your analogy.');
+      refreshGraph();
+    } catch (err) {
+      setAnalogyMsg(describeApiError(err, 'Could not add an analogy node.'));
+    } finally {
+      setAddingAnalogy(false);
+    }
+  };
   const { detail, loading: detailLoading, error: detailError } = useConceptDetail(node.id);
   const pool = isLoggedIn ? allNodes : demoNodes;
   const linkedIds = new Set<string>([
@@ -148,16 +178,27 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
           }}>
             <span style={{ color: 'var(--text-dim)', marginTop: 1, flexShrink: 0 }}><Lock size={16} /></span>
             <div>
-              <div style={{ fontWeight: 600, color: 'var(--text-2)', fontSize: 13, marginBottom: 4 }}>{isExplanation ? 'Locked explanation' : 'Missing prerequisite'}</div>
-              <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55 }}>
-                {isExplanation
-                  ? 'You found this by going deeper. Write a note on it in your own words to unlock it.'
-                  : 'Kaizou identified this as a prerequisite not yet established in your Brain.'}
+              <div style={{ fontWeight: 600, color: 'var(--text-2)', fontSize: 13, marginBottom: 4 }}>
+                {node.isAnalogy ? 'Empty analogy node' : isExplanation ? 'Locked explanation' : 'Missing prerequisite'}
               </div>
-              <button onClick={() => learnConcept(node.id, node.label)} style={{
-                marginTop: 10, padding: '6px 14px', borderRadius: 7, background: 'var(--blue)',
-                border: 'none', color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
-              }}>Learn this concept</button>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55 }}>
+                {node.isAnalogy
+                  ? `Write your own analogy${analogyBase ? ` for ${analogyBase.label}` : ''} to fill this node.`
+                  : isExplanation
+                    ? 'You found this by going deeper. Write a note on it in your own words to unlock it.'
+                    : 'Kaizou identified this as a prerequisite not yet established in your Brain.'}
+              </div>
+              {node.isAnalogy ? (
+                <button onClick={writeAnalogy} style={{
+                  marginTop: 10, padding: '6px 14px', borderRadius: 7, background: ANALOGY_COLOR,
+                  border: 'none', color: '#1a1030', fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit',
+                }}>◆ Write analogy</button>
+              ) : (
+                <button onClick={() => learnConcept(node.id, node.label)} style={{
+                  marginTop: 10, padding: '6px 14px', borderRadius: 7, background: 'var(--blue)',
+                  border: 'none', color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
+                }}>Learn this concept</button>
+              )}
             </div>
           </div>
         )}
@@ -208,8 +249,28 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
                 <Zap size={14} strokeWidth={1.8} /> Explain
               </button>
             </div>
+            {isLoggedIn && (
+              <button onClick={() => setViewingNote(true)} style={secondaryBtn}>
+                <FileText size={13} /> View original note
+              </button>
+            )}
             {isLoggedIn && <DeepDivePanel node={node} onLearn={learnConcept} onUpdateNote={updateNote} />}
           </div>
+        )}
+
+        {/* Add analogy node (any non-analogy node) */}
+        {isLoggedIn && !node.isAnalogy && (
+          <div style={{ marginTop: 8 }}>
+            <button onClick={addAnalogyNode} disabled={addingAnalogy} style={{ ...secondaryBtn, color: ANALOGY_COLOR, borderColor: `${ANALOGY_COLOR}66`, opacity: addingAnalogy ? 0.6 : 1 }}>
+              ◆ {addingAnalogy ? 'Adding…' : 'Add analogy node'}
+            </button>
+            {analogyMsg && <div role="status" style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 5 }}>{analogyMsg}</div>}
+          </div>
+        )}
+
+        {viewingNote && (
+          <NoteViewerModal conceptId={node.id} label={node.label} onClose={() => setViewingNote(false)}
+            onOpenInNotes={() => { setViewingNote(false); updateNote(); }} />
         )}
 
         {/* Tab bar */}

@@ -246,6 +246,73 @@ router.get('/:id', verifyToken, async (req, res) => {
   }
 });
 
+// ── View original note ────────────────────────────────────────────────
+// GET /api/concepts/:id/notes -> the note(s) behind this node, each with its
+// original (first) version when it has since been updated.
+//   [{ id, title, body, note_type, created_at, updated_at, revisions,
+//      original: { title, body, written_at } | null }]
+router.get('/:id/notes', verifyToken, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Concept not found' });
+  try {
+    const r = await db.query(
+      `SELECT n.id, n.title, n.body_md AS body, n.note_type, n.created_at, n.updated_at,
+              (SELECT COUNT(*)::int FROM note_revisions x WHERE x.note_id = n.id) AS revisions,
+              (SELECT json_build_object('title', x.title, 'body', x.body_md, 'written_at', x.written_at)
+                 FROM note_revisions x WHERE x.note_id = n.id
+                 ORDER BY x.replaced_at ASC LIMIT 1) AS original
+       FROM notes n JOIN note_concepts nc ON nc.note_id = n.id
+       WHERE nc.concept_id = $1 AND n.learner_id = $2
+       ORDER BY n.created_at`,
+      [req.params.id, req.user.id]
+    );
+    res.json(r.rows);
+  } catch (err) {
+    console.error('Error fetching concept notes:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Add analogy node ─────────────────────────────────────────────────
+// POST /api/concepts/:id/analogy -> { id, label }
+// Creates an EMPTY analogy node (locked, diamond) attached to this concept by
+// ANALOGY_OF. "Write analogy" on it opens a note that fills that exact node.
+router.post('/:id/analogy', verifyToken, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Concept not found' });
+  try {
+    const base = await db.query(
+      'SELECT id, canonical_label, track FROM concepts WHERE id = $1 AND learner_id = $2',
+      [req.params.id, req.user.id]
+    );
+    if (!base.rows[0]) return res.status(404).json({ error: 'Concept not found' });
+    if (base.rows[0].track === 'ANALOGY') {
+      return res.status(422).json({ error: 'An analogy node cannot have its own analogy node' });
+    }
+    const pending = await db.query(
+      `SELECT COUNT(*)::int AS n FROM concepts c JOIN edges e ON e.source_id = c.id AND e.type = 'ANALOGY_OF'
+       WHERE e.target_id = $1 AND c.track = 'ANALOGY' AND c.status = 'UNRESOLVED_PREREQUISITE'`,
+      [req.params.id]
+    );
+    if (pending.rows[0].n >= 5) {
+      return res.status(409).json({ error: 'Write the empty analogy nodes you already added first' });
+    }
+    const label = `Analogy for ${base.rows[0].canonical_label}`.slice(0, 200);
+    const c = await db.query(
+      `INSERT INTO concepts (learner_id, canonical_label, track, shape, category, status, version, probe_eligible)
+       VALUES ($1, $2, 'ANALOGY', 'DEFINITION', 'CONVENTIONAL', 'UNRESOLVED_PREREQUISITE', 1, false)
+       RETURNING id, canonical_label`,
+      [req.user.id, label]
+    );
+    await db.query(
+      `INSERT INTO edges (learner_id, source_id, target_id, type, weight) VALUES ($1, $2, $3, 'ANALOGY_OF', 1.0)`,
+      [req.user.id, c.rows[0].id, req.params.id]
+    );
+    res.status(201).json({ id: c.rows[0].id, label: c.rows[0].canonical_label, analogy_of: req.params.id });
+  } catch (err) {
+    console.error('Error adding analogy node:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── Go deeper (why-ladder) ─────────────────────────────────────────────
 // GET  /api/concepts/:id/deeper  -> stored step, no AI
 // POST /api/concepts/:id/deeper  { regenerate? } -> generates the step if absent

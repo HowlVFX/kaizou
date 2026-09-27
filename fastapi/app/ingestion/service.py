@@ -170,8 +170,20 @@ class IngestionService:
             if note_type == "ANALOGY" and note.get("analogy_target_concept_id") else None
         )
         locked_target = str(note["target_concept_id"]) if note.get("target_concept_id") else None
+        analogy_label = (note.get("analogy_target_label") or "").strip() if note_type == "ANALOGY" else ""
 
         try:
+            # Standalone analogy (migration 009): the topic has no note yet.
+            # Resolve it to an existing concept or a locked placeholder once,
+            # then remember it on the note.
+            if note_type == "ANALOGY" and not analogy_target and analogy_label:
+                analogy_target = await self._resolve_analogy_topic(learner_id, analogy_label, locked_target)
+                async with self._conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE notes SET analogy_target_concept_id = %s WHERE id = %s",
+                        (analogy_target, note_id),
+                    )
+
             # 2. Check if content changed (skip if hash matches). The note type
             # and analogy target are part of the "content": changing either
             # must re-ingest even when the body is identical.
@@ -238,10 +250,15 @@ class IngestionService:
             ]
             identity = resolve_concept_identity(label_embedding, identity_pool)
 
-            if locked_target and locked_target in by_id:
-                # "Learn this concept" on a locked node: this note IS that node.
+            locked_status = (
+                by_id[locked_target]["status"] if locked_target and locked_target in by_id
+                else await self._owned_status(learner_id, locked_target) if locked_target else None
+            )
+            if locked_status:
+                # "Learn this concept" / "Write analogy" on a locked node:
+                # this note IS that node (fills it in place, no duplicate).
                 concept_id = locked_target
-                mode = "promote" if by_id[locked_target]["status"] == UNRESOLVED else "update"
+                mode = "promote" if locked_status == UNRESOLVED else "update"
             elif identity.is_new:
                 # A placeholder created from an earlier note's prerequisite list
                 # with the same label is this concept: promote, don't duplicate.
@@ -485,8 +502,52 @@ class IngestionService:
         "SELECT DISTINCT c.id FROM concepts c "
         "JOIN edges e ON e.source_id = c.id AND e.type = 'ANALOGY_OF' "
         "WHERE c.learner_id = %s AND c.track = 'ANALOGY' "
+        # Empty analogy nodes the learner added ("Add analogy node") are
+        # locked and waiting for their own note; they are not detected children.
+        "AND c.status = 'VERIFIED_CONCEPT' "
         "AND NOT EXISTS (SELECT 1 FROM note_concepts nc WHERE nc.concept_id = c.id)"
     )
+
+    async def _owned_status(self, learner_id: str, concept_id: str) -> str | None:
+        """Status of a learner's concept (covers placeholders with no embedding)."""
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status::text AS status FROM concepts WHERE id = %s AND learner_id = %s",
+                (concept_id, learner_id),
+            )
+            row = await cur.fetchone()
+        return row["status"] if row else None
+
+    async def _resolve_analogy_topic(
+        self, learner_id: str, label: str, exclude_id: str | None,
+    ) -> str:
+        """Concept for an analogy's topic: exact label, else identity match on
+        the label embedding, else a new locked placeholder for the topic."""
+        label = " ".join(label.split())[:120]
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT id FROM concepts WHERE learner_id = %s AND LOWER(canonical_label) = LOWER(%s) "
+                "AND track <> 'ANALOGY' AND (%s::uuid IS NULL OR id <> %s::uuid) LIMIT 1",
+                (learner_id, label, exclude_id, exclude_id),
+            )
+            row = await cur.fetchone()
+        if row:
+            return str(row["id"])
+        emb = as_vector(await self._embedding.compute_embedding(label))
+        pool = [c for c in await self._load_learner_concepts(learner_id) if c["id"] != exclude_id]
+        res = resolve_concept_identity(emb, pool)
+        if not res.is_new and res.concept_id:
+            return str(res.concept_id)
+        pid = str(uuid4())
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                """INSERT INTO concepts (id, learner_id, canonical_label, label_embedding,
+                       track, shape, category, status, version, probe_eligible)
+                   VALUES (%s, %s, %s, %s::vector, %s, %s, %s, 'UNRESOLVED_PREREQUISITE', 1, false)""",
+                (pid, learner_id, label, _vector_literal(emb),
+                 PLACEHOLDER_TRACK, PLACEHOLDER_SHAPE, PLACEHOLDER_CATEGORY),
+            )
+        return pid
 
     async def _analogy_child_ids(self, learner_id: str, parent_id: str | None = None) -> set[str]:
         """Analogy nodes detected inside a note: owned by their parent concept

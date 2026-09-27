@@ -22,6 +22,7 @@ interface AppContextType extends AppState {
   addNote: (note: Note) => Promise<boolean>;
   updateNoteType: (id: string, noteType: NoteType, analogyTargetId?: string | null) => Promise<void>;
   setNoteSources: (id: string, sources: NoteSource[]) => void;
+  submitNoteUpdate: (id: string, fields: { title: string; body: string }) => Promise<void>;
   updateNoteStatus: (id: string, status: Note['status']) => void;
   updateNoteTitle: (id: string, title: string) => void;
   updateNoteBody: (id: string, body: string) => void;
@@ -72,6 +73,7 @@ function mapNote(n: any): Note {
     analogyTargetId: n.analogy_target_concept_id ?? null,
     analogyTargetLabel: n.analogy_target_label ?? null,
     targetConceptId: n.target_concept_id ?? null,
+    revisions: Number(n.revisions) || 0,
     sources: Array.isArray(n.sources) ? n.sources.map(mapNoteSource) : [],
   };
 }
@@ -392,6 +394,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
           body: note.body,
           note_type: note.noteType ?? 'SOURCE_BACKED',
           analogy_target_concept_id: note.noteType === 'ANALOGY' ? (note.analogyTargetId ?? null) : null,
+          // Analogy about a topic with no note yet.
+          analogy_target_label: note.noteType === 'ANALOGY' && !note.analogyTargetId ? (note.analogyTargetLabel ?? null) : null,
           target_concept_id: note.targetConceptId ?? null,
         },
       });
@@ -416,6 +420,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
       method: 'PUT',
       body: { note_type: noteType, analogy_target_concept_id: noteType === 'ANALOGY' ? analogyTargetId : null },
     });
+    fetchNotes();
+  }, [fetchNotes]);
+
+  /** Notes are read-only once created: this is the one explicit "Update note"
+   *  submit. Saves title/body now (the old text is kept as a revision) and
+   *  re-processes the note into a new version. Rejects on failure. */
+  const submitNoteUpdate = useCallback(async (id: string, fields: { title: string; body: string }) => {
+    const pending = pendingSaves.current.get(id);
+    if (pending) { clearTimeout(pending.timer); pendingSaves.current.delete(id); }
+    const title = fields.title.trim() || 'Untitled';
+    setNotes(prev => prev.map(n => (n.id === id ? { ...n, title, body: fields.body, status: 'processing', updatedAt: 'Just now' } : n)));
+    await api(`/api/notes/${id}`, { method: 'PUT', body: { title, body: fields.body } });
     fetchNotes();
   }, [fetchNotes]);
 
@@ -532,7 +548,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     <AppContext.Provider value={{
       isLoggedIn, theme, user, nodes, edges, notes, learningPrefs,
       graphStatus, graphError, clusters, clustersStatus,
-      login, logout, setTheme, addNote, updateNoteType, setNoteSources, updateNoteStatus, updateNoteTitle, updateNoteBody, deleteNote, updateUser, setLearningPrefs,
+      login, logout, setTheme, addNote, updateNoteType, setNoteSources, submitNoteUpdate, updateNoteStatus, updateNoteTitle, updateNoteBody, deleteNote, updateUser, setLearningPrefs,
       refreshGraph, refreshNotes, resetProgress,
     }}>
       {children}

@@ -24,8 +24,14 @@ const NOTE_TYPE_OPTIONS: { value: NoteType; label: string; hint: string }[] = [
   { value: 'ANALOGY', label: 'Analogy', hint: 'This note is an analogy for another concept.' },
 ];
 
-/** State passed by "Learn this concept" on a locked node, or "Update your note" on an upgraded one. */
-interface LearnConceptState { learnConcept?: { id: string; label: string }; openConceptId?: string }
+/** State passed by "Learn this concept" / "Write analogy" on a locked node, or "Update your note" on an upgraded one. */
+interface LearnConceptState {
+  learnConcept?: { id: string; label: string; analogyFor?: { id: string; label: string } };
+  openConceptId?: string;
+}
+
+// Analogy target picker: "a topic I don't have a note for yet".
+const TOPIC_OPTION = '__topic__';
 
 // ── Pipeline steps (learner-friendly labels) ─────────────────────
 const PIPELINE_STEPS = [
@@ -84,7 +90,7 @@ type FilterTab = 'all' | 'attention' | 'processing' | 'completed';
 
 // ── Main page ────────────────────────────────────────────────────
 export default function NotesPage() {
-  const { notes, nodes, addNote, updateNoteType, setNoteSources, updateNoteStatus, updateNoteTitle, updateNoteBody, deleteNote } = useApp();
+  const { notes, nodes, addNote, updateNoteType, setNoteSources, submitNoteUpdate, updateNoteStatus, deleteNote } = useApp();
   const location = useLocation();
   const navigate = useNavigate();
   const vw = useVW();
@@ -104,8 +110,16 @@ export default function NotesPage() {
   const [newAnalogyTarget, setNewAnalogyTarget] = useState<string | null>(null);
   const [newTargetConcept, setNewTargetConcept] = useState<string | null>(null);
   const [typeError, setTypeError] = useState('');
-  // Existing note switched to "Analogy" but no target picked yet (not saved until picked).
-  const [pendingAnalogyNoteId, setPendingAnalogyNoteId] = useState<string | null>(null);
+  // Analogy about a topic with no note yet (null = picking an existing concept).
+  const [newAnalogyTopic, setNewAnalogyTopic] = useState<string | null>(null);
+  // "Update note" edit session (saved notes are otherwise read-only).
+  const [editing, setEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState('');
+  const [draftBody, setDraftBody] = useState('');
+  const [draftType, setDraftType] = useState<NoteType>('SOURCE_BACKED');
+  const [draftAnalogyTarget, setDraftAnalogyTarget] = useState<string | null>(null);
+  const [submittingUpdate, setSubmittingUpdate] = useState(false);
+  const [updateError, setUpdateError] = useState('');
 
   // Sources: saved ones live on the note (server), pending ones belong to the unsaved new note.
   const [pendingSources, setPendingSources] = useState<PendingSource[]>([]);
@@ -167,8 +181,8 @@ export default function NotesPage() {
 
   const currentNoteType: NoteType = isNewNote
     ? newNoteType
-    : (selectedNote && pendingAnalogyNoteId === selectedNote.id ? 'ANALOGY' : (selectedNote?.noteType ?? 'SOURCE_BACKED'));
-  const currentAnalogyTarget = isNewNote ? newAnalogyTarget : (selectedNote?.analogyTargetId ?? null);
+    : editing ? draftType : (selectedNote?.noteType ?? 'SOURCE_BACKED');
+  const currentAnalogyTarget = isNewNote ? newAnalogyTarget : editing ? draftAnalogyTarget : (selectedNote?.analogyTargetId ?? null);
   const currentSources: SourceView[] = isNewNote
     ? pendingSources.map(p => ({
         id: p.id, kind: p.kind, title: p.title, pending: true, url: p.url,
@@ -225,8 +239,11 @@ export default function NotesPage() {
 
   const handleProcessNew = async () => {
     if (isProcessing) return;
-    if (newNoteType === 'ANALOGY' && !newAnalogyTarget) {
-      setTypeError('Pick the concept this note is an analogy for.');
+    const topic = newAnalogyTopic?.trim() ?? '';
+    if (newNoteType === 'ANALOGY' && !newAnalogyTarget && !topic) {
+      setTypeError(newAnalogyTopic !== null
+        ? 'Type the topic this note is an analogy for.'
+        : 'Pick the concept this note is an analogy for.');
       return;
     }
     setTypeError('');
@@ -235,6 +252,7 @@ export default function NotesPage() {
     const note: Note = {
       id, title: newTitle, body: newBody, status: 'processing', updatedAt: 'Just now',
       noteType: newNoteType, analogyTargetId: newNoteType === 'ANALOGY' ? newAnalogyTarget : null,
+      analogyTargetLabel: newNoteType === 'ANALOGY' && !newAnalogyTarget ? topic : null,
       targetConceptId: newTargetConcept, sources: [],
     };
     const queued = newNoteType === 'USER_DEFINED' ? [] : pendingSources;
@@ -259,19 +277,28 @@ export default function NotesPage() {
     setNoteSources(id, saved);
   };
 
-  const handleReExtract = () => {
+  // Retry processing a note as it is (e.g. after a failure). Resubmits the
+  // current text; nothing changes in the note itself.
+  const handleReExtract = async () => {
     if (!selectedNote || isProcessing) return;
     setExtractedBodies(prev => ({ ...prev, [selectedNote.id]: selectedNote.body }));
     runPipeline(selectedNote.id);
+    try {
+      await submitNoteUpdate(selectedNote.id, { title: selectedNote.title, body: selectedNote.body });
+    } catch (err) {
+      setUpdateError(describeApiError(err, 'Could not retry processing.'));
+    }
   };
 
-  const handleNewNote = (opts?: { title?: string; targetConceptId?: string }) => {
+  const handleNewNote = (opts?: { title?: string; targetConceptId?: string; analogyFor?: { id: string; label: string } }) => {
     setIsNewNote(true);
     setSelectedNoteId(null);
+    setEditing(false);
     setNewTitle(opts?.title ?? 'Untitled Note');
     setNewBody(NEW_NOTE_TEMPLATE);
-    setNewNoteType('SOURCE_BACKED');
-    setNewAnalogyTarget(null);
+    setNewNoteType(opts?.analogyFor ? 'ANALOGY' : 'SOURCE_BACKED');
+    setNewAnalogyTarget(opts?.analogyFor?.id ?? null);
+    setNewAnalogyTopic(null);
     setNewTargetConcept(opts?.targetConceptId ?? null);
     setPendingSources([]);
     setTypeError('');
@@ -285,7 +312,8 @@ export default function NotesPage() {
   const handleSelectNote = (id: string) => {
     setSelectedNoteId(id);
     setIsNewNote(false);
-    setPendingAnalogyNoteId(null);
+    setEditing(false);
+    setUpdateError('');
     setTypeError('');
     if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
     setProcessingNoteId(null);
@@ -426,35 +454,71 @@ export default function NotesPage() {
       if (type !== 'ANALOGY') setNewAnalogyTarget(null);
       return;
     }
-    if (!selectedNote || type === currentNoteType) return;
+    // Saved notes are read-only: the type changes only inside "Update note"
+    // and is applied when the update is submitted.
+    if (!selectedNote || !editing || type === currentNoteType) return;
     if (type === 'USER_DEFINED' && (selectedNote.sources?.length ?? 0) > 0
-        && !window.confirm('A user-defined note has no sources. Remove its sources?')) return;
-    if (type === 'ANALOGY') {
-      // Saved once a target is picked (an analogy needs something to be an analogy OF).
-      setPendingAnalogyNoteId(selectedNote.id);
+        && !window.confirm('A user-defined note has no sources. Its sources will be removed when you save. Continue?')) return;
+    setDraftType(type);
+    if (type !== 'ANALOGY') setDraftAnalogyTarget(null);
+  };
+
+  const handlePickAnalogyTarget = (value: string) => {
+    setTypeError('');
+    if (value === TOPIC_OPTION) {
+      // Analogy about a topic you don't have a note for yet (new notes only).
+      setNewAnalogyTarget(null);
+      setNewAnalogyTopic('');
       return;
     }
-    try {
-      await updateNoteType(selectedNote.id, type);
-      runPipeline(selectedNote.id);
-    } catch (err) {
-      setTypeError(describeApiError(err, 'Could not change the note type.'));
+    if (isNewNote) {
+      setNewAnalogyTopic(null);
+      setNewAnalogyTarget(value || null);
+    } else if (editing) {
+      setDraftAnalogyTarget(value || null);
     }
   };
 
-  const handlePickAnalogyTarget = async (targetId: string | null) => {
+  // ── Update note (the only way a saved note changes) ──
+  const handleStartUpdate = () => {
+    if (!selectedNote || isProcessing) return;
+    setDraftTitle(selectedNote.title);
+    setDraftBody(selectedNote.body);
+    setDraftType(selectedNote.noteType ?? 'SOURCE_BACKED');
+    setDraftAnalogyTarget(selectedNote.analogyTargetId ?? null);
+    setUpdateError('');
     setTypeError('');
-    if (isNewNote) {
-      setNewAnalogyTarget(targetId);
+    setEditing(true);
+  };
+
+  const handleCancelUpdate = () => {
+    setEditing(false);
+    setUpdateError('');
+    setTypeError('');
+  };
+
+  const handleSubmitUpdate = async () => {
+    if (!selectedNote || submittingUpdate) return;
+    if (draftType === 'ANALOGY' && !draftAnalogyTarget) {
+      setTypeError('Pick the concept this note is an analogy for.');
       return;
     }
-    if (!selectedNote || !targetId) return;
+    const typeChanged = draftType !== (selectedNote.noteType ?? 'SOURCE_BACKED')
+      || (draftType === 'ANALOGY' && draftAnalogyTarget !== (selectedNote.analogyTargetId ?? null));
+    const textChanged = draftTitle !== selectedNote.title || draftBody !== selectedNote.body;
+    if (!typeChanged && !textChanged) { setEditing(false); return; }
+    setSubmittingUpdate(true);
+    setUpdateError('');
     try {
-      await updateNoteType(selectedNote.id, 'ANALOGY', targetId);
-      setPendingAnalogyNoteId(null);
+      if (typeChanged) await updateNoteType(selectedNote.id, draftType, draftType === 'ANALOGY' ? draftAnalogyTarget : null);
+      await submitNoteUpdate(selectedNote.id, { title: draftTitle, body: draftBody });
+      setExtractedBodies(prev => ({ ...prev, [selectedNote.id]: draftBody }));
+      setEditing(false);
       runPipeline(selectedNote.id);
     } catch (err) {
-      setTypeError(describeApiError(err, 'Could not save the analogy target.'));
+      setUpdateError(describeApiError(err, 'Could not save your update.'));
+    } finally {
+      setSubmittingUpdate(false);
     }
   };
 
@@ -472,7 +536,8 @@ export default function NotesPage() {
     } else if (learn) {
       const existing = notes.find(n => n.targetConceptId === learn.id || n.conceptIds?.includes(learn.id));
       if (existing) handleSelectNote(existing.id);
-      else handleNewNote({ title: learn.label, targetConceptId: learn.id });
+      // "Write analogy" on an empty analogy node: an analogy note that fills that node.
+      else handleNewNote({ title: learn.label, targetConceptId: learn.id, analogyFor: learn.analogyFor });
     }
     navigate(location.pathname, { replace: true, state: null });
   }, [location.state]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -483,8 +548,10 @@ export default function NotesPage() {
     }
   }, [selectedNote?.id]);
 
-  const currentBody = isNewNote ? newBody : (selectedNote?.body ?? '');
-  const currentTitle = isNewNote ? newTitle : (selectedNote?.title ?? '');
+  const currentBody = isNewNote ? newBody : editing ? draftBody : (selectedNote?.body ?? '');
+  const currentTitle = isNewNote ? newTitle : editing ? draftTitle : (selectedNote?.title ?? '');
+  // Saved notes are read-only until "Update note".
+  const readOnly = !isNewNote && !editing;
   const wc = wordCount(currentBody);
 
   // Show the extraction panel while processing, when done, when a failure needs
@@ -587,7 +654,13 @@ export default function NotesPage() {
               selected={!isNewNote && selectedNoteId === note.id}
               dirty={note.id in extractedBodies && note.body !== extractedBodies[note.id]}
               onSelect={() => handleSelectNote(note.id)}
-              onRename={t => updateNoteTitle(note.id, t)}
+              onRename={t => {
+                // Renaming is an explicit update: saved and re-processed once.
+                if (!t.trim() || t === note.title) return;
+                submitNoteUpdate(note.id, { title: t, body: note.body })
+                  .then(() => runPipeline(note.id))
+                  .catch(err => setUpdateError(describeApiError(err, 'Could not rename the note.')));
+              }}
               onDelete={() => {
                 // Deleting a note also removes its node(s) from your Brain, plus
                 // any locked prerequisites that only it needed.
@@ -632,7 +705,9 @@ export default function NotesPage() {
           )}
           <input
             value={currentTitle}
-            onChange={e => isNewNote ? setNewTitle(e.target.value) : selectedNote && updateNoteTitle(selectedNote.id, e.target.value)}
+            readOnly={readOnly}
+            aria-readonly={readOnly}
+            onChange={e => { if (isNewNote) setNewTitle(e.target.value); else if (editing) setDraftTitle(e.target.value); }}
             placeholder="Note title..."
             style={{
               flex: 1, background: 'none', border: 'none', color: 'var(--text)',
@@ -652,10 +727,10 @@ export default function NotesPage() {
             </button>
           )}
 
-          {!isNewNote && isDirty && !isProcessing && (
+          {editing && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '3px 8px', borderRadius: 5, background: 'rgba(255,150,0,0.1)', border: '1px solid rgba(255,150,0,0.3)', flexShrink: 0 }}>
               <AlertTriangle size={11} style={{ color: 'var(--orange)' }} />
-              <span style={{ fontSize: 11, color: 'var(--orange)', fontWeight: 600 }}>Modified</span>
+              <span style={{ fontSize: 11, color: 'var(--orange)', fontWeight: 600 }}>Editing: processed only when you save</span>
             </div>
           )}
 
@@ -677,22 +752,43 @@ export default function NotesPage() {
             >
               <Puzzle size={13} /> Save to Brain
             </button>
-          ) : isDirty && selectedNote && !isProcessing ? (
-            <button
-              onClick={handleReExtract}
-              style={{
-                padding: '7px 18px', borderRadius: 8, background: 'var(--orange)',
-                color: '#fff', border: 'none', cursor: 'pointer',
-                fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
-                display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0,
-              }}
-            >
-              <RefreshCw size={13} /> Re-extract
-            </button>
+          ) : editing && selectedNote ? (
+            <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+              <button
+                onClick={handleCancelUpdate}
+                disabled={submittingUpdate}
+                style={{
+                  padding: '7px 14px', borderRadius: 8, background: 'var(--bg-input)',
+                  color: 'var(--text-2)', border: '1px solid var(--border)', cursor: 'pointer',
+                  fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
+                }}
+              >Cancel</button>
+              <button
+                onClick={handleSubmitUpdate}
+                disabled={submittingUpdate || draftBody.trim().length < 20}
+                style={{
+                  padding: '7px 18px', borderRadius: 8, background: 'var(--orange)',
+                  color: '#fff', border: 'none', cursor: submittingUpdate ? 'default' : 'pointer',
+                  fontSize: 13, fontWeight: 600, fontFamily: 'inherit', opacity: submittingUpdate ? 0.6 : 1,
+                  display: 'flex', alignItems: 'center', gap: 5,
+                }}
+              >
+                <RefreshCw size={13} /> {submittingUpdate ? 'Saving…' : 'Save update'}
+              </button>
+            </div>
           ) : isProcessing ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--blue)', flexShrink: 0 }}>
               <RefreshCw size={13} style={{ animation: 'spin 1s linear infinite' }} /> Processing…
             </div>
+          ) : selectedNote ? (
+            <button
+              onClick={handleStartUpdate}
+              style={{
+                padding: '7px 16px', borderRadius: 8, background: 'var(--bg-input)',
+                color: 'var(--text)', border: '1px solid var(--border-strong)', cursor: 'pointer',
+                fontSize: 13, fontWeight: 600, fontFamily: 'inherit', flexShrink: 0,
+              }}
+            >✎ Update note</button>
           ) : null}
         </div>
 
@@ -711,7 +807,7 @@ export default function NotesPage() {
                   role="radio"
                   aria-checked={active}
                   title={opt.hint}
-                  disabled={isProcessing}
+                  disabled={isProcessing || (readOnly && !active)}
                   onClick={() => handleChangeNoteType(opt.value)}
                   style={{
                     padding: '4px 10px', borderRadius: 6, border: 'none',
@@ -729,9 +825,9 @@ export default function NotesPage() {
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)' }}>
               Analogy for
               <select
-                value={currentAnalogyTarget ?? ''}
-                onChange={e => handlePickAnalogyTarget(e.target.value || null)}
-                disabled={isProcessing}
+                value={isNewNote && newAnalogyTopic !== null ? TOPIC_OPTION : (currentAnalogyTarget ?? '')}
+                onChange={e => handlePickAnalogyTarget(e.target.value)}
+                disabled={isProcessing || readOnly}
                 style={{
                   padding: '4px 8px', borderRadius: 6, border: '1px solid var(--border-strong)',
                   background: 'var(--bg-input)', color: 'var(--text)', fontSize: 12, fontFamily: 'inherit', maxWidth: 240,
@@ -739,12 +835,32 @@ export default function NotesPage() {
               >
                 <option value="">Choose a concept…</option>
                 {currentAnalogyTarget && !analogyTargets.some(n => n.id === currentAnalogyTarget) && (
-                  <option value={currentAnalogyTarget}>{selectedNote?.analogyTargetLabel ?? 'Current target'}</option>
+                  <option value={currentAnalogyTarget}>
+                    {nodes.find(n => n.id === currentAnalogyTarget)?.label ?? selectedNote?.analogyTargetLabel ?? 'Current target'}
+                  </option>
                 )}
                 {analogyTargets.map(n => <option key={n.id} value={n.id}>{n.label}</option>)}
+                {isNewNote && <option value={TOPIC_OPTION}>+ A topic I don&apos;t have a note for…</option>}
               </select>
             </label>
           )}
+          {currentNoteType === 'ANALOGY' && isNewNote && newAnalogyTopic !== null && (
+            <input
+              autoFocus
+              value={newAnalogyTopic}
+              onChange={e => setNewAnalogyTopic(e.target.value)}
+              placeholder="Topic, e.g. Electricity"
+              aria-label="Topic this analogy is about"
+              style={{
+                padding: '4px 8px', borderRadius: 6, border: '1px solid var(--border-strong)',
+                background: 'var(--bg-input)', color: 'var(--text)', fontSize: 12, fontFamily: 'inherit', width: 200,
+              }}
+            />
+          )}
+          {readOnly && selectedNote && (selectedNote.revisions ?? 0) > 0 && (
+            <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>Updated {selectedNote.revisions}×</span>
+          )}
+          {updateError && <span role="alert" style={{ fontSize: 11, color: 'var(--red)' }}>{updateError}</span>}
           {currentNoteType === 'USER_DEFINED' && (
             <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>Your own understanding. No sources.</span>
           )}
@@ -919,9 +1035,12 @@ export default function NotesPage() {
         <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           <textarea
             value={currentBody}
+            readOnly={readOnly}
+            aria-readonly={readOnly}
+            aria-label={readOnly ? 'Note (read-only, use Update note to change it)' : 'Note'}
             onChange={e => {
               if (isNewNote) setNewBody(e.target.value);
-              else if (selectedNote) updateNoteBody(selectedNote.id, e.target.value);
+              else if (editing) setDraftBody(e.target.value);
             }}
             placeholder="Write what you know..."
             spellCheck={false}

@@ -44,7 +44,9 @@ const SOURCES_SUBQUERY = `
 const SELECT_NOTE = `
   SELECT n.id, n.title, n.body_md AS body, n.ingestion_status,
          n.note_type, n.analogy_target_concept_id, n.target_concept_id,
-         (SELECT canonical_label FROM concepts WHERE id = n.analogy_target_concept_id) AS analogy_target_label,
+         COALESCE((SELECT canonical_label FROM concepts WHERE id = n.analogy_target_concept_id),
+                  n.analogy_target_label) AS analogy_target_label,
+         (SELECT COUNT(*)::int FROM note_revisions r WHERE r.note_id = n.id) AS revisions,
          n.created_at, n.updated_at, ${CONCEPTS_SUBQUERY}, ${SOURCES_SUBQUERY}
   FROM notes n`;
 
@@ -71,6 +73,8 @@ function toApiNote(row) {
     analogy_target_concept_id: row.analogy_target_concept_id || null,
     analogy_target_label: row.analogy_target_label || null,
     target_concept_id: row.target_concept_id || null,
+    // Times this note was updated (each update keeps the replaced text).
+    revisions: row.revisions || 0,
     concepts: row.concepts || [],
     sources: row.sources || [],
     created_at: row.created_at,
@@ -282,6 +286,12 @@ router.post('/', verifyToken, async (req, res) => {
     if (typed.error) return res.status(400).json({ error: typed.error });
     const noteType = typed.noteType || 'SOURCE_BACKED';
     const analogyTarget = noteType === 'ANALOGY' ? (typed.analogyTarget ?? null) : null;
+    // Standalone analogy: a topic with no note yet (ingestion resolves it).
+    const rawTopic = typeof req.body.analogy_target_label === 'string' ? req.body.analogy_target_label.trim().slice(0, 120) : '';
+    const analogyTopic = noteType === 'ANALOGY' && !analogyTarget && rawTopic ? rawTopic : null;
+    if (noteType === 'ANALOGY' && !analogyTarget && !analogyTopic) {
+      return res.status(400).json({ error: 'An analogy note needs the concept or topic it is an analogy for' });
+    }
 
     // "Learn this concept" on a locked node: the note is bound to that exact
     // concept so ingestion promotes it instead of creating a duplicate.
@@ -294,10 +304,10 @@ router.post('/', verifyToken, async (req, res) => {
     }
 
     const result = await db.query(
-      `INSERT INTO notes (id, learner_id, title, body_md, note_type, analogy_target_concept_id, target_concept_id)
-       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, COALESCE($4, ''), $5::note_type, $6, $7)
+      `INSERT INTO notes (id, learner_id, title, body_md, note_type, analogy_target_concept_id, target_concept_id, analogy_target_label)
+       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, COALESCE($4, ''), $5::note_type, $6, $7, $8)
        RETURNING id, body_md`,
-      [noteId, learnerId, title, body, noteType, analogyTarget, targetConcept]
+      [noteId, learnerId, title, body, noteType, analogyTarget, targetConcept, analogyTopic]
     );
 
     const created = result.rows[0];
@@ -336,6 +346,18 @@ router.put('/:id', verifyToken, async (req, res) => {
     let updated;
     try {
       await client.query('BEGIN');
+      // Notes change only through an explicit "Update note" submit. Keep the
+      // text being replaced so the original version can always be viewed.
+      if (title !== undefined || body !== undefined) {
+        await client.query(
+          `INSERT INTO note_revisions (note_id, title, body_md, written_at)
+           SELECT id, title, body_md, updated_at FROM notes
+           WHERE id = $1 AND learner_id = $2
+             AND (($3::text IS NOT NULL AND $3 IS DISTINCT FROM title)
+               OR ($4::text IS NOT NULL AND $4 IS DISTINCT FROM body_md))`,
+          [noteId, learnerId, title ?? null, body ?? null]
+        );
+      }
       // A content change puts the note back in the ingestion queue. A
       // status-only PUT touches nothing but still returns the current note.
       // Leaving ANALOGY clears the analogy target.

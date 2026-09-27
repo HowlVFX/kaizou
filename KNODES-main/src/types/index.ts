@@ -94,6 +94,8 @@ export interface Note {
   /** Locked concept this note was written to unlock ("learn this concept"). */
   targetConceptId?: string | null;
   sources?: NoteSource[];
+  /** Times the note was updated via "Update note". */
+  revisions?: number;
 }
 
 export interface User {
