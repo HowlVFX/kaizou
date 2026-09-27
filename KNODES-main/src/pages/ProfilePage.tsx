@@ -17,6 +17,12 @@ import { Brain, Sun, Moon, LogOut, ChevronRight, Check, X } from '../components/
 const SECTIONS = ['Profile', 'Appearance', 'Learning', 'Account'] as const;
 type Section = typeof SECTIONS[number];
 
+// Profile stats (concepts, connections, recall, the Brain summary) only mean
+// something once there's a small graph to describe, so they stay locked until
+// the learner has this many notes fully ingested into concepts. Settings
+// (name/email, theme, sign-out) are never gated. One knob, easy to retune.
+const PROFILE_UNLOCK_NOTES = 3;
+
 export default function ProfilePage() {
   const { user, theme, setTheme, logout, updateUser, learningPrefs, setLearningPrefs, nodes, edges, notes, isLoggedIn } = useApp();
   const navigate = useNavigate();
@@ -42,6 +48,11 @@ export default function ProfilePage() {
   const reviewCount = nodes.filter(n => n.recall !== null && n.recall < 50).length;
   const vw = useVW();
   const isMobile = vw < 640;
+
+  // Gate on notes that finished ingestion (became concepts), not drafts in flight.
+  const ingestedNotes = notes.filter(n => n.status === 'completed').length;
+  const statsUnlocked = ingestedNotes >= PROFILE_UNLOCK_NOTES;
+  const notesRemaining = Math.max(0, PROFILE_UNLOCK_NOTES - ingestedNotes);
 
   const stats = [
     { label: 'Concepts', value: nodes.filter(n => !n.locked).length },
@@ -78,44 +89,56 @@ export default function ProfilePage() {
         {isMobile && (
           <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 14, marginLeft: 2 }}>Member since {user.memberSince}</div>
         )}
-        {/* Stats grid */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: isMobile ? 8 : 16 }}>
-          {stats.map(({ label, value }) => (
-            <div key={label} style={{
-              textAlign: 'center',
-              background: isMobile ? 'var(--bg-input)' : 'transparent',
-              borderRadius: isMobile ? 10 : 0,
-              padding: isMobile ? '10px 4px' : 0,
-            }}>
-              <div style={{ fontSize: isMobile ? 17 : 20, fontWeight: 700, color: 'var(--text)' }}>{value}</div>
-              <div style={{ fontSize: isMobile ? 10 : 11, color: 'var(--text-dim)', marginTop: 2 }}>{label}</div>
-            </div>
-          ))}
-        </div>
+        {/* Stats grid — unlocked once enough notes are ingested */}
+        {statsUnlocked ? (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: isMobile ? 8 : 16 }}>
+            {stats.map(({ label, value }) => (
+              <div key={label} style={{
+                textAlign: 'center',
+                background: isMobile ? 'var(--bg-input)' : 'transparent',
+                borderRadius: isMobile ? 10 : 0,
+                padding: isMobile ? '10px 4px' : 0,
+              }}>
+                <div style={{ fontSize: isMobile ? 17 : 20, fontWeight: 700, color: 'var(--text)' }}>{value}</div>
+                <div style={{ fontSize: isMobile ? 10 : 11, color: 'var(--text-dim)', marginTop: 2 }}>{label}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <StatsLocked
+            ingested={ingestedNotes}
+            remaining={notesRemaining}
+            target={PROFILE_UNLOCK_NOTES}
+            onAddNote={() => navigate('/notes')}
+            isMobile={isMobile}
+          />
+        )}
       </div>
 
-      {/* Brain shortcut */}
-      <div
-        onClick={() => navigate('/brain')}
-        style={{
-          background: 'linear-gradient(135deg, rgba(88,204,2,0.12), rgba(28,176,246,0.08))',
-          border: '1px solid var(--green)',
-          borderRadius: 12, padding: isMobile ? '12px 16px' : '16px 20px', marginBottom: 16,
-          display: 'flex', alignItems: 'center', gap: 14,
-          cursor: 'pointer', transition: 'opacity 0.15s',
-        }}
-        onMouseEnter={e => (e.currentTarget as HTMLElement).style.opacity = '0.85'}
-        onMouseLeave={e => (e.currentTarget as HTMLElement).style.opacity = '1'}
-      >
-        <span style={{ color: 'var(--green)', display: 'flex' }}><Brain size={isMobile ? 22 : 26} strokeWidth={1.4} /></span>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 600, fontSize: isMobile ? 14 : 15, color: 'var(--text)', marginBottom: 2 }}>Your Brain</div>
-          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-            {nodes.filter(n => !n.locked).length} concepts · {reviewCount} need review
+      {/* Brain shortcut — hidden until stats unlock (there's nothing to summarise yet) */}
+      {statsUnlocked && (
+        <div
+          onClick={() => navigate('/brain')}
+          style={{
+            background: 'linear-gradient(135deg, rgba(88,204,2,0.12), rgba(28,176,246,0.08))',
+            border: '1px solid var(--green)',
+            borderRadius: 12, padding: isMobile ? '12px 16px' : '16px 20px', marginBottom: 16,
+            display: 'flex', alignItems: 'center', gap: 14,
+            cursor: 'pointer', transition: 'opacity 0.15s',
+          }}
+          onMouseEnter={e => (e.currentTarget as HTMLElement).style.opacity = '0.85'}
+          onMouseLeave={e => (e.currentTarget as HTMLElement).style.opacity = '1'}
+        >
+          <span style={{ color: 'var(--green)', display: 'flex' }}><Brain size={isMobile ? 22 : 26} strokeWidth={1.4} /></span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600, fontSize: isMobile ? 14 : 15, color: 'var(--text)', marginBottom: 2 }}>Your Brain</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              {nodes.filter(n => !n.locked).length} concepts · {reviewCount} need review
+            </div>
           </div>
+          <span style={{ color: 'var(--green)', display: 'flex' }}><ChevronRight size={18} /></span>
         </div>
-        <span style={{ color: 'var(--green)', display: 'flex' }}><ChevronRight size={18} /></span>
-      </div>
+      )}
 
       {/* Section nav */}
       <div style={{ display: 'flex', gap: isMobile ? 0 : 4, marginBottom: 20, borderBottom: '1px solid var(--border)', paddingBottom: 0, overflowX: 'auto' }}>
@@ -195,6 +218,59 @@ export default function ProfilePage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ── Locked stats: shown until enough notes are ingested ── */
+function StatsLocked({ ingested, remaining, target, onAddNote, isMobile }: {
+  ingested: number; remaining: number; target: number; onAddNote: () => void; isMobile?: boolean;
+}) {
+  const pct = Math.min(100, Math.round((ingested / target) * 100));
+  return (
+    <div style={{
+      background: 'var(--bg-input)', borderRadius: 12,
+      padding: isMobile ? '18px 16px' : '22px 20px', textAlign: 'center',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12, color: 'var(--text-dim)' }}>
+        <Brain size={isMobile ? 26 : 30} strokeWidth={1.4} />
+      </div>
+      <div style={{ fontSize: isMobile ? 15 : 16, fontWeight: 700, color: 'var(--text)', marginBottom: 6 }}>
+        {remaining === 1
+          ? "Add 1 more note to unlock your profile stats"
+          : `Add ${remaining} more notes to unlock your profile stats`}
+      </div>
+      <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: '0 0 16px', lineHeight: 1.6, maxWidth: 420, marginInline: 'auto' }}>
+        Your concept count, connections and recall appear once Kaizou has turned
+        a few notes into concepts. You have {ingested} of {target} so far.
+      </p>
+
+      {/* Progress bar */}
+      <div style={{ maxWidth: 320, margin: '0 auto 16px' }}>
+        <div style={{ height: 8, background: 'var(--bg-elevated)', borderRadius: 4, overflow: 'hidden' }}>
+          <div style={{ height: '100%', width: `${pct}%`, background: 'linear-gradient(90deg, var(--green), var(--blue))', borderRadius: 4, transition: 'width 0.4s ease' }} />
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'center', gap: 6, marginTop: 8 }}>
+          {Array.from({ length: target }).map((_, i) => (
+            <div key={i} style={{
+              width: 8, height: 8, borderRadius: '50%',
+              background: i < ingested ? 'var(--green)' : 'var(--bg-elevated)',
+              border: `1.5px solid ${i < ingested ? 'var(--green)' : 'var(--border-strong)'}`,
+            }} />
+          ))}
+        </div>
+      </div>
+
+      <button
+        onClick={onAddNote}
+        style={{
+          padding: '10px 20px', borderRadius: 10, background: 'var(--green)', border: 'none',
+          color: '#fff', fontSize: 14, fontWeight: 700, fontFamily: 'inherit', cursor: 'pointer',
+          display: 'inline-flex', alignItems: 'center', gap: 8,
+        }}
+      >
+        Write a note <ChevronRight size={16} />
+      </button>
     </div>
   );
 }
