@@ -11,7 +11,18 @@ function useVW() {
 }
 import { useApp } from '../context/AppContext';
 import type { Note } from '../types';
+import { api, describeApiError } from '../lib/api';
 import { FileText, Network, Link, Puzzle, Brain, RefreshCw, Check, X as XIcon, Search, AlertTriangle } from '../components/Icon';
+
+// Cap appended source text so a huge page can't blow up the note body.
+const MAX_SOURCE_CHARS = 20000;
+
+/** Append extracted source text to a note body under a labelled heading. */
+function appendSource(body: string, label: string, text: string): string {
+  const clean = text.trim().slice(0, MAX_SOURCE_CHARS);
+  const base = body.trimEnd();
+  return `${base}${base ? '\n\n' : ''}## Source: ${label}\n\n${clean}\n`;
+}
 
 // ── Pipeline steps (learner-friendly labels) ─────────────────────
 const PIPELINE_STEPS = [
@@ -89,6 +100,10 @@ export default function NotesPage() {
   const [addingLink, setAddingLink] = useState(false);
   const [linkUrl, setLinkUrl] = useState('');
   const [linkError, setLinkError] = useState('');
+  const [pastingText, setPastingText] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+  const [sourceBusy, setSourceBusy] = useState(false); // fetching a web link
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Mobile results sheet
   const [showMobileResults, setShowMobileResults] = useState(false);
@@ -214,28 +229,92 @@ export default function NotesPage() {
     setLinkUrl('');
   };
 
-  const handleAddLink = () => {
-    if (!linkUrl.trim()) return;
+  // Append extracted source text into the current note body (new or existing).
+  // The appended text becomes part of the note and is ingested normally.
+  const applyToBody = (label: string, text: string): boolean => {
+    if (!text.trim()) return false;
+    if (isNewNote) {
+      setNewBody(prev => appendSource(prev, label, text));
+    } else if (selectedNote) {
+      updateNoteBody(selectedNote.id, appendSource(selectedNote.body, label, text));
+    } else {
+      return false;
+    }
+    return true;
+  };
+
+  const recordSource = (source: Source) => {
+    const noteId = selectedNote?.id ?? 'new';
+    setSources(prev => ({ ...prev, [noteId]: [...(prev[noteId] ?? []), source] }));
+  };
+
+  const closeSourceUi = () => {
+    setShowSourceChooser(false);
+    setAddingLink(false);
+    setPastingText(false);
+    setLinkUrl('');
+    setLinkError('');
+    setPasteText('');
+  };
+
+  // Web link: server fetches + extracts the page text (SSRF-safe), we append it.
+  const handleAddLink = async () => {
+    const raw = linkUrl.trim();
+    if (!raw || sourceBusy) return;
+    const url = raw.startsWith('http') ? raw : 'https://' + raw;
     try {
-      new URL(linkUrl.startsWith('http') ? linkUrl : 'https://' + linkUrl);
+      new URL(url);
     } catch {
       setLinkError("That doesn't look like a valid web address.");
       return;
     }
     setLinkError('');
-    const domain = linkUrl.replace(/^https?:\/\//, '').split('/')[0];
-    const newSource: Source = {
-      id: Date.now().toString(),
-      type: 'link',
-      title: domain,
-      meta: domain,
-      status: 'attached',
-    };
-    const noteId = selectedNote?.id ?? 'new';
-    setSources(prev => ({ ...prev, [noteId]: [...(prev[noteId] ?? []), newSource] }));
-    setLinkUrl('');
-    setAddingLink(false);
-    setShowSourceChooser(false);
+    setSourceBusy(true);
+    try {
+      const res = await api<{ url: string; title?: string; text: string; truncated?: boolean }>(
+        '/api/notes/fetch-source', { method: 'POST', body: { url } },
+      );
+      const domain = (res.title || url.replace(/^https?:\/\//, '').split('/')[0]);
+      if (!applyToBody(domain, res.text)) {
+        setLinkError('Open or create a note first.');
+        return;
+      }
+      recordSource({ id: crypto.randomUUID(), type: 'link', title: domain, meta: res.truncated ? `${domain} · truncated` : domain, status: 'extracted' });
+      closeSourceUi();
+    } catch (err) {
+      setLinkError(describeApiError(err, 'Could not fetch that link.'));
+    } finally {
+      setSourceBusy(false);
+    }
+  };
+
+  // Paste text: append the pasted content directly.
+  const handlePasteConfirm = () => {
+    const text = pasteText.trim();
+    if (!text) return;
+    if (!applyToBody('Pasted text', text)) return;
+    recordSource({ id: crypto.randomUUID(), type: 'paste', title: 'Pasted text', meta: `${wordCount(text)} words`, status: 'extracted' });
+    closeSourceUi();
+  };
+
+  // File upload: read a plain-text / markdown file client-side and append.
+  const handleFilePicked = async (file: File | undefined) => {
+    if (!file) return;
+    const isText = /\.(txt|md|markdown|text)$/i.test(file.name) || file.type.startsWith('text/');
+    if (!isText) {
+      setLinkError('Only .txt or .md files can be read right now.');
+      setShowSourceChooser(true);
+      return;
+    }
+    try {
+      const text = await file.text();
+      if (!applyToBody(file.name, text)) return;
+      recordSource({ id: crypto.randomUUID(), type: 'file', title: file.name, meta: `${wordCount(text)} words`, status: 'extracted' });
+      closeSourceUi();
+    } catch {
+      setLinkError('Could not read that file.');
+      setShowSourceChooser(true);
+    }
   };
 
   const handleRemoveSource = (sourceId: string) => {
@@ -491,7 +570,7 @@ export default function NotesPage() {
               )}
 
               {/* Empty state / add button */}
-              {!showSourceChooser && !addingLink && (
+              {!showSourceChooser && !addingLink && !pastingText && (
                 <button
                   onClick={() => setShowSourceChooser(true)}
                   style={{
@@ -515,32 +594,35 @@ export default function NotesPage() {
                   animation: 'fadeUp 0.15s ease',
                 }}>
                   {[
-                    // File upload and paste-to-source have no ingestion endpoint yet;
-                    // mark them "Soon" rather than presenting dead buttons. Web links
-                    // are kept as session-local reference notes.
-                    { icon: '📄', label: 'Upload file', action: () => {}, soon: true },
-                    { icon: '🔗', label: 'Add web link', action: () => { setAddingLink(true); setShowSourceChooser(false); }, soon: false },
-                    { icon: '📋', label: 'Paste text', action: () => {}, soon: true },
-                  ].map(({ icon, label, action, soon }) => (
+                    // All three append extracted text into the note body, which is
+                    // then ingested normally. File reads .txt/.md client-side; web
+                    // link fetches server-side (SSRF-safe); paste is direct.
+                    { icon: '📄', label: 'Upload file', action: () => fileInputRef.current?.click() },
+                    { icon: '🔗', label: 'Add web link', action: () => { setAddingLink(true); setShowSourceChooser(false); setLinkError(''); } },
+                    { icon: '📋', label: 'Paste text', action: () => { setPastingText(true); setShowSourceChooser(false); setPasteText(''); } },
+                  ].map(({ icon, label, action }) => (
                     <button
                       key={label}
-                      onClick={soon ? undefined : action}
-                      disabled={soon}
-                      title={soon ? 'Coming soon' : undefined}
+                      onClick={action}
                       style={{
                         padding: '7px 12px', borderRadius: 7, border: 'none', background: 'transparent',
-                        color: soon ? 'var(--text-dim)' : 'var(--text-2)', fontSize: 12, fontFamily: 'inherit',
-                        cursor: soon ? 'default' : 'pointer',
+                        color: 'var(--text-2)', fontSize: 12, fontFamily: 'inherit', cursor: 'pointer',
                         display: 'flex', alignItems: 'center', gap: 8, textAlign: 'left',
                         transition: 'background 0.1s',
                       }}
-                      onMouseEnter={e => { if (!soon) (e.currentTarget as HTMLElement).style.background = 'var(--bg-input)'; }}
+                      onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--bg-input)'}
                       onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
                     >
                       <span>{icon}</span> {label}
-                      {soon && <span style={{ marginLeft: 'auto', fontSize: 9, fontWeight: 700, letterSpacing: '0.05em', color: 'var(--text-dim)', border: '1px solid var(--border)', borderRadius: 4, padding: '1px 5px' }}>SOON</span>}
                     </button>
                   ))}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".txt,.md,.markdown,.text,text/plain,text/markdown"
+                    style={{ display: 'none' }}
+                    onChange={e => { handleFilePicked(e.target.files?.[0]); e.currentTarget.value = ''; }}
+                  />
                   <button onClick={() => setShowSourceChooser(false)} style={{ position: 'absolute', top: 6, right: 6, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-dim)', padding: 0, display: 'flex' }}>
                     <XIcon size={12} />
                   </button>
@@ -566,14 +648,45 @@ export default function NotesPage() {
                     />
                     <button
                       onClick={handleAddLink}
-                      style={{ padding: '6px 12px', borderRadius: 7, background: 'var(--blue)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 600, fontFamily: 'inherit' }}
-                    >Add</button>
+                      disabled={sourceBusy}
+                      style={{ padding: '6px 12px', borderRadius: 7, background: 'var(--blue)', color: '#fff', border: 'none', cursor: sourceBusy ? 'default' : 'pointer', opacity: sourceBusy ? 0.6 : 1, fontSize: 12, fontWeight: 600, fontFamily: 'inherit' }}
+                    >{sourceBusy ? 'Fetching…' : 'Add'}</button>
                     <button
                       onClick={() => { setAddingLink(false); setLinkUrl(''); setLinkError(''); }}
                       style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-dim)', display: 'flex', padding: 0 }}
                     ><XIcon size={13} /></button>
                   </div>
                   {linkError && <span style={{ fontSize: 11, color: 'var(--red)' }}>{linkError}</span>}
+                </div>
+              )}
+
+              {/* Paste text input */}
+              {pastingText && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, animation: 'fadeUp 0.15s ease' }}>
+                  <textarea
+                    autoFocus
+                    value={pasteText}
+                    onChange={e => setPasteText(e.target.value)}
+                    placeholder="Paste source text here…"
+                    rows={4}
+                    style={{
+                      width: '100%', padding: '8px 10px', borderRadius: 7,
+                      border: '1px solid var(--border-strong)', background: 'var(--bg-input)',
+                      color: 'var(--text)', fontSize: 12, fontFamily: 'inherit', outline: 'none',
+                      resize: 'vertical', boxSizing: 'border-box',
+                    }}
+                  />
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      onClick={handlePasteConfirm}
+                      disabled={!pasteText.trim()}
+                      style={{ padding: '6px 12px', borderRadius: 7, background: 'var(--blue)', color: '#fff', border: 'none', cursor: pasteText.trim() ? 'pointer' : 'default', opacity: pasteText.trim() ? 1 : 0.6, fontSize: 12, fontWeight: 600, fontFamily: 'inherit' }}
+                    >Add text</button>
+                    <button
+                      onClick={() => { setPastingText(false); setPasteText(''); }}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-dim)', display: 'flex', padding: '6px 0', fontSize: 12, fontFamily: 'inherit' }}
+                    >Cancel</button>
+                  </div>
                 </div>
               )}
             </div>

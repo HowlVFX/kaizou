@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import type { GraphNode } from '../types';
 import { recallStatus, demoNodes } from '../data/demo';
 import { useApp } from '../context/AppContext';
-import { useConceptDetail, formatRelative } from '../lib/concepts';
+import { useConceptDetail, formatRelative, type ConceptDetail } from '../lib/concepts';
 import { Lock, FileText, X as XIcon, Target, RefreshCw, GitMerge, BarChart, Zap } from './Icon';
 
 interface Props {
@@ -230,11 +230,11 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
         )}
 
         {tab === 'depth' && (
-          <DepthTab node={node} rs={rs} />
+          <DepthTab node={node} detail={detail} rs={rs} />
         )}
 
         {tab === 'evidence' && (
-          <EvidenceTab node={node} />
+          <EvidenceTab node={node} detail={detail} />
         )}
       </div>
     </div>
@@ -343,7 +343,7 @@ function OverviewTab({ node, connected, navigate }: { node: GraphNode; connected
 }
 
 /* ── Depth tab ── */
-function DepthTab({ node, rs }: { node: GraphNode; rs: ReturnType<typeof recallStatus> }) {
+function DepthTab({ node, detail, rs }: { node: GraphNode; detail: ConceptDetail | null; rs: ReturnType<typeof recallStatus> }) {
   const [barsFilled, setBarsFilled] = useState(false);
 
   useEffect(() => {
@@ -352,11 +352,19 @@ function DepthTab({ node, rs }: { node: GraphNode; rs: ReturnType<typeof recallS
     return () => clearTimeout(t);
   }, [node.id]);
 
-  if (!node.evidence || node.locked) {
+  // Real concepts source depth from the detail endpoint; demo nodes fall back
+  // to their embedded evidence shape.
+  const evidence = detail?.evidence ?? node.evidence;
+  const process = detail?.process ?? node.process;
+
+  // Honest empty state: only when there is no evidence at all, or every
+  // dimension is zero (learner has no relevant graded attempts).
+  const hasDepth = !!evidence && Object.values(evidence).some(v => (v ?? 0) > 0);
+  if (!hasDepth || node.locked) {
     return <EmptyState label="No depth data available yet" />;
   }
 
-  const entries = Object.entries(node.evidence) as [string, number][];
+  const entries = Object.entries(evidence) as [string, number][];
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -394,16 +402,16 @@ function DepthTab({ node, rs }: { node: GraphNode; rs: ReturnType<typeof recallS
         </div>
       </Section>
 
-      {node.process && node.process.length > 0 && (
+      {process && process.length > 0 && (
         <Section title="Process trace">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
-            {node.process.map((step, i) => (
+            {process.map((step, i) => (
               <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexShrink: 0, paddingTop: 4 }}>
                   <div style={{ width: 20, height: 20, borderRadius: '50%', background: rs.color + '20', border: `1.5px solid ${rs.color}`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, color: rs.color }}>{i + 1}</div>
-                  {i < node.process!.length - 1 && <div style={{ width: 1.5, flex: 1, background: 'var(--border-strong)', minHeight: 20, marginTop: 3 }} />}
+                  {i < process.length - 1 && <div style={{ width: 1.5, flex: 1, background: 'var(--border-strong)', minHeight: 20, marginTop: 3 }} />}
                 </div>
-                <div style={{ paddingBottom: i < node.process!.length - 1 ? 16 : 0, paddingTop: 2 }}>
+                <div style={{ paddingBottom: i < process.length - 1 ? 16 : 0, paddingTop: 2 }}>
                   <span style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.55 }}>{step}</span>
                 </div>
               </div>
@@ -416,8 +424,15 @@ function DepthTab({ node, rs }: { node: GraphNode; rs: ReturnType<typeof recallS
 }
 
 /* ── Evidence tab ── */
-function EvidenceTab({ node }: { node: GraphNode }) {
-  if (!node.assessmentEvidence || node.locked) {
+function EvidenceTab({ node, detail }: { node: GraphNode; detail: ConceptDetail | null }) {
+  // Real concepts source assessment evidence from the detail endpoint; demo
+  // nodes fall back to their embedded shape.
+  const assessment = detail?.assessmentEvidence ?? node.assessmentEvidence;
+
+  // Honest empty state: only when there is no evidence at all, or every
+  // category is 'none' (learner has never attempted any relevant probe).
+  const hasEvidence = !!assessment && Object.values(assessment).some(v => v && v !== 'none');
+  if (!hasEvidence || node.locked) {
     return <EmptyState label="No assessment evidence yet" />;
   }
 
@@ -433,7 +448,7 @@ function EvidenceTab({ node }: { node: GraphNode }) {
     : v === 'developing' ? { icon: '△', color: 'var(--orange)', bg: 'var(--orange)', label: 'Developing' }
     : { icon: '—', color: 'var(--text-dim)', bg: 'var(--text-dim)', label: 'Not yet' };
 
-  const ev = node.assessmentEvidence as Record<string, string>;
+  const ev = assessment as Record<string, string>;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>

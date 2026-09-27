@@ -30,6 +30,7 @@ from app.retrieval.fetcher import FetchBlockedError, FetchTooLargeError, fetch_u
 from app.retrieval.schemas import (
     SearchRequest, SearchResponse, SourceResult,
     FetchRequest, FetchResponse,
+    ExtractTextRequest, ExtractTextResponse,
     ValidateRequest, ValidateResponse,
 )
 from app.retrieval.search import (
@@ -133,6 +134,38 @@ async def fetch(
         source_id=source_id,
         content_sha256=fetched["content_hash"],
         token_count=fetched["token_count"],
+    )
+
+
+@router.post("/extract-text", response_model=ExtractTextResponse)
+async def extract_text(request: ExtractTextRequest):
+    """Fetch a URL and return its cleaned text — no DB write, no concept needed.
+
+    Backs the learner "Add web link" source action: the extracted text is
+    appended to the note body client-side and ingested through the normal
+    note pipeline. Uses the same SSRF-protected fetcher as /fetch.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        fetched = await fetch_url(str(request.url))
+    except FetchBlockedError as e:
+        raise HTTPException(status_code=400, detail=f"URL not allowed: {e}")
+    except FetchTooLargeError as e:
+        raise HTTPException(status_code=413, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch source: {type(e).__name__}")
+
+    text = fetched["content"]
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="No readable text found at that URL")
+    domain = (urlparse(str(request.url)).hostname or "").lower()
+    # fetch_url already caps content at 50k chars; flag if we hit that ceiling.
+    return ExtractTextResponse(
+        url=fetched.get("url") or str(request.url),
+        title=domain,
+        text=text,
+        truncated=len(text) >= 50000,
     )
 
 

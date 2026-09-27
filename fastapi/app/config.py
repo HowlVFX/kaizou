@@ -129,6 +129,12 @@ class Settings(BaseSettings):
     spacing_lambda: float = 1.5                 # λ
     failure_multiplier: float = 0.50            # ρ
     stagnation_kappa: float = 0.60              # κ_s
+    # decay_sensitivity (learner preference) scales the effective half-life at
+    # the READ boundary only — stored memory_states.half_life is never mutated.
+    # Low → slower forgetting (reviews less often); High → faster (reviews sooner).
+    # Standard = 1.0 implicit.
+    decay_sensitivity_low: float = 1.5
+    decay_sensitivity_high: float = 0.67
 
     # Complexity
     complexity_min: float = 0.5

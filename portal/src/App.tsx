@@ -7,6 +7,7 @@ import { LoginPage } from './pages/LoginPage';
 import { OverviewPage } from './pages/OverviewPage';
 import { PopulationPage } from './pages/PopulationPage';
 import { GraderPage } from './pages/GraderPage';
+import { GraderLabelingPage } from './pages/GraderLabelingPage';
 import { MemoryPage } from './pages/MemoryPage';
 import { ProbesPage } from './pages/ProbesPage';
 import { GraphPage } from './pages/GraphPage';
@@ -25,6 +26,7 @@ const App: React.FC = () => {
         <Route index element={<OverviewPage />} />
         <Route path="population" element={<PopulationPage />} />
         <Route path="grader" element={<GraderPage />} />
+        <Route path="grader-labeling" element={<GraderLabelingPage />} />
         <Route path="memory" element={<MemoryPage />} />
         <Route path="probes" element={<ProbesPage />} />
         <Route path="graph" element={<GraphPage />} />

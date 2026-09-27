@@ -19,6 +19,7 @@ from app.memory.decay import (
     update_half_life,
     calculate_initial_half_life,
     classify_recall_colour,
+    decay_factor,
 )
 from app.memory.mastery import (
     calculate_required_streak,
@@ -63,9 +64,11 @@ class MemoryService:
         """Fetch memory state with computed recall probability."""
         async with self._conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """SELECT ms.*, c.c_current AS complexity, c.shape, c.solo_level
+                """SELECT ms.*, c.c_current AS complexity, c.shape, c.solo_level,
+                          l.decay_sensitivity::text AS decay_sensitivity
                    FROM memory_states ms
                    JOIN concepts c ON c.id = ms.concept_id
+                   JOIN learners l ON l.id = ms.learner_id
                    WHERE ms.concept_id = %s AND ms.learner_id = %s""",
                 (concept_id, learner_id),
             )
@@ -75,11 +78,14 @@ class MemoryService:
             return None
 
         state = dict(row)
+        # decay_sensitivity is a per-learner READ lens: scale half-life for the
+        # recall read only, never the stored value (used by update_after_attempt).
+        factor = decay_factor(state.get("decay_sensitivity"), self._s)
         # Compute recall on read (D-21)
         if state.get("last_reviewed"):
             state["recall"] = calculate_recall_probability(
                 state["last_reviewed"],
-                state["half_life"],
+                state["half_life"] * factor,
                 state.get("decay_exempt", False),
             )
             state["never_reviewed"] = False
@@ -324,8 +330,10 @@ class MemoryService:
                        c.status::text AS status, c.probe_eligible,
                        ms.concept_id AS ms_concept_id,
                        ms.half_life, ms.last_reviewed, ms.decay_exempt,
-                       ms.streak, ms.mastered_at
+                       ms.streak, ms.mastered_at,
+                       l.decay_sensitivity::text AS decay_sensitivity
                 FROM concepts c
+                JOIN learners l ON l.id = c.learner_id
                 LEFT JOIN memory_states ms
                        ON ms.concept_id = c.id AND ms.learner_id = c.learner_id
                 WHERE c.learner_id = %s
@@ -336,6 +344,10 @@ class MemoryService:
 
             if not rows:
                 return []
+
+            # Per-learner decay_sensitivity lens for recall reads (stored
+            # half-life is untouched); the queue "due" filter shifts naturally.
+            factor = decay_factor(rows[0].get("decay_sensitivity"), s)
 
             await cur.execute(
                 """
@@ -370,7 +382,7 @@ class MemoryService:
                 recall = 0.0   # never reviewed â†’ due now
             else:
                 recall = calculate_recall_probability(
-                    r["last_reviewed"], r["half_life"], False, now,
+                    r["last_reviewed"], r["half_life"] * factor, False, now,
                 )
             info[cid] = {
                 "concept_id": cid,

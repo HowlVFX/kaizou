@@ -6,6 +6,7 @@ const NAV_ITEMS = [
   { to: '/', label: 'Overview', icon: '📊' },
   { to: '/population', label: 'Population', icon: '👥' },
   { to: '/grader', label: 'Grader', icon: '⚖️' },
+  { to: '/grader-labeling', label: 'Grader QA', icon: '✍️' },
   { to: '/memory', label: 'Memory', icon: '🧠' },
   { to: '/probes', label: 'Probes', icon: '🧪' },
   { to: '/graph', label: 'Graph', icon: '🕸️' },

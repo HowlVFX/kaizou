@@ -1,6 +1,24 @@
 import { useEffect, useState } from 'react';
 import { api, describeApiError } from './api';
 
+export interface ConceptDepth {
+  definition?: number;
+  mechanism?: number;
+  contrast?: number;
+  boundary?: number;
+  application?: number;
+  counterfactual?: number;
+}
+
+export type EvidenceLevel = 'demonstrated' | 'developing' | 'none';
+
+export interface ConceptAssessment {
+  recall?: EvidenceLevel;
+  processTrace?: EvidenceLevel;
+  counterfactual?: EvidenceLevel;
+  transfer?: EvidenceLevel;
+}
+
 export interface ConceptDetail {
   id: string;
   claims: string[];
@@ -14,6 +32,12 @@ export interface ConceptDetail {
   status?: string;
   lastReviewed?: string | null;
   halfLife?: number | null;
+  /** Depth dimensions 0..100 derived from graded attempts (honest zeros). */
+  evidence?: ConceptDepth;
+  /** Assessment categories derived from passed/attempted probe types. */
+  assessmentEvidence?: ConceptAssessment;
+  /** Ordered mechanism steps (process template trunk → claim texts). */
+  process?: string[];
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -39,6 +63,30 @@ function mapDetail(d: any): ConceptDetail {
       related.add(src === d.id ? tgt : src);
     }
   });
+  const evidence: ConceptDepth | undefined = d?.evidence && typeof d.evidence === 'object'
+    ? {
+        definition: Number(d.evidence.definition) || 0,
+        mechanism: Number(d.evidence.mechanism) || 0,
+        contrast: Number(d.evidence.contrast) || 0,
+        boundary: Number(d.evidence.boundary) || 0,
+        application: Number(d.evidence.application) || 0,
+        counterfactual: Number(d.evidence.counterfactual) || 0,
+      }
+    : undefined;
+  const asLevel = (v: unknown): EvidenceLevel =>
+    v === 'demonstrated' || v === 'developing' ? v : 'none';
+  const ae = d?.assessment_evidence;
+  const assessmentEvidence: ConceptAssessment | undefined = ae && typeof ae === 'object'
+    ? {
+        recall: asLevel(ae.recall),
+        processTrace: asLevel(ae.processTrace),
+        counterfactual: asLevel(ae.counterfactual),
+        transfer: asLevel(ae.transfer),
+      }
+    : undefined;
+  const process: string[] = Array.isArray(d?.process)
+    ? d.process.filter((s: unknown): s is string => typeof s === 'string' && s.length > 0)
+    : [];
   return {
     id: d?.id,
     claims,
@@ -49,6 +97,9 @@ function mapDetail(d: any): ConceptDetail {
     status: d?.status,
     lastReviewed: d?.last_reviewed ?? null,
     halfLife: typeof d?.half_life === 'number' ? d.half_life : null,
+    evidence,
+    assessmentEvidence,
+    process,
   };
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */

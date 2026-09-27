@@ -12,7 +12,7 @@ function useVW() {
   }, []);
   return vw;
 }
-import { Brain, Sun, Moon, LogOut, ChevronRight, Check, X } from '../components/Icon';
+import { Brain, Sun, Moon, LogOut, ChevronRight, Check, X, RefreshCw, AlertTriangle, CheckCircle } from '../components/Icon';
 
 const SECTIONS = ['Profile', 'Appearance', 'Learning', 'Account'] as const;
 type Section = typeof SECTIONS[number];
@@ -24,15 +24,41 @@ type Section = typeof SECTIONS[number];
 const PROFILE_UNLOCK_NOTES = 3;
 
 export default function ProfilePage() {
-  const { user, theme, setTheme, logout, updateUser, learningPrefs, setLearningPrefs, nodes, edges, notes, isLoggedIn } = useApp();
+  const { user, theme, setTheme, logout, updateUser, learningPrefs, setLearningPrefs, nodes, edges, notes, isLoggedIn, resetProgress } = useApp();
   const navigate = useNavigate();
   const [activeSection, setActiveSection] = useState<Section>('Profile');
   const [showSignOut, setShowSignOut] = useState(false);
+  const [showReset, setShowReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+  const [resetDone, setResetDone] = useState(false);
   const [totalReviews, setTotalReviews] = useState<number | null>(null);
 
   const handleSignOut = () => {
     logout();
     navigate('/');
+  };
+
+  const closeReset = () => {
+    if (resetting) return;
+    setShowReset(false);
+    setResetError(null);
+  };
+
+  const handleReset = async () => {
+    if (resetting) return;
+    setResetting(true);
+    setResetError(null);
+    try {
+      await resetProgress();
+      setShowReset(false);
+      setResetDone(true);
+      setTimeout(() => setResetDone(false), 2600);
+    } catch (err) {
+      setResetError((err as Error)?.message || 'Could not reset your progress. Try again.');
+    } finally {
+      setResetting(false);
+    }
   };
 
   // Real review count from the analytics activity endpoint (logged-in only).
@@ -171,7 +197,7 @@ export default function ProfilePage() {
       )}
 
       {activeSection === 'Account' && (
-        <AccountSection onSignOut={() => setShowSignOut(true)} />
+        <AccountSection onSignOut={() => setShowSignOut(true)} onReset={() => { setResetError(null); setShowReset(true); }} />
       )}
 
       {showSignOut && (
@@ -216,6 +242,75 @@ export default function ProfilePage() {
               >Sign Out</button>
             </div>
           </div>
+        </div>
+      )}
+
+      {showReset && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
+          }}
+          onClick={closeReset}
+        >
+          <div
+            style={{
+              background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+              borderRadius: 16, padding: 32, maxWidth: 380, width: '90%',
+              animation: 'fadeUp 0.2s ease',
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'center', color: 'var(--orange)', marginBottom: 12 }}>
+              <AlertTriangle size={28} strokeWidth={1.4} />
+            </div>
+            <div style={{ fontWeight: 700, fontSize: 18, color: 'var(--text)', marginBottom: 8, textAlign: 'center' }}>Reset progress?</div>
+            <p style={{ fontSize: 14, color: 'var(--text-muted)', margin: '0 0 24px', lineHeight: 1.6, textAlign: 'center' }}>
+              This clears your recall scores, review history and SOLO levels &mdash; your notes and concepts stay. This can&rsquo;t be undone.
+            </p>
+            {resetError && (
+              <div role="alert" style={{ fontSize: 13, color: 'var(--red)', textAlign: 'center', marginBottom: 16 }}>{resetError}</div>
+            )}
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button
+                onClick={closeReset}
+                disabled={resetting}
+                style={{
+                  flex: 1, padding: '10px', borderRadius: 8,
+                  background: 'var(--bg-input)', border: '1px solid var(--border)',
+                  color: 'var(--text-2)', cursor: resetting ? 'default' : 'pointer',
+                  fontFamily: 'inherit', fontSize: 14, opacity: resetting ? 0.6 : 1,
+                }}
+              >Cancel</button>
+              <button
+                onClick={handleReset}
+                disabled={resetting}
+                style={{
+                  flex: 1, padding: '10px', borderRadius: 8,
+                  background: 'var(--orange)', border: 'none',
+                  color: '#fff', cursor: resetting ? 'default' : 'pointer',
+                  fontFamily: 'inherit', fontSize: 14, fontWeight: 600, opacity: resetting ? 0.8 : 1,
+                }}
+              >{resetting ? 'Resetting…' : 'Reset Progress'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {resetDone && (
+        <div
+          role="status"
+          style={{
+            position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)',
+            background: 'var(--bg-elevated)', border: '1px solid var(--green)',
+            borderRadius: 10, padding: '10px 18px', zIndex: 300,
+            display: 'flex', alignItems: 'center', gap: 8,
+            color: 'var(--text)', fontSize: 14, fontWeight: 600,
+            boxShadow: '0 6px 20px rgba(0,0,0,0.25)', animation: 'fadeUp 0.2s ease',
+          }}
+        >
+          <span style={{ color: 'var(--green)', display: 'flex' }}><CheckCircle size={16} /></span>
+          Progress reset
         </div>
       )}
     </div>
@@ -502,7 +597,7 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
 }
 
 /* ── Account section ── */
-function AccountSection({ onSignOut }: { onSignOut: () => void }) {
+function AccountSection({ onSignOut, onReset }: { onSignOut: () => void; onReset: () => void }) {
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
@@ -551,6 +646,15 @@ function AccountSection({ onSignOut }: { onSignOut: () => void }) {
       </div>
       <div>
         <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--red)', marginBottom: 12 }}>Danger zone</div>
+        <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+          <ActionButton
+            label="Reset Progress"
+            description="Clear recall scores, review history and SOLO levels. Your notes and concepts stay."
+            onClick={onReset}
+            icon={<RefreshCw size={16} />}
+            variant="warn"
+          />
+        </div>
         <button
           onClick={onSignOut}
           style={{
@@ -569,7 +673,7 @@ function AccountSection({ onSignOut }: { onSignOut: () => void }) {
   );
 }
 
-function ActionButton({ label, description, onClick, variant }: { label: string; description: string; onClick: () => void; variant?: 'warn' }) {
+function ActionButton({ label, description, onClick, variant, icon }: { label: string; description: string; onClick: () => void; variant?: 'warn'; icon?: React.ReactNode }) {
   return (
     <button
       onClick={onClick}
@@ -582,7 +686,10 @@ function ActionButton({ label, description, onClick, variant }: { label: string;
       onMouseEnter={e => (e.currentTarget as HTMLElement).style.borderColor = variant === 'warn' ? 'var(--orange)' : 'var(--border-strong)'}
       onMouseLeave={e => (e.currentTarget as HTMLElement).style.borderColor = variant === 'warn' ? 'rgba(255,150,0,0.3)' : 'var(--border)'}
     >
-      <div style={{ fontSize: 13, fontWeight: 600, color: variant === 'warn' ? 'var(--orange)' : 'var(--text-2)', marginBottom: 4 }}>{label}</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: variant === 'warn' ? 'var(--orange)' : 'var(--text-2)', marginBottom: 4 }}>
+        {icon && <span style={{ display: 'flex' }}>{icon}</span>}
+        <span style={{ fontSize: 13, fontWeight: 600 }}>{label}</span>
+      </div>
       <div style={{ fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.5 }}>{description}</div>
     </button>
   );

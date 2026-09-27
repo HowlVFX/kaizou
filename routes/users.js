@@ -5,11 +5,19 @@ const verifyToken = require('../middleware/auth');
 const router = express.Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/; // same rule as routes/auth.js signup
-const PROFILE_COLS = 'id, email, name, role, preferred_language, portal_optin, created_at';
-const UPDATABLE = new Set(['name', 'email', 'preferred_language', 'portal_optin']);
+const PROFILE_COLS = 'id, email, name, role, preferred_language, portal_optin, daily_goal, review_mode, decay_sensitivity, solo_notifications, created_at';
+const UPDATABLE = new Set([
+  'name', 'email', 'preferred_language', 'portal_optin',
+  'daily_goal', 'review_mode', 'decay_sensitivity', 'solo_notifications',
+]);
+
+// Learning-preference enums (must match migration 005 / schema.sql).
+const REVIEW_MODES = new Set(['Understand', 'Abstract']);
+const DECAY_SENSITIVITIES = new Set(['Low', 'Standard', 'High']);
 
 // 1. GET CURRENT USER PROFILE
-// Response: { id, email, name, role, preferred_language, portal_optin, created_at }
+// Response: { id, email, name, role, preferred_language, portal_optin,
+//             daily_goal, review_mode, decay_sensitivity, solo_notifications, created_at }
 router.get('/me', verifyToken, async (req, res) => {
   try {
     // Fetch the user, but intentionally exclude password_hash for security
@@ -26,7 +34,8 @@ router.get('/me', verifyToken, async (req, res) => {
 });
 
 // 2. UPDATE CURRENT USER PROFILE
-// Body: any subset of { name, email, preferred_language, portal_optin }.
+// Body: any subset of { name, email, preferred_language, portal_optin,
+//                       daily_goal, review_mode, decay_sensitivity, solo_notifications }.
 // Unknown fields (including role/id) -> 400 listing them; nothing is written.
 // Response: { message, learner: <same shape as GET /me> }
 router.put('/me', verifyToken, async (req, res) => {
@@ -72,6 +81,30 @@ router.put('/me', verifyToken, async (req, res) => {
     }
     set('portal_optin', body.portal_optin);
   }
+  if (body.daily_goal !== undefined) {
+    if (typeof body.daily_goal !== 'number' || !Number.isInteger(body.daily_goal) || body.daily_goal < 1 || body.daily_goal > 50) {
+      return res.status(400).json({ error: 'daily_goal must be an integer between 1 and 50' });
+    }
+    set('daily_goal', body.daily_goal);
+  }
+  if (body.review_mode !== undefined) {
+    if (typeof body.review_mode !== 'string' || !REVIEW_MODES.has(body.review_mode)) {
+      return res.status(400).json({ error: "review_mode must be 'Understand' or 'Abstract'" });
+    }
+    set('review_mode', body.review_mode);
+  }
+  if (body.decay_sensitivity !== undefined) {
+    if (typeof body.decay_sensitivity !== 'string' || !DECAY_SENSITIVITIES.has(body.decay_sensitivity)) {
+      return res.status(400).json({ error: "decay_sensitivity must be 'Low', 'Standard' or 'High'" });
+    }
+    set('decay_sensitivity', body.decay_sensitivity);
+  }
+  if (body.solo_notifications !== undefined) {
+    if (typeof body.solo_notifications !== 'boolean') {
+      return res.status(400).json({ error: 'solo_notifications must be a boolean' });
+    }
+    set('solo_notifications', body.solo_notifications);
+  }
 
   try {
     const learnerId = req.user.id;
@@ -110,6 +143,78 @@ router.put('/me', verifyToken, async (req, res) => {
     }
     console.error('Error updating profile:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 3. RESET PROGRESS
+// Clears the learner's RECALL/MEMORY progress without deleting their notes or
+// concepts. Resets memory_states to a fresh state, deletes graded history
+// (attempts + their misconception/capability events) and rolls concept
+// progress-derived fields (solo_level, c_current) back to their initial values.
+// Canonical content — labels, claims, edges, track/shape/category, notes — is
+// left untouched. All writes run in a single transaction.
+// Response: { message, cleared: { memory_states, attempts, concepts_reset } }
+router.post('/me/reset-progress', verifyToken, async (req, res) => {
+  const learnerId = req.user.id;
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    // Graded history first (children before parents): capability_events and
+    // misconception_events reference attempts, so delete them ahead of attempts.
+    await client.query('DELETE FROM capability_events WHERE learner_id = $1', [learnerId]);
+    await client.query('DELETE FROM misconception_events WHERE learner_id = $1', [learnerId]);
+    const attemptsResult = await client.query('DELETE FROM attempts WHERE learner_id = $1', [learnerId]);
+
+    // Reset memory scheduling state. half_life goes back to the concept's
+    // initial h_0 = 1/C (using c_0, the concept's initial capacity); fall back
+    // to the schema default of 1.0 when c_0 is missing or zero.
+    const memoryResult = await client.query(
+      `UPDATE memory_states ms
+          SET half_life = COALESCE(1.0 / NULLIF(c.c_0, 0), 1.0),
+              last_reviewed = NULL,
+              streak = 0,
+              attempts = 0,
+              passes = 0,
+              decay_exempt = false,
+              mastered_at = NULL,
+              stagnation_clock = 0
+         FROM concepts c
+        WHERE ms.concept_id = c.id
+          AND ms.learner_id = $1`,
+      [learnerId]
+    );
+
+    // Roll concept progress-derived fields back to their initial values.
+    // Canonical fields (label, track, shape, category, claims, edges) are not touched.
+    const conceptsResult = await client.query(
+      `UPDATE concepts
+          SET solo_level = 'Prestructural',
+              c_current = c_0
+        WHERE learner_id = $1`,
+      [learnerId]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      message: 'Progress reset successfully',
+      cleared: {
+        memory_states: memoryResult.rowCount,
+        attempts: attemptsResult.rowCount,
+        concepts_reset: conceptsResult.rowCount,
+      },
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Error rolling back reset-progress:', rollbackError);
+    }
+    console.error('Error resetting progress:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 

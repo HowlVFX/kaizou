@@ -179,3 +179,45 @@ export interface EvaluationResponse extends PrivacyEnvelope {
 
 export type ExportReport = 'learner-data' | 'anonymised-metrics';
 export type ExportFormat = 'json' | 'csv';
+
+// --- Grader QA / Cohen's kappa labelling (routes/management/grader.js) ------
+
+/** One graded attempt sampled for a human rater to label. */
+export interface GraderSampleAttempt {
+  attempt_id: string;
+  probe_type: string;
+  machine_band: string;
+  answer_text: string;
+  answer_truncated: boolean;
+  concept_label: string;
+  has_label: boolean;
+}
+
+export interface GraderLabelsSample extends PrivacyEnvelope {
+  bands: string[];
+  attempts: GraderSampleAttempt[];
+}
+
+/** The persisted gold label returned by POST /grader/labels. */
+export interface GraderLabel {
+  id: string;
+  attempt_id: string;
+  human_band: string;
+  rater: string;
+  note: string | null;
+  created_at: string;
+}
+
+export interface GraderLabelResponse extends PrivacyEnvelope {
+  label: GraderLabel;
+}
+
+export interface GraderAgreement extends PrivacyEnvelope {
+  live: {
+    cohens_kappa: number | null;
+    n: number;
+    rater: string;
+  };
+  /** Canonical population value written by the aggregates job; null until computed. */
+  published: AggregateMetric | null;
+}

@@ -85,6 +85,29 @@ def calculate_recall_probability(
     return 2.0 ** (-delta_days / half_life_days)
 
 
+def decay_factor(sensitivity: Optional[str], settings=None) -> float:
+    """Map a learner's decay_sensitivity preference to a half-life multiplier.
+
+    Applied at the READ boundary only (get_memory_state / get_review_queue):
+    the stored half-life is scaled to an *effective* half-life so recall reads
+    fade faster or slower without ever mutating memory_states.half_life.
+
+        Low      → ×settings.decay_sensitivity_low   (slower forgetting)
+        Standard → ×1.0                               (canonical)
+        High     → ×settings.decay_sensitivity_high  (faster forgetting)
+
+    Unknown / None → 1.0 (Standard).
+    """
+    if settings is None:
+        from app.config import get_settings
+        settings = get_settings()
+    if sensitivity == "Low":
+        return settings.decay_sensitivity_low
+    if sensitivity == "High":
+        return settings.decay_sensitivity_high
+    return 1.0
+
+
 def calculate_initial_half_life(complexity: float) -> float:
     """Compute the initial half-life h_0 = 1 day / C (§5.17.2).
 

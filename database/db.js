@@ -34,6 +34,9 @@ pool.on('error', (err) => {
 });
 
 // We export a simple query method that we will use in all our route handlers.
+// `getClient` hands out a pooled client for multi-statement transactions
+// (BEGIN/COMMIT/ROLLBACK); callers must always release() it when done.
 module.exports = {
   query: (text, params) => pool.query(text, params),
+  getClient: () => pool.connect(),
 };

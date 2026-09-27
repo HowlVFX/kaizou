@@ -21,6 +21,8 @@ CREATE TYPE cluster_status AS ENUM ('ACTIVE', 'ARCHIVED');
 CREATE TYPE job_status AS ENUM ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED');
 CREATE TYPE learner_role AS ENUM ('learner', 'admin');
 CREATE TYPE capability_event_type AS ENUM ('SOLO_ADVANCE', 'PERTURBATION_PASS', 'TRANSFER_PASS', 'MASTERY');
+CREATE TYPE review_mode AS ENUM ('Understand', 'Abstract');
+CREATE TYPE decay_sensitivity AS ENUM ('Low', 'Standard', 'High');
 
 -- Tables
 
@@ -32,6 +34,11 @@ CREATE TABLE learners (
     role learner_role DEFAULT 'learner',
     preferred_language VARCHAR(10) DEFAULT 'en',
     portal_optin BOOLEAN DEFAULT false,
+    -- Learning preferences (migration 005). decay_sensitivity feeds the memory scheduler.
+    daily_goal INTEGER NOT NULL DEFAULT 10,
+    review_mode review_mode NOT NULL DEFAULT 'Understand',
+    decay_sensitivity decay_sensitivity NOT NULL DEFAULT 'Standard',
+    solo_notifications BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -2,6 +2,7 @@ const express = require('express');
 const db = require('../database/db');
 const verifyToken = require('../middleware/auth');
 const { scheduleIngestion, cancelIngestion } = require('./ingest-trigger');
+const { fastapi, sendFastApiError } = require('../services/fastapi');
 
 const router = express.Router();
 
@@ -186,6 +187,25 @@ router.delete('/:id', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Error deleting note:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/notes/fetch-source { url } -> { url, title, text, truncated }
+// Server-side fetch of a web page's readable text (browsers can't fetch
+// cross-origin, and this reuses FastAPI's SSRF-protected fetcher). The client
+// appends the returned text into the note body; ingestion then runs normally.
+// No DB write here. FastAPI statuses (400 blocked, 413 too large, 422 empty,
+// 502 fetch failed, 503 down) pass straight through.
+router.post('/fetch-source', verifyToken, async (req, res) => {
+  const url = req.body && typeof req.body.url === 'string' ? req.body.url.trim() : '';
+  if (!url || !/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ error: 'A valid http(s) URL is required' });
+  }
+  try {
+    const response = await fastapi.post('/retrieval/extract-text', { url });
+    res.json(response.data);
+  } catch (err) {
+    sendFastApiError(res, err, 'Could not fetch that link');
   }
 });
 

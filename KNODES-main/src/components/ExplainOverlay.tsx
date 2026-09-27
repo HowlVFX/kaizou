@@ -135,7 +135,16 @@ export default function ExplainOverlay({ node: baseNode, onClose, onBack }: Prop
   const pool = isLoggedIn ? graphNodes : demoNodes;
   const poolEdges = isLoggedIn ? graphEdges : demoEdges;
   const node: GraphNode = detail
-    ? { ...baseNode, claims: detail.claims, prerequisites: detail.prerequisites, related: detail.related }
+    ? {
+        ...baseNode,
+        claims: detail.claims,
+        prerequisites: detail.prerequisites,
+        related: detail.related,
+        // Real depth/assessment/process from the graded-attempts endpoint.
+        evidence: detail.evidence ?? baseNode.evidence,
+        assessmentEvidence: detail.assessmentEvidence ?? baseNode.assessmentEvidence,
+        process: detail.process ?? baseNode.process,
+      }
     : baseNode;
   const rs = recallStatus(node.recall);
   const { prereqs, related, dependents } = getRelationships(node, pool, poolEdges, detail?.dependents);
@@ -154,7 +163,11 @@ export default function ExplainOverlay({ node: baseNode, onClose, onBack }: Prop
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  const entries = node.evidence ? Object.entries(node.evidence) as [string, number][] : [];
+  // Only show depth bars when there is real signal (any dimension > 0);
+  // an all-zero evidence object means the learner has no graded attempts yet.
+  const entries = node.evidence && Object.values(node.evidence).some(v => (v ?? 0) > 0)
+    ? (Object.entries(node.evidence) as [string, number][])
+    : [];
 
   if (isMobile) {
     return (
@@ -510,7 +523,7 @@ export default function ExplainOverlay({ node: baseNode, onClose, onBack }: Prop
             )}
 
             {/* Assessment evidence summary */}
-            {node.assessmentEvidence && (
+            {node.assessmentEvidence && Object.values(node.assessmentEvidence).some(v => v && v !== 'none') && (
               <Section title="Assessment evidence">
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 7 }}>
                   {(Object.entries(node.assessmentEvidence) as [string, string][]).map(([key, val]) => {

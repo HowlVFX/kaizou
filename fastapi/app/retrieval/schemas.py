@@ -39,6 +39,17 @@ class FetchResponse(BaseModel):
     token_count: int
 
 
+class ExtractTextRequest(BaseModel):
+    url: str
+
+
+class ExtractTextResponse(BaseModel):
+    url: str          # final URL after redirects
+    title: str = ""   # domain (we don't parse <title> here)
+    text: str         # cleaned, extracted page text
+    truncated: bool = False
+
+
 class ValidateRequest(BaseModel):
     note_id: UUID
     source_id: UUID

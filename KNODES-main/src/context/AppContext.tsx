@@ -29,6 +29,7 @@ interface AppContextType extends AppState {
   setLearningPrefs: (prefs: Partial<LearningPrefs>) => void;
   refreshGraph: () => void;
   refreshNotes: () => void;
+  resetProgress: () => Promise<void>;
   graphStatus: LoadStatus;
   graphError: string | null;
   clusters: MasterCluster[];
@@ -63,6 +64,33 @@ function mapNote(n: any): Note {
     concepts,
     updatedAt: ts ? new Date(ts).toLocaleDateString() : '',
   };
+}
+
+const REVIEW_MODES = ['Understand', 'Abstract'] as const;
+const DECAY_SENSITIVITIES = ['Low', 'Standard', 'High'] as const;
+
+/** Server profile fields (snake_case) → LearningPrefs, ignoring anything invalid. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapLearningPrefs(data: any, fallback: LearningPrefs): LearningPrefs {
+  const dailyGoal = Number(data?.daily_goal);
+  const reviewMode = data?.review_mode;
+  const decaySensitivity = data?.decay_sensitivity;
+  return {
+    dailyGoal: Number.isInteger(dailyGoal) && dailyGoal >= 1 && dailyGoal <= 50 ? dailyGoal : fallback.dailyGoal,
+    reviewMode: (REVIEW_MODES as readonly string[]).includes(reviewMode) ? reviewMode : fallback.reviewMode,
+    decaySensitivity: (DECAY_SENSITIVITIES as readonly string[]).includes(decaySensitivity) ? decaySensitivity : fallback.decaySensitivity,
+    soloNotifications: typeof data?.solo_notifications === 'boolean' ? data.solo_notifications : fallback.soloNotifications,
+  };
+}
+
+/** LearningPrefs (camelCase) → server profile fields (snake_case). Only the given keys. */
+function prefsToServer(prefs: Partial<LearningPrefs>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (prefs.dailyGoal !== undefined) out.daily_goal = prefs.dailyGoal;
+  if (prefs.reviewMode !== undefined) out.review_mode = prefs.reviewMode;
+  if (prefs.decaySensitivity !== undefined) out.decay_sensitivity = prefs.decaySensitivity;
+  if (prefs.soloNotifications !== undefined) out.solo_notifications = prefs.soloNotifications;
+  return out;
 }
 
 const SOLO_LEVELS = ['Prestructural', 'Unistructural', 'Multistructural', 'Relational', 'Extended Abstract'] as const;
@@ -280,6 +308,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           ? new Date(data.created_at).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
           : '';
         setUser({ name, email: data.email || '', memberSince, avatarInitial: name.charAt(0).toUpperCase() });
+        setLearningPrefsState(prev => mapLearningPrefs(data, prev));
       })
       .catch(err => console.error('Failed to fetch profile:', describeApiError(err)));
 
@@ -400,19 +429,45 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  /** Optimistically updates local prefs and persists the changed fields to the
+   *  profile; on failure it reverts to the previous values and surfaces the error. */
   const setLearningPrefs = useCallback((prefs: Parameters<AppContextType['setLearningPrefs']>[0]) => {
-    setLearningPrefsState(prev => ({ ...prev, ...prefs }));
+    const body = prefsToServer(prefs);
+    if (Object.keys(body).length === 0) return;
+    let snapshot: LearningPrefs | null = null;
+    setLearningPrefsState(prev => {
+      snapshot = prev;
+      return { ...prev, ...prefs };
+    });
+    api('/api/users/me', { method: 'PUT', body })
+      .catch(err => {
+        console.error('Failed to save learning preferences:', describeApiError(err));
+        if (snapshot) setLearningPrefsState(snapshot);
+      });
   }, []);
 
   const refreshGraph = useCallback(() => { fetchGraph(); }, [fetchGraph]);
   const refreshNotes = useCallback(() => { fetchNotes(); }, [fetchNotes]);
+
+  /** Clears recall scores, review history and SOLO levels on the server, then
+   *  reloads the graph and notes so the UI reflects the fresh state. Notes and
+   *  concepts themselves are preserved. Rejects with a friendly message. */
+  const resetProgress = useCallback(async () => {
+    try {
+      await api('/api/users/me/reset-progress', { method: 'POST' });
+    } catch (err) {
+      throw new Error(describeApiError(err, 'Could not reset your progress. Try again.'));
+    }
+    fetchGraph();
+    fetchNotes();
+  }, [fetchGraph, fetchNotes]);
 
   return (
     <AppContext.Provider value={{
       isLoggedIn, theme, user, nodes, edges, notes, learningPrefs,
       graphStatus, graphError, clusters, clustersStatus,
       login, logout, setTheme, addNote, updateNoteStatus, updateNoteTitle, updateNoteBody, deleteNote, updateUser, setLearningPrefs,
-      refreshGraph, refreshNotes,
+      refreshGraph, refreshNotes, resetProgress,
     }}>
       {children}
     </AppContext.Provider>
