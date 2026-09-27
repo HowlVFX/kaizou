@@ -292,6 +292,8 @@ class IngestionService:
                     # Placeholder labels are included so the model reuses them.
                     [c["label"] for c in prereq_pool],
                     concept_label=title,
+                    # Prerequisites stay at the note's own level band.
+                    bloom_level=classification.bloom_level,
                 )
             prereq_ids, placeholders_created = await self._resolve_prerequisites(
                 learner_id, prereq_labels, prereq_pool,

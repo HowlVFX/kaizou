@@ -32,8 +32,43 @@ CLAIMS_SCHEMA = strict_object({
 })
 
 PREREQUISITES_SCHEMA = strict_object({
-    "prerequisites": {"type": "array", "items": {"type": "string"}},
+    "prerequisites": {
+        "type": "array",
+        "items": strict_object({
+            "label": {"type": "string"},
+            # The level a learner must be at to understand this prerequisite.
+            "level": {"type": "string", "enum": ["young_child", "school", "university", "expert"]},
+        }),
+    },
 })
+
+# Prerequisite level bands, lowest first. A note's band caps which
+# prerequisites it may create: a young child's note never gets "Cell biology".
+PREREQ_LEVELS = ("young_child", "school", "university", "expert")
+PREREQ_LEVEL_TEXT = {
+    "young_child": "a young child (everyday ideas like sunlight, water, food, sugar)",
+    "school": "a school student (basic school-level ideas)",
+    "university": "a university student",
+    "expert": "a specialist",
+}
+# Fewer, simpler prerequisites for simpler notes.
+PREREQ_MAX_BY_LEVEL = {"young_child": 2, "school": 3, "university": 4, "expert": 5}
+_READING_TO_BAND = {"very simple": 0, "simple": 1, "standard": 2, "technical": 3}
+
+
+def note_level_band(text: str, bloom_level: float | None = None) -> str:
+    """The level band a note is written at, from its reading level (sentence
+    and word length) and, when known, its Bloom level. Deterministic.
+
+    Bloom >= 1.5 (application/synthesis) raises the band by one, but never
+    for a very simply written note: a child applying an idea is still a child.
+    """
+    from app.probes.style import reading_level
+
+    band = _READING_TO_BAND[reading_level(text)]
+    if bloom_level is not None and bloom_level >= 1.5 and band >= 1:
+        band = min(band + 1, len(PREREQ_LEVELS) - 1)
+    return PREREQ_LEVELS[band]
 
 EMBEDDED_ANALOGY_SCHEMA = strict_object({
     "has_analogy": {"type": "boolean"},
@@ -120,16 +155,18 @@ Rules:
 - When an existing concept label below fits, return that label exactly.
 - Otherwise return a short canonical concept name (2-5 words, no explanation).
 - Do not list "{label}" itself or concepts the text merely mentions in passing.
-- Stay at the level the text is written at. Only list ideas the learner would genuinely need to already understand to follow THIS text as written; never list advanced or broad topics the text does not rely on.
+- The learner writes at the level of {note_level}. Only list ideas that person would genuinely need to already understand to follow THIS text as written, and that they could actually learn next. Never list advanced or broad topics the text does not rely on (a child's note about plants needs "Sunlight", not "Cell biology").
+- Name each prerequisite in words that learner would use.
+- For each one, set "level" to who could understand it: young_child, school, university or expert.
 - Return an empty list if the text needs no prior knowledge.
 
-Return JSON: {"prerequisites": ["concept_label_1", "concept_label_2"]}
+Return JSON: {"prerequisites": [{"label": "concept_label_1", "level": "school"}]}
 
 Existing concepts: {concepts}"""
 
     # Cache variant for prerequisite extraction so it never shares an entry
     # with another generation call on the same text.
-    PREREQ_VARIANT = "prerequisites-v2"
+    PREREQ_VARIANT = "prerequisites-v3"
     MAX_PREREQUISITES = 5
 
     def __init__(self, client: GenerationClient | None = None, *, conn=None):
@@ -160,14 +197,20 @@ Existing concepts: {concepts}"""
 
     async def extract_prerequisites(
         self, text: str, existing_concepts: list[str], concept_label: str = "",
+        bloom_level: float | None = None,
     ) -> list[str]:
-        """Extract prerequisite concept labels from text.
+        """Extract prerequisite concept labels from text, at the note's level.
 
         Labels may name existing concepts or new ones; the caller resolves
         them (existing concept or UNRESOLVED_PREREQUISITE placeholder).
+        Prerequisites rated above the note's level band are dropped, and
+        simpler notes get fewer of them.
         """
         if not text.strip():
             return []
+        band = note_level_band(text, bloom_level)
+        max_rank = PREREQ_LEVELS.index(band)
+        max_items = min(self.MAX_PREREQUISITES, PREREQ_MAX_BY_LEVEL[band])
 
         # Sorted so the prompt (and so the cache key) is stable for the same graph.
         concepts_str = ", ".join(sorted(set(existing_concepts))[:100]) or "(none)"
@@ -177,7 +220,8 @@ Existing concepts: {concepts}"""
             self.PREREQ_PROMPT
             .replace("{concepts}", concepts_str)
             .replace("{label}", label)
-            .replace("{max_items}", str(self.MAX_PREREQUISITES))
+            .replace("{max_items}", str(max_items))
+            .replace("{note_level}", PREREQ_LEVEL_TEXT[band])
         )
 
         result = await self._client.generate_structured(
@@ -190,6 +234,12 @@ Existing concepts: {concepts}"""
         out: list[str] = []
         seen: set[str] = set()
         for p in result.data.get("prerequisites", []):
+            if isinstance(p, dict):
+                lvl = p.get("level")
+                if lvl in PREREQ_LEVELS and PREREQ_LEVELS.index(lvl) > max_rank:
+                    logger.info("Dropped prerequisite %r (%s) above note level %s", p.get("label"), lvl, band)
+                    continue
+                p = p.get("label")
             if not isinstance(p, str):
                 continue
             cleaned = " ".join(p.split())[:120]
@@ -198,7 +248,7 @@ Existing concepts: {concepts}"""
                 continue
             seen.add(key)
             out.append(cleaned)
-        return out[: self.MAX_PREREQUISITES]
+        return out[:max_items]
 
     ANALOGY_PROMPT = """A learner wrote a note about "{label}". Decide whether the note explains "{label}" through an analogy or comparison to something else (e.g. "the leaf is like a kitchen").
 

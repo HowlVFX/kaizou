@@ -80,7 +80,7 @@ class FakeExtractor:
     async def extract_claims(self, text, shape="DEFINITION"):
         return [ExtractedClaim(text=t, order_index=i) for i, t in enumerate(self.claims.get(text, []))]
 
-    async def extract_prerequisites(self, text, existing_concepts, concept_label=""):
+    async def extract_prerequisites(self, text, existing_concepts, concept_label="", bloom_level=None):
         self.prereq_calls.append((text, list(existing_concepts), concept_label))
         return list(self.prereqs.get(text, []))
 
@@ -495,4 +495,28 @@ def test_extract_prerequisites_prompt_variant_and_filtering():
         assert gen.kwargs["variant"] == ClaimExtractor.PREREQ_VARIANT
         assert '"Hoisting"' in gen.kwargs["system"] and "(none)" in gen.kwargs["system"]
         assert "{concepts}" not in gen.kwargs["system"]
+    asyncio.run(run())
+
+
+def test_prerequisites_are_capped_at_the_notes_level():
+    from app.ingestion.extractor import note_level_band
+    kid = ("Plants make their own food. They use sunlight, water and air to do it. "
+           "The food they make is sugar. The green stuff in leaves catches the sunlight.")
+    tech = ("Photosynthesis is a biochemical process whereby photoautotrophic organisms convert "
+            "electromagnetic radiation into chemical energy via the Calvin-Benson cycle.")
+    assert note_level_band(kid) == "young_child"
+    assert note_level_band(kid, bloom_level=2.0) == "young_child"   # a child applying an idea is still a child
+    assert note_level_band(tech) == "expert"
+
+    async def run():
+        gen = FakeGen({"prerequisites": [
+            {"label": "Sunlight", "level": "young_child"},
+            {"label": "Cell biology", "level": "university"},
+            {"label": "Adenosine triphosphate", "level": "expert"},
+            {"label": "Sugar", "level": "young_child"},
+            {"label": "Water", "level": "young_child"},
+        ]})
+        out = await ClaimExtractor(client=gen).extract_prerequisites(kid, [], concept_label="Plant food")
+        assert out == ["Sunlight", "Sugar"]          # above-level dropped, capped at 2 for a child
+        assert "a young child" in gen.kwargs["system"]
     asyncio.run(run())
