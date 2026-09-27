@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
-import { api } from '../lib/api';
+import { api, describeApiError } from '../lib/api';
 
 function useVW() {
   const [vw, setVw] = useState(window.innerWidth);
@@ -503,21 +503,51 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
 
 /* ── Account section ── */
 function AccountSection({ onSignOut }: { onSignOut: () => void }) {
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  // Real export: pull the learner's graph, notes and concepts from the API.
+  const handleExport = async () => {
+    if (exporting) return;
+    setExporting(true);
+    setExportError(null);
+    try {
+      const [graph, notes, concepts] = await Promise.all([
+        api<unknown>('/api/graph'),
+        api<unknown>('/api/notes'),
+        api<unknown>('/api/concepts'),
+      ]);
+      const payload = { exportedAt: new Date().toISOString(), source: 'Kaizou', graph, notes, concepts };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `kaizou-brain-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(describeApiError(err, 'Could not export your Brain. Try again.'));
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
       <div>
         <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-2)', marginBottom: 12 }}>Data</div>
         <div style={{ display: 'flex', gap: 10 }}>
-          <ActionButton label="Export Brain" description="Download your knowledge graph as JSON" onClick={() => {
-            const data = JSON.stringify({ exportedAt: new Date().toISOString(), source: 'KNODES' }, null, 2);
-            const blob = new Blob([data], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url; a.download = 'knodes-brain.json'; a.click();
-            URL.revokeObjectURL(url);
-          }} />
-          <ActionButton label="Reset Progress" description="Clear all recall scores" onClick={() => alert('Reset would clear all recall scores. (Demo — no permanent effect)')} variant="warn" />
+          <ActionButton
+            label={exporting ? 'Exporting…' : 'Export Brain'}
+            description="Download your concepts, notes and graph as JSON"
+            onClick={handleExport}
+          />
         </div>
+        {exportError && (
+          <div role="alert" style={{ marginTop: 8, fontSize: 12, color: 'var(--red)' }}>{exportError}</div>
+        )}
       </div>
       <div>
         <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--red)', marginBottom: 12 }}>Danger zone</div>

@@ -93,11 +93,11 @@ export default function NotesPage() {
   // Mobile results sheet
   const [showMobileResults, setShowMobileResults] = useState(false);
 
-  // Pipeline state
+  // Pipeline state. pipelineStep is a visual cue only; pipelineDone/failed are
+  // derived from the note's real backend status (see below), never from a timer.
   const [processingNoteId, setProcessingNoteId] = useState<string | null>(null);
   const [pipelineStep, setPipelineStep] = useState(0);
-  const [pipelineDone, setPipelineDone] = useState(false);
-  const processingRef = useRef(false);
+  const stepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Dirty tracking
   const [extractedBodies, setExtractedBodies] = useState<Record<string, string>>(() => {
@@ -107,7 +107,13 @@ export default function NotesPage() {
   });
 
   const selectedNote = isNewNote ? null : notes.find(n => n.id === selectedNoteId);
-  const isProcessing = processingNoteId !== null && !pipelineDone;
+  // The note we kicked off ingestion for, tracked by its real backend status
+  // (AppContext polls PENDING -> READY/FAILED). The stepper reflects that, not a timer.
+  const processingNote = processingNoteId ? notes.find(n => n.id === processingNoteId) : null;
+  const processingFailed = processingNote?.status === 'failed';
+  // "Done" means the backend actually finished, not that the animation ran out.
+  const pipelineDone = processingNote?.status === 'completed';
+  const isProcessing = processingNoteId !== null && !pipelineDone && !processingFailed;
 
   const isDirty = selectedNote
     ? selectedNote.body !== (extractedBodies[selectedNote.id] ?? selectedNote.body)
@@ -131,34 +137,45 @@ export default function NotesPage() {
 
   const currentSources = selectedNote ? (sources[selectedNote.id] ?? []) : [];
 
-  const runPipeline = useCallback((noteId: string, onComplete: () => void) => {
-    if (processingRef.current) return;
-    processingRef.current = true;
+  // Advance the visual stepper while the backend works. It walks up to the
+  // SECOND-TO-LAST step and then waits: the final "Updating your Brain" step
+  // and the results only land when the note's real status becomes 'completed'
+  // (an effect below finalises it). If ingestion fails, the failure UI shows.
+  const runPipeline = useCallback((noteId: string) => {
+    if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
     setProcessingNoteId(noteId);
     setPipelineStep(0);
-    setPipelineDone(false);
     updateNoteStatus(noteId, 'processing');
 
+    const HOLD_AT = PIPELINE_STEPS.length - 1; // don't claim "done" on a timer
     let step = 0;
     const advance = () => {
-      step++;
+      step += 1;
       setPipelineStep(step);
-      if (step < PIPELINE_STEPS.length) {
-        setTimeout(advance, 800 + Math.random() * 400);
-      } else {
-        setTimeout(() => {
-          // Ingestion status is backend-owned; AppContext polls until the note is READY/FAILED.
-          setPipelineDone(true);
-          processingRef.current = false;
-          onComplete();
-        }, 500);
+      if (step < HOLD_AT) {
+        stepTimerRef.current = setTimeout(advance, 800 + Math.random() * 400);
       }
     };
-    setTimeout(advance, 600);
+    stepTimerRef.current = setTimeout(advance, 600);
   }, [updateNoteStatus]);
 
+  // Finalise the stepper from the note's REAL status. When ingestion actually
+  // completes, fill the last step; when it fails, stop the animation.
+  useEffect(() => {
+    if (!processingNote) return;
+    if (processingNote.status === 'completed') {
+      if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
+      setPipelineStep(PIPELINE_STEPS.length);
+    } else if (processingNote.status === 'failed') {
+      if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
+    }
+  }, [processingNote?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Clean up the stepper timer on unmount.
+  useEffect(() => () => { if (stepTimerRef.current) clearTimeout(stepTimerRef.current); }, []);
+
   const handleProcessNew = () => {
-    if (processingRef.current) return;
+    if (isProcessing) return;
     // Backend requires a UUID primary key; timestamp ids get rejected on later PUTs.
     const id = crypto.randomUUID();
     const note: Note = { id, title: newTitle, body: newBody, status: 'processing', updatedAt: 'Just now' };
@@ -166,13 +183,13 @@ export default function NotesPage() {
     setSelectedNoteId(id);
     setIsNewNote(false);
     setExtractedBodies(prev => ({ ...prev, [id]: newBody }));
-    runPipeline(id, () => {});
+    runPipeline(id);
   };
 
   const handleReExtract = () => {
-    if (!selectedNote || processingRef.current) return;
+    if (!selectedNote || isProcessing) return;
     setExtractedBodies(prev => ({ ...prev, [selectedNote.id]: selectedNote.body }));
-    runPipeline(selectedNote.id, () => {});
+    runPipeline(selectedNote.id);
   };
 
   const handleNewNote = () => {
@@ -180,9 +197,8 @@ export default function NotesPage() {
     setSelectedNoteId(null);
     setNewTitle('Untitled Note');
     setNewBody(NEW_NOTE_TEMPLATE);
+    if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
     setProcessingNoteId(null);
-    setPipelineDone(false);
-    processingRef.current = false;
     setShowSourceChooser(false);
     setAddingLink(false);
     setLinkUrl('');
@@ -191,9 +207,8 @@ export default function NotesPage() {
   const handleSelectNote = (id: string) => {
     setSelectedNoteId(id);
     setIsNewNote(false);
+    if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
     setProcessingNoteId(null);
-    setPipelineDone(false);
-    processingRef.current = false;
     setShowSourceChooser(false);
     setAddingLink(false);
     setLinkUrl('');
@@ -238,7 +253,9 @@ export default function NotesPage() {
   const currentTitle = isNewNote ? newTitle : (selectedNote?.title ?? '');
   const wc = wordCount(currentBody);
 
-  const showExtractionPanel = isProcessing || pipelineDone || (selectedNote?.status === 'completed' && !isProcessing && !pipelineDone);
+  // Show the extraction panel while processing, when done, when a failure needs
+  // reporting, or when viewing an already-completed note.
+  const showExtractionPanel = isProcessing || pipelineDone || processingFailed || selectedNote?.status === 'completed';
 
   return (
     <div style={{ display: 'flex', height: '100%', background: 'var(--bg)', overflow: 'hidden' }}>
@@ -498,23 +515,30 @@ export default function NotesPage() {
                   animation: 'fadeUp 0.15s ease',
                 }}>
                   {[
-                    { icon: '📄', label: 'Upload file', action: () => setShowSourceChooser(false) },
-                    { icon: '🔗', label: 'Add web link', action: () => { setAddingLink(true); setShowSourceChooser(false); } },
-                    { icon: '📋', label: 'Paste text', action: () => setShowSourceChooser(false) },
-                  ].map(({ icon, label, action }) => (
+                    // File upload and paste-to-source have no ingestion endpoint yet;
+                    // mark them "Soon" rather than presenting dead buttons. Web links
+                    // are kept as session-local reference notes.
+                    { icon: '📄', label: 'Upload file', action: () => {}, soon: true },
+                    { icon: '🔗', label: 'Add web link', action: () => { setAddingLink(true); setShowSourceChooser(false); }, soon: false },
+                    { icon: '📋', label: 'Paste text', action: () => {}, soon: true },
+                  ].map(({ icon, label, action, soon }) => (
                     <button
                       key={label}
-                      onClick={action}
+                      onClick={soon ? undefined : action}
+                      disabled={soon}
+                      title={soon ? 'Coming soon' : undefined}
                       style={{
                         padding: '7px 12px', borderRadius: 7, border: 'none', background: 'transparent',
-                        color: 'var(--text-2)', fontSize: 12, fontFamily: 'inherit', cursor: 'pointer',
+                        color: soon ? 'var(--text-dim)' : 'var(--text-2)', fontSize: 12, fontFamily: 'inherit',
+                        cursor: soon ? 'default' : 'pointer',
                         display: 'flex', alignItems: 'center', gap: 8, textAlign: 'left',
                         transition: 'background 0.1s',
                       }}
-                      onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--bg-input)'}
+                      onMouseEnter={e => { if (!soon) (e.currentTarget as HTMLElement).style.background = 'var(--bg-input)'; }}
                       onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
                     >
                       <span>{icon}</span> {label}
+                      {soon && <span style={{ marginLeft: 'auto', fontSize: 9, fontWeight: 700, letterSpacing: '0.05em', color: 'var(--text-dim)', border: '1px solid var(--border)', borderRadius: 4, padding: '1px 5px' }}>SOON</span>}
                     </button>
                   ))}
                   <button onClick={() => setShowSourceChooser(false)} style={{ position: 'absolute', top: 6, right: 6, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-dim)', padding: 0, display: 'flex' }}>
@@ -649,6 +673,7 @@ export default function NotesPage() {
                   })}
                 </div>
               )}
+              {processingFailed && <IngestionFailed onRetry={handleReExtract} />}
               {(pipelineDone || (selectedNote?.status === 'completed' && !isProcessing)) && (
                 <ExtractionResults
                   note={selectedNote ?? null}
@@ -673,7 +698,7 @@ export default function NotesPage() {
               Knowledge Processing
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              {isProcessing ? 'Structuring your note…' : pipelineDone ? 'Extraction complete' : 'Latest extraction'}
+              {isProcessing ? 'Structuring your note…' : processingFailed ? 'Processing failed' : pipelineDone ? 'Extraction complete' : 'Latest extraction'}
             </div>
           </div>
 
@@ -745,6 +770,9 @@ export default function NotesPage() {
               </div>
             )}
 
+            {/* Ingestion failed */}
+            {processingFailed && <IngestionFailed onRetry={handleReExtract} />}
+
             {/* Extraction results */}
             {(pipelineDone || (selectedNote?.status === 'completed' && !isProcessing)) && (
               <ExtractionResults
@@ -754,6 +782,33 @@ export default function NotesPage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// Shown when the backend reports a note's ingestion FAILED (real status, not a timer).
+function IngestionFailed({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div style={{ padding: '14px 16px', borderRadius: 10, background: 'rgba(255,75,75,0.08)', border: '1px solid rgba(255,75,75,0.3)' }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+        <AlertTriangle size={14} style={{ color: 'var(--red)', flexShrink: 0, marginTop: 1 }} />
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--red)', marginBottom: 4 }}>Couldn&apos;t process this note</div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, marginBottom: 10 }}>
+            Something went wrong while structuring this note into your Brain. Your text is safe. You can try again.
+          </div>
+          <button
+            onClick={onRetry}
+            style={{
+              padding: '6px 14px', borderRadius: 7, background: 'var(--red)', color: '#fff',
+              border: 'none', cursor: 'pointer', fontSize: 11, fontWeight: 700, fontFamily: 'inherit',
+              display: 'flex', alignItems: 'center', gap: 5,
+            }}
+          >
+            <RefreshCw size={11} /> Try again
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
