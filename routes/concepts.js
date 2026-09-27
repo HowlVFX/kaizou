@@ -3,6 +3,7 @@ const db = require('../database/db');
 const verifyToken = require('../middleware/auth');
 const { soloToUi } = require('../services/solo');
 const { computeRecall } = require('../services/recall');
+const { fastapi, sendFastApiError } = require('../services/fastapi');
 const router = express.Router();
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -242,6 +243,34 @@ router.get('/:id', verifyToken, async (req, res) => {
   } catch (err) {
     console.error('Error fetching concept:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Go deeper (why-ladder) ─────────────────────────────────────────────
+// GET  /api/concepts/:id/deeper  -> stored step, no AI
+// POST /api/concepts/:id/deeper  { regenerate? } -> generates the step if absent
+//   step: { question, primer, simplification, is_bedrock, bedrock_reason,
+//           chain: [{concept_id,label}], explanations: [{concept_id,label,teaser,level_band,locked}] }
+router.get('/:id/deeper', verifyToken, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Concept not found' });
+  try {
+    const r = await fastapi.get(`/deeper/${req.params.id}`, { params: { learner_id: req.user.id } });
+    res.json(r.data);
+  } catch (err) {
+    sendFastApiError(res, err, 'Could not load this step');
+  }
+});
+
+router.post('/:id/deeper', verifyToken, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Concept not found' });
+  try {
+    const r = await fastapi.post(`/deeper/${req.params.id}`, {
+      learner_id: req.user.id,
+      regenerate: Boolean(req.body && req.body.regenerate),
+    });
+    res.json(r.data);
+  } catch (err) {
+    sendFastApiError(res, err, 'Could not go deeper right now');
   }
 });
 

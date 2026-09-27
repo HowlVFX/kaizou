@@ -5,6 +5,7 @@ import { recallStatus, demoNodes } from '../data/demo';
 import { useApp } from '../context/AppContext';
 import { useConceptDetail, formatRelative, type ConceptDetail } from '../lib/concepts';
 import { Lock, FileText, X as XIcon, Target, RefreshCw, GitMerge, BarChart, Zap } from './Icon';
+import DeepDivePanel from './DeepDivePanel';
 
 interface Props {
   node: GraphNode;
@@ -43,7 +44,11 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
   const recallDash = node.recall !== null ? (node.recall / 100) * circumference : 0;
 
   // Claims + edges come from GET /api/concepts/:id; neighbours resolve against the loaded graph.
-  const { nodes: allNodes, isLoggedIn } = useApp();
+  const { nodes: allNodes, edges: allEdges, isLoggedIn } = useApp();
+  // Locked node created by "Go deeper" (not a prerequisite of a note).
+  const isExplanation = node.locked && allEdges.some(e => e.type === 'explained' && e.target === node.id);
+  const learnConcept = (id: string, label: string) => navigate('/notes', { state: { learnConcept: { id, label } } });
+  const updateNote = () => navigate('/notes', { state: { openConceptId: node.id } });
   const { detail, loading: detailLoading, error: detailError } = useConceptDetail(node.id);
   const pool = isLoggedIn ? allNodes : demoNodes;
   const linkedIds = new Set<string>([
@@ -143,14 +148,23 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
           }}>
             <span style={{ color: 'var(--text-dim)', marginTop: 1, flexShrink: 0 }}><Lock size={16} /></span>
             <div>
-              <div style={{ fontWeight: 600, color: 'var(--text-2)', fontSize: 13, marginBottom: 4 }}>Missing prerequisite</div>
-              <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55 }}>Kaizou identified this as a prerequisite not yet established in your Brain.</div>
-              <button onClick={() => navigate('/notes', { state: { learnConcept: { id: node.id, label: node.label } } })} style={{
+              <div style={{ fontWeight: 600, color: 'var(--text-2)', fontSize: 13, marginBottom: 4 }}>{isExplanation ? 'Locked explanation' : 'Missing prerequisite'}</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55 }}>
+                {isExplanation
+                  ? 'You found this by going deeper. Write a note on it in your own words to unlock it.'
+                  : 'Kaizou identified this as a prerequisite not yet established in your Brain.'}
+              </div>
+              <button onClick={() => learnConcept(node.id, node.label)} style={{
                 marginTop: 10, padding: '6px 14px', borderRadius: 7, background: 'var(--blue)',
                 border: 'none', color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
               }}>Learn this concept</button>
             </div>
           </div>
+        )}
+
+        {/* Teaser on a locked explanation node */}
+        {node.locked && isLoggedIn && (
+          <DeepDivePanel node={node} onLearn={learnConcept} onUpdateNote={updateNote} />
         )}
 
         {/* Action buttons */}
@@ -194,6 +208,7 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
                 <Zap size={14} strokeWidth={1.8} /> Explain
               </button>
             </div>
+            {isLoggedIn && <DeepDivePanel node={node} onLearn={learnConcept} onUpdateNote={updateNote} />}
           </div>
         )}
 

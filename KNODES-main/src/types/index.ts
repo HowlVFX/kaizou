@@ -33,12 +33,37 @@ export interface GraphNode {
   isAnalogy?: boolean;
   /** Concept id this node is an analogy for. */
   analogyOf?: string | null;
+  /** Go deeper: nothing deeper explains this (axiom, law, observed fact). */
+  isBedrock?: boolean;
+  /** A deeper explanation of this node has been learnt. */
+  upgraded?: boolean;
+  hasDeeperStep?: boolean;
+  levelBand?: string | null;
+  /** On an explanation node: what it will reveal. */
+  teaser?: string | null;
+  simplificationNote?: string | null;
 }
 
 export interface GraphEdge {
   source: string;
   target: string;
-  type: 'semantic' | 'wikilink' | 'requires' | 'analogy';
+  type: 'semantic' | 'wikilink' | 'requires' | 'analogy' | 'explained';
+}
+
+/** One step down the why-ladder (GET/POST /api/concepts/:id/deeper). */
+export interface DeeperStep {
+  concept_id: string;
+  label: string;
+  level_band: string | null;
+  has_step: boolean;
+  stale: boolean;
+  is_bedrock: boolean;
+  bedrock_reason: string | null;
+  question: string | null;
+  primer: string | null;
+  simplification: string | null;
+  chain: { concept_id: string; label: string }[];
+  explanations: { concept_id: string; label: string; teaser: string | null; level_band: string | null; locked: boolean; is_bedrock: boolean }[];
 }
 
 /** SOURCE_BACKED: may have sources · USER_DEFINED: no sources · ANALOGY: analogy for another concept. */
@@ -59,6 +84,7 @@ export interface Note {
   body: string;
   status: 'draft' | 'processing' | 'completed' | 'partial' | 'failed';
   concepts?: string[];
+  conceptIds?: string[];
   claims?: number;
   connections?: number;
   updatedAt: string;

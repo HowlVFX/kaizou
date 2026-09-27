@@ -182,7 +182,7 @@ async function deleteNoteCascade(noteId, learnerId) {
     if (owned.length) {
       relocked = (await client.query(
         `SELECT DISTINCT e.target_id AS id FROM edges e
-         WHERE e.type = 'REQUIRES' AND e.target_id = ANY($1::uuid[])
+         WHERE e.type IN ('REQUIRES', 'EXPLAINED_BY') AND e.target_id = ANY($1::uuid[])
            AND NOT (e.source_id = ANY($1::uuid[]))`,
         [owned]
       )).rows.map(r => r.id);
@@ -195,7 +195,9 @@ async function deleteNoteCascade(noteId, learnerId) {
       await client.query(
         `UPDATE concepts SET status = 'UNRESOLVED_PREREQUISITE', probe_eligible = false,
                 track = 'SELF_AUTHORED', shape = 'DEFINITION', category = 'DETERMINISTIC_MECHANISM',
-                solo_level = 'Prestructural'
+                solo_level = 'Prestructural',
+                deeper_question = NULL, deeper_primer = NULL, simplification_note = NULL,
+                deeper_version = NULL, is_bedrock = false, bedrock_reason = NULL
          WHERE id = ANY($1::uuid[]) AND learner_id = $2`,
         [relocked, learnerId]
       );

@@ -659,6 +659,12 @@ export default function BrainPage() {
               </svg>
               <span style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>Analogy</span>
             </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+              <svg width="10" height="10" viewBox="0 0 10 10" style={{ flexShrink: 0 }} aria-hidden="true">
+                <circle cx="5" cy="5" r="4" fill="none" stroke="#f5b942" strokeWidth="1.5" />
+              </svg>
+              <span style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>Upgraded (went deeper)</span>
+            </div>
             {[
               { color: "var(--green)", label: "Healthy (75–100%)" },
               { color: "var(--orange)", label: "Weakening (50–74%)" },

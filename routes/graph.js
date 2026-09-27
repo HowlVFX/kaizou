@@ -23,6 +23,11 @@ router.get('/', verifyToken, async (req, res) => {
       `SELECT c.id, c.canonical_label, c.category, c.status, c.solo_level, c.track,
               (SELECT e.target_id FROM edges e
                 WHERE e.source_id = c.id AND e.type = 'ANALOGY_OF' LIMIT 1) AS analogy_of,
+              c.is_bedrock, c.level_band, c.teaser, c.simplification_note,
+              (c.deeper_question IS NOT NULL) AS has_deeper_step,
+              EXISTS (SELECT 1 FROM edges e JOIN concepts d ON d.id = e.target_id
+                      WHERE e.source_id = c.id AND e.type = 'EXPLAINED_BY'
+                        AND d.status = 'VERIFIED_CONCEPT') AS upgraded,
               m.half_life, m.last_reviewed, m.decay_exempt,
               (SELECT COUNT(*)::int FROM claims cl
                 WHERE cl.concept_id = c.id AND cl.concept_version = c.version) AS claims_count
@@ -43,6 +48,14 @@ router.get('/', verifyToken, async (req, res) => {
       track: c.track,
       // Concept this node is an analogy for (ANALOGY_OF target), if any.
       analogy_of: c.analogy_of ?? null,
+      // Go deeper: bedrock = nothing deeper; upgraded = a deeper explanation
+      // of this node has been learnt (its note can optionally be updated).
+      is_bedrock: Boolean(c.is_bedrock),
+      upgraded: Boolean(c.upgraded),
+      has_deeper_step: Boolean(c.has_deeper_step),
+      level_band: c.level_band ?? null,
+      teaser: c.teaser ?? null,
+      simplification_note: c.simplification_note ?? null,
       summary: null,
       solo_level: soloToUi(c.solo_level),
       recall: computeRecall(c.last_reviewed, c.half_life, c.decay_exempt, now),

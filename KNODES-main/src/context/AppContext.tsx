@@ -64,6 +64,9 @@ function mapNote(n: any): Note {
     body: n.body ?? n.body_md ?? '',
     status: mapNoteStatus(n),
     concepts,
+    conceptIds: Array.isArray(n.concepts)
+      ? n.concepts.map((c: any) => c?.id).filter((id: unknown): id is string => typeof id === 'string')
+      : [],
     updatedAt: ts ? new Date(ts).toLocaleDateString() : '',
     noteType: n.note_type === 'USER_DEFINED' || n.note_type === 'ANALOGY' ? n.note_type : 'SOURCE_BACKED',
     analogyTargetId: n.analogy_target_concept_id ?? null,
@@ -141,6 +144,12 @@ function mapNode(n: any): GraphNode {
     lastReviewed: n.last_reviewed || undefined,
     isAnalogy: n.track === 'ANALOGY',
     analogyOf: n.analogy_of ?? null,
+    isBedrock: Boolean(n.is_bedrock),
+    upgraded: Boolean(n.upgraded),
+    hasDeeperStep: Boolean(n.has_deeper_step),
+    levelBand: n.level_band ?? null,
+    teaser: n.teaser ?? null,
+    simplificationNote: n.simplification_note ?? null,
   };
 }
 
@@ -148,6 +157,7 @@ function mapEdgeType(t: unknown): GraphEdge['type'] {
   const s = String(t || '').toLowerCase();
   if (s === 'requires') return 'requires';
   if (s === 'analogy_of') return 'analogy';
+  if (s === 'explained_by') return 'explained';
   if (s === 'wikilink') return 'wikilink';
   return 'semantic';
 }

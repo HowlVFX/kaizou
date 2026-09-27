@@ -24,8 +24,8 @@ const NOTE_TYPE_OPTIONS: { value: NoteType; label: string; hint: string }[] = [
   { value: 'ANALOGY', label: 'Analogy', hint: 'This note is an analogy for another concept.' },
 ];
 
-/** State passed by "Learn this concept" on a locked node. */
-interface LearnConceptState { learnConcept?: { id: string; label: string } }
+/** State passed by "Learn this concept" on a locked node, or "Update your note" on an upgraded one. */
+interface LearnConceptState { learnConcept?: { id: string; label: string }; openConceptId?: string }
 
 // ── Pipeline steps (learner-friendly labels) ─────────────────────
 const PIPELINE_STEPS = [
@@ -461,11 +461,19 @@ export default function NotesPage() {
   // "Learn this concept" on a locked node → open a fresh note titled with that
   // concept and bound to it (ingestion promotes that exact locked node).
   useEffect(() => {
-    const learn = (location.state as LearnConceptState | null)?.learnConcept;
-    if (!learn) return;
-    const existing = notes.find(n => n.targetConceptId === learn.id);
-    if (existing) handleSelectNote(existing.id);
-    else handleNewNote({ title: learn.label, targetConceptId: learn.id });
+    const state = location.state as LearnConceptState | null;
+    const learn = state?.learnConcept;
+    const openId = state?.openConceptId;
+    if (!learn && !openId) return;
+    if (openId) {
+      // Upgraded node: open its note so the learner can (optionally) update it.
+      const note = notes.find(n => n.conceptIds?.includes(openId));
+      if (note) handleSelectNote(note.id);
+    } else if (learn) {
+      const existing = notes.find(n => n.targetConceptId === learn.id || n.conceptIds?.includes(learn.id));
+      if (existing) handleSelectNote(existing.id);
+      else handleNewNote({ title: learn.label, targetConceptId: learn.id });
+    }
     navigate(location.pathname, { replace: true, state: null });
   }, [location.state]); // eslint-disable-line react-hooks/exhaustive-deps
 

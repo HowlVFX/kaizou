@@ -30,6 +30,7 @@ from app.grading.router import router as grading_router
 from app.probes.router import router as probes_router
 from app.memory.router import router as review_router
 from app.graph.router import router as learning_paths_router
+from app.deeper.router import router as deeper_router
 
 
 @asynccontextmanager
@@ -76,6 +77,7 @@ app.include_router(grading_router, dependencies=_internal)
 app.include_router(probes_router, dependencies=_internal)
 app.include_router(review_router, dependencies=_internal)
 app.include_router(learning_paths_router, dependencies=_internal)
+app.include_router(deeper_router, dependencies=_internal)
 
 
 @app.exception_handler(ProviderError)

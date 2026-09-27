@@ -9,7 +9,7 @@ CREATE TYPE concept_shape AS ENUM ('PROCEDURAL', 'DEFINITION', 'ORDERED_PROCESS'
 CREATE TYPE concept_category AS ENUM ('DETERMINISTIC_MECHANISM', 'CONVENTIONAL', 'PROBABILISTIC', 'AXIOMATIC', 'OUT_OF_SCOPE');
 CREATE TYPE concept_status AS ENUM ('UNRESOLVED_PREREQUISITE', 'VERIFIED_CONCEPT');
 CREATE TYPE solo_level AS ENUM ('Prestructural', 'Unistructural', 'Multistructural', 'Relational', 'Extended_Abstract');
-CREATE TYPE edge_type AS ENUM ('WIKILINK', 'SEMANTIC', 'REQUIRES', 'ANALOGY_OF');
+CREATE TYPE edge_type AS ENUM ('WIKILINK', 'SEMANTIC', 'REQUIRES', 'ANALOGY_OF', 'EXPLAINED_BY');
 CREATE TYPE edge_flag AS ENUM ('CYCLE_CONFLICT', 'MERGE_CANDIDATE');
 CREATE TYPE source_trust_tier AS ENUM ('PEER_REVIEWED', 'INSTITUTIONAL', 'GENERAL', 'SELF_AUTHORED');
 CREATE TYPE template_tier AS ENUM ('SOURCE_GROUNDED', 'GENERATED');
@@ -116,6 +116,16 @@ CREATE TABLE concepts (
     solo_level solo_level DEFAULT 'Prestructural',
     probe_eligible BOOLEAN DEFAULT true,
     source_trust_tier source_trust_tier,
+    -- "Go deeper" (migration 008): level band, the step generated from this
+    -- concept, bedrock flag, and the teaser shown on an explanation node.
+    level_band TEXT,
+    deeper_question TEXT,
+    deeper_primer TEXT,
+    simplification_note TEXT,
+    deeper_version INTEGER,
+    is_bedrock BOOLEAN NOT NULL DEFAULT false,
+    bedrock_reason TEXT,
+    teaser TEXT,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 

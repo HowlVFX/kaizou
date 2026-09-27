@@ -24,6 +24,8 @@ const NODE_RADIUS = 22
 const LOCKED_RADIUS = 18
 // Analogy nodes (diamonds) and their ANALOGY_OF links.
 const ANALOGY_COLOR = "#a78bfa"
+// Go deeper: upgraded-node ring and "explained by" links.
+const DEEP_COLOR = "#f5b942"
 const CLUSTER_RADIUS = 58
 
 export default function KnowledgeGraph({
@@ -197,6 +199,8 @@ export default function KnowledgeGraph({
         ? "var(--green)"
         : edge.type === "analogy"
           ? ANALOGY_COLOR
+          : edge.type === "explained"
+            ? DEEP_COLOR
           : isRelevant
             ? edge.type === "requires"
               ? "var(--green)"
@@ -218,7 +222,9 @@ export default function KnowledgeGraph({
             ? "6,3"
             : edge.type === "analogy"
               ? "2,4"
-              : "none",
+              : edge.type === "explained"
+                ? "1,3"
+                : "none",
     }
   }
 
@@ -819,6 +825,18 @@ export default function KnowledgeGraph({
                     filter={filterAttr}
                     style={{ transition: "r 0.15s, stroke 0.15s" }}
                   />
+                )}
+                {/* Upgraded: a deeper explanation of this node has been learnt */}
+                {node.upgraded && !node.locked && (
+                  <circle r={r + 4.5} fill="none" stroke={DEEP_COLOR} strokeWidth={2} opacity={0.9}>
+                    <title>Upgraded: you learnt what explains this</title>
+                  </circle>
+                )}
+                {/* Bedrock: nothing deeper explains this */}
+                {node.isBedrock && !node.locked && (
+                  <rect x={-4} y={r - 2} width={8} height={8} rx={1} fill="var(--text-2)">
+                    <title>Bedrock truth</title>
+                  </rect>
                 )}
                 {/* Locked overlay */}
                 {node.locked && (
