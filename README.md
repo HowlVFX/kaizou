@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🧠 Second Brain
+# 🧠 Kaizou
 
 ### Verified knowledge retention on a node-based knowledge graph
 
