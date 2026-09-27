@@ -283,5 +283,5 @@ Because the system's central claims are about retention over weeks, evaluation i
 ISC. See `package.json`.
 
 <div align="center">
-<sub>Built as a final-year BSc Computer Science project · University of Mumbai · 2025–2026</sub>
+<sub>Built as a final-year BSc Computer Science project · University of Mumbai · 2026–2027</sub>
 </div>
