@@ -10,9 +10,33 @@ const MANAGEMENT_BASE = `${ADMIN_BASE}/management`;
 const ACCESS_KEY = 'portal_access_token';
 const REFRESH_KEY = 'portal_refresh_token';
 const USER_KEY = 'portal_user';
+const GATE_KEY = 'portal_gate_token';
 
 /** Fired on window when the session can no longer be refreshed. */
 export const SESSION_EXPIRED_EVENT = 'portal:session-expired';
+/** Fired when the shared site gate is no longer valid (must re-enter it). */
+export const GATE_REQUIRED_EVENT = 'portal:gate-required';
+
+// --- Site gate (shared splash credentials in front of the whole portal) ------
+export function getGateToken(): string | null {
+  return localStorage.getItem(GATE_KEY);
+}
+export function hasGate(): boolean {
+  return Boolean(getGateToken());
+}
+export function clearGateToken(): void {
+  localStorage.removeItem(GATE_KEY);
+}
+/** Exchange the shared gate credentials for a gate token. Throws ApiError on failure. */
+export async function enterGate(username: string, password: string): Promise<void> {
+  const res = await postJson('/api/gate', { username, password });
+  if (!res.ok) {
+    throw new ApiError(res.status, 'Incorrect access credentials.');
+  }
+  const data = await res.json();
+  if (!data?.gateToken) throw new ApiError(500, 'Gate failed.');
+  localStorage.setItem(GATE_KEY, data.gateToken);
+}
 
 export class ApiError extends Error {
   status: number;
@@ -74,12 +98,25 @@ async function readError(res: Response, fallback: string): Promise<string> {
   return fallback;
 }
 
+function gateHeaders(base: Record<string, string> = {}): Record<string, string> {
+  const gate = getGateToken();
+  return gate ? { ...base, 'X-Gate-Token': gate } : base;
+}
+
 function postJson(path: string, body: unknown): Promise<Response> {
   return fetch(`${API_ORIGIN}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: gateHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
   });
+}
+
+function requireGateOrThrow(res: Response, data?: { code?: string }): void {
+  if (res.status === 401 && data?.code === 'gate_required') {
+    clearGateToken();
+    window.dispatchEvent(new Event(GATE_REQUIRED_EVENT));
+    throw new ApiError(401, 'Site access has expired. Re-enter the access credentials.');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +126,8 @@ function postJson(path: string, body: unknown): Promise<Response> {
 export async function login(email: string, password: string): Promise<AdminUser> {
   const res = await postJson(`${ADMIN_BASE}/login`, { email, password });
   if (!res.ok) {
+    const body = await res.clone().json().catch(() => null);
+    requireGateOrThrow(res, body);
     throw new ApiError(res.status, res.status === 401
       ? 'Invalid email or password.'
       : await readError(res, 'Login failed. Please try again.'));
@@ -157,11 +196,20 @@ export async function authFetch(path: string, init: RequestInit = {}): Promise<R
     const headers = new Headers(init.headers);
     const token = getAccessToken();
     if (token) headers.set('Authorization', `Bearer ${token}`);
+    const gate = getGateToken();
+    if (gate) headers.set('X-Gate-Token', gate);
     return fetch(`${API_ORIGIN}${path}`, { ...init, headers });
   };
 
   let res = await send();
+  // The whole portal is behind the shared site gate; if it lapses, bounce to it.
   if (res.status === 401) {
+    const peek = await res.clone().json().catch(() => null);
+    if (peek?.code === 'gate_required') {
+      clearGateToken();
+      window.dispatchEvent(new Event(GATE_REQUIRED_EVENT));
+      return res;
+    }
     if (!(await refreshSession())) expireSession();
     res = await send();
     if (res.status === 401) expireSession();

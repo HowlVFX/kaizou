@@ -5,7 +5,7 @@ const verifyToken = require('../middleware/auth');
 const router = express.Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/; // same rule as routes/auth.js signup
-const PROFILE_COLS = 'id, email, name, role, preferred_language, portal_optin, daily_goal, review_mode, decay_sensitivity, solo_notifications, created_at';
+const PROFILE_COLS = 'id, email, name, preferred_language, portal_optin, daily_goal, review_mode, decay_sensitivity, solo_notifications, created_at';
 const UPDATABLE = new Set([
   'name', 'email', 'preferred_language', 'portal_optin',
   'daily_goal', 'review_mode', 'decay_sensitivity', 'solo_notifications',
@@ -16,7 +16,7 @@ const REVIEW_MODES = new Set(['Understand', 'Abstract']);
 const DECAY_SENSITIVITIES = new Set(['Low', 'Standard', 'High']);
 
 // 1. GET CURRENT USER PROFILE
-// Response: { id, email, name, role, preferred_language, portal_optin,
+// Response: { id, email, name, preferred_language, portal_optin,
 //             daily_goal, review_mode, decay_sensitivity, solo_notifications, created_at }
 router.get('/me', verifyToken, async (req, res) => {
   try {

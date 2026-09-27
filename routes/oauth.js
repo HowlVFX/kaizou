@@ -40,7 +40,7 @@ async function handleOAuthUser(rawEmail, rawName, res) {
     const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim().slice(0, 100) : null;
 
     // LOWER() so accounts created before emails were normalised still match.
-    let result = await db.query('SELECT id, email, name, role FROM learners WHERE LOWER(email) = $1', [email]);
+    let result = await db.query('SELECT id, email, name FROM learners WHERE LOWER(email) = $1', [email]);
     let learner = result.rows[0];
 
     if (!learner) {
@@ -48,13 +48,13 @@ async function handleOAuthUser(rawEmail, rawName, res) {
       // random bytes that is never shown to anyone.
       const passwordHash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
       result = await db.query(
-        'INSERT INTO learners (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, role',
+        'INSERT INTO learners (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name',
         [email, passwordHash, name]
       );
       learner = result.rows[0];
     } else if (!learner.name && name) {
       result = await db.query(
-        'UPDATE learners SET name = $1 WHERE id = $2 RETURNING id, email, name, role',
+        'UPDATE learners SET name = $1 WHERE id = $2 RETURNING id, email, name',
         [name, learner.id]
       );
       learner = result.rows[0];
@@ -64,7 +64,7 @@ async function handleOAuthUser(rawEmail, rawName, res) {
     const code = loginCodes.put({
       accessToken,
       refreshToken,
-      learner: { id: learner.id, email: learner.email, name: learner.name, role: learner.role },
+      learner: { id: learner.id, email: learner.email, name: learner.name },
     });
     res.redirect(`${FRONTEND_URL}/auth-callback?${new URLSearchParams({ code })}`);
   } catch (error) {

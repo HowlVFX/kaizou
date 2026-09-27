@@ -1,5 +1,6 @@
 {
-  "description": "Streamline project management by organizing comprehensive project details and case files, enhancing collaboration and efficiency for teams.",
+  "title": "Kaizou",
+  "description": "Turn your notes into a connected knowledge graph, then remember, explain, and test how that knowledge works.",
   "robots": {
     "index": false
   },

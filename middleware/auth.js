@@ -2,7 +2,8 @@ const jwt = require('jsonwebtoken');
 const { verifyAccessToken } = require('../services/tokens');
 
 // Middleware to protect routes that require a user to be logged in.
-// Sets req.user = { id, role, type }.
+// Sets req.user = { id, type }. (Learners carry no role — admin is a separate
+// identity domain, see services/admin-tokens.js.)
 function verifyToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   if (!authHeader) {

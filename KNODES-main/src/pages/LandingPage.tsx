@@ -257,7 +257,7 @@ export default function LandingPage() {
             Remembering a fact isn't the same<br />as understanding it.
           </h2>
           <p style={{ fontSize: 16, color: 'var(--text-muted)', maxWidth: 520, margin: '0 auto' }}>
-            KNODES looks beyond surface recall — exploring relationships, mechanisms, counterfactuals, and transfer.
+            Kaizou looks beyond surface recall — exploring relationships, mechanisms, counterfactuals, and transfer.
           </p>
         </div>
 
