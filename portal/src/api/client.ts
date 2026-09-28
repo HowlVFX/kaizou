@@ -130,11 +130,27 @@ export async function login(email: string, password: string): Promise<AdminUser>
     requireGateOrThrow(res, body);
     throw new ApiError(res.status, res.status === 401
       ? 'Invalid email or password.'
-      : await readError(res, 'Login failed. Please try again.'));
+      : await readError(res, 'Login failed. Please try again.')); // 403 = email not on the allowlist
   }
   const data = (await res.json()) as AdminAuthResponse;
   if (!data.admin) {
     throw new ApiError(500, 'Login failed.');
+  }
+  storeSession(data);
+  return data.admin;
+}
+
+/** Create a moderator account. Only works for an email on the allowlist. */
+export async function signup(email: string, password: string, name?: string): Promise<AdminUser> {
+  const res = await postJson(`${ADMIN_BASE}/signup`, { email, password, name });
+  if (!res.ok) {
+    const body = await res.clone().json().catch(() => null);
+    requireGateOrThrow(res, body);
+    throw new ApiError(res.status, await readError(res, 'Sign up failed. Please try again.'));
+  }
+  const data = (await res.json()) as AdminAuthResponse;
+  if (!data.admin) {
+    throw new ApiError(500, 'Sign up failed.');
   }
   storeSession(data);
   return data.admin;

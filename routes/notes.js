@@ -339,7 +339,8 @@ router.put('/:id', verifyToken, async (req, res) => {
     }
     const typed = await parseTypeFields(req.body, learnerId);
     if (typed.error) return res.status(400).json({ error: typed.error });
-    const typeSent = typed.noteType !== undefined || typed.analogyTarget !== undefined;
+    const typeSent = typed.noteType !== undefined || typed.analogyTarget !== undefined
+      || req.body.analogy_target_label !== undefined;
     const contentChanged = title !== undefined || body !== undefined || typeSent;
 
     const client = await db.getClient();
@@ -361,6 +362,11 @@ router.put('/:id', verifyToken, async (req, res) => {
       // A content change puts the note back in the ingestion queue. A
       // status-only PUT touches nothing but still returns the current note.
       // Leaving ANALOGY clears the analogy target.
+      // Standalone analogy topic (a label with no note yet). Sent only when
+      // switching to / staying an analogy that points at a topic, not a concept.
+      const rawTopic = typeof req.body.analogy_target_label === 'string'
+        ? req.body.analogy_target_label.trim().slice(0, 120) : null;
+      const topicSent = req.body.analogy_target_label !== undefined;
       const result = await client.query(
         `UPDATE notes
          SET
@@ -371,13 +377,20 @@ router.put('/:id', verifyToken, async (req, res) => {
              WHEN COALESCE($6::note_type, note_type) <> 'ANALOGY' THEN NULL
              WHEN $7::boolean THEN $8::uuid
              ELSE analogy_target_concept_id END,
+           analogy_target_label = CASE
+             WHEN COALESCE($6::note_type, note_type) <> 'ANALOGY' THEN NULL
+             -- picking a concept target clears any standalone topic label
+             WHEN $7::boolean AND $8::uuid IS NOT NULL THEN NULL
+             WHEN $9::boolean THEN $10::text
+             ELSE analogy_target_label END,
            ingestion_status = CASE WHEN $5::boolean THEN 'PENDING'::note_status
                                    ELSE ingestion_status END,
            updated_at = CASE WHEN $5::boolean THEN CURRENT_TIMESTAMP ELSE updated_at END
          WHERE id = $3 AND learner_id = $4
          RETURNING id, body_md, note_type`,
         [title ?? null, body ?? null, noteId, learnerId, contentChanged,
-         typed.noteType ?? null, typed.analogyTarget !== undefined, typed.analogyTarget ?? null]
+         typed.noteType ?? null, typed.analogyTarget !== undefined, typed.analogyTarget ?? null,
+         topicSent, rawTopic || null]
       );
       if (result.rows.length === 0) {
         await client.query('ROLLBACK');

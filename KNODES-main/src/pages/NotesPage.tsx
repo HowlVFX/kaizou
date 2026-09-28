@@ -28,6 +28,8 @@ const NOTE_TYPE_OPTIONS: { value: NoteType; label: string; hint: string }[] = [
 interface LearnConceptState {
   learnConcept?: { id: string; label: string; analogyFor?: { id: string; label: string } };
   openConceptId?: string;
+  /** Open a blank new-note editor straight away (e.g. from "Write a note" / "Add Note"). */
+  newNote?: boolean;
 }
 
 // Analogy target picker: "a topic I don't have a note for yet".
@@ -99,7 +101,9 @@ export default function NotesPage() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(notes[0]?.id ?? null);
-  const [isNewNote, setIsNewNote] = useState(false);
+  // With no notes yet, open the blank editor by default so the page is
+  // immediately writable instead of showing an empty read-only pane.
+  const [isNewNote, setIsNewNote] = useState(notes.length === 0);
   const [newTitle, setNewTitle] = useState('Untitled Note');
   const [newBody, setNewBody] = useState(NEW_NOTE_TEMPLATE);
   const [search, setSearch] = useState('');
@@ -118,6 +122,8 @@ export default function NotesPage() {
   const [draftBody, setDraftBody] = useState('');
   const [draftType, setDraftType] = useState<NoteType>('SOURCE_BACKED');
   const [draftAnalogyTarget, setDraftAnalogyTarget] = useState<string | null>(null);
+  // Analogy about a topic with no note yet, while editing (null = picking a concept).
+  const [draftAnalogyTopic, setDraftAnalogyTopic] = useState<string | null>(null);
   const [submittingUpdate, setSubmittingUpdate] = useState(false);
   const [updateError, setUpdateError] = useState('');
 
@@ -183,6 +189,10 @@ export default function NotesPage() {
     ? newNoteType
     : editing ? draftType : (selectedNote?.noteType ?? 'SOURCE_BACKED');
   const currentAnalogyTarget = isNewNote ? newAnalogyTarget : editing ? draftAnalogyTarget : (selectedNote?.analogyTargetId ?? null);
+  // Whether the analogy points at a free-text topic (no concept yet) in the
+  // current mode. New notes and edit sessions both support this.
+  const currentAnalogyTopic = isNewNote ? newAnalogyTopic : editing ? draftAnalogyTopic : null;
+  const analogyIsTopic = currentAnalogyTopic !== null;
   const currentSources: SourceView[] = isNewNote
     ? pendingSources.map(p => ({
         id: p.id, kind: p.kind, title: p.title, pending: true, url: p.url,
@@ -460,7 +470,7 @@ export default function NotesPage() {
     if (type === 'USER_DEFINED' && (selectedNote.sources?.length ?? 0) > 0
         && !window.confirm('A user-defined note has no sources. Its sources will be removed when you save. Continue?')) return;
     setDraftType(type);
-    if (type !== 'ANALOGY') setDraftAnalogyTarget(null);
+    if (type !== 'ANALOGY') { setDraftAnalogyTarget(null); setDraftAnalogyTopic(null); }
   };
 
   const handlePickAnalogyTarget = (value: string) => {
@@ -475,6 +485,12 @@ export default function NotesPage() {
       setNewAnalogyTopic(null);
       setNewAnalogyTarget(value || null);
     } else if (editing) {
+      if (value === TOPIC_OPTION) {
+        setDraftAnalogyTarget(null);
+        setDraftAnalogyTopic('');
+        return;
+      }
+      setDraftAnalogyTopic(null);
       setDraftAnalogyTarget(value || null);
     }
   };
@@ -486,6 +502,12 @@ export default function NotesPage() {
     setDraftBody(selectedNote.body);
     setDraftType(selectedNote.noteType ?? 'SOURCE_BACKED');
     setDraftAnalogyTarget(selectedNote.analogyTargetId ?? null);
+    // If the note's analogy target is a topic (label but no resolved concept),
+    // seed the topic field so the dropdown shows "a topic…" instead of resetting
+    // to blank and forcing the learner to pick a concept.
+    const isTopic = (selectedNote.noteType ?? 'SOURCE_BACKED') === 'ANALOGY'
+      && !selectedNote.analogyTargetId && !!selectedNote.analogyTargetLabel;
+    setDraftAnalogyTopic(isTopic ? (selectedNote.analogyTargetLabel ?? '') : null);
     setUpdateError('');
     setTypeError('');
     setEditing(true);
@@ -499,18 +521,31 @@ export default function NotesPage() {
 
   const handleSubmitUpdate = async () => {
     if (!selectedNote || submittingUpdate) return;
-    if (draftType === 'ANALOGY' && !draftAnalogyTarget) {
-      setTypeError('Pick the concept this note is an analogy for.');
+    const draftTopic = draftAnalogyTopic?.trim() ?? '';
+    if (draftType === 'ANALOGY' && !draftAnalogyTarget && !draftTopic) {
+      setTypeError(draftAnalogyTopic !== null
+        ? 'Type the topic this note is an analogy for.'
+        : 'Pick the concept this note is an analogy for.');
       return;
     }
-    const typeChanged = draftType !== (selectedNote.noteType ?? 'SOURCE_BACKED')
-      || (draftType === 'ANALOGY' && draftAnalogyTarget !== (selectedNote.analogyTargetId ?? null));
+    const prevType = selectedNote.noteType ?? 'SOURCE_BACKED';
+    const prevTarget = selectedNote.analogyTargetId ?? null;
+    const prevTopic = (!prevTarget ? (selectedNote.analogyTargetLabel ?? null) : null);
+    const nextTopic = draftType === 'ANALOGY' && !draftAnalogyTarget ? (draftTopic || null) : null;
+    const typeChanged = draftType !== prevType
+      || (draftType === 'ANALOGY' && (draftAnalogyTarget !== prevTarget || nextTopic !== prevTopic));
     const textChanged = draftTitle !== selectedNote.title || draftBody !== selectedNote.body;
     if (!typeChanged && !textChanged) { setEditing(false); return; }
     setSubmittingUpdate(true);
     setUpdateError('');
     try {
-      if (typeChanged) await updateNoteType(selectedNote.id, draftType, draftType === 'ANALOGY' ? draftAnalogyTarget : null);
+      if (typeChanged) {
+        await updateNoteType(
+          selectedNote.id, draftType,
+          draftType === 'ANALOGY' ? draftAnalogyTarget : null,
+          draftType === 'ANALOGY' ? nextTopic : null,
+        );
+      }
       await submitNoteUpdate(selectedNote.id, { title: draftTitle, body: draftBody });
       setExtractedBodies(prev => ({ ...prev, [selectedNote.id]: draftBody }));
       setEditing(false);
@@ -528,8 +563,11 @@ export default function NotesPage() {
     const state = location.state as LearnConceptState | null;
     const learn = state?.learnConcept;
     const openId = state?.openConceptId;
-    if (!learn && !openId) return;
-    if (openId) {
+    if (!learn && !openId && !state?.newNote) return;
+    if (state?.newNote) {
+      // "Write a note" / "Add Note": open a blank editor ready for typing.
+      handleNewNote();
+    } else if (openId) {
       // Upgraded node: open its note so the learner can (optionally) update it.
       const note = notes.find(n => n.conceptIds?.includes(openId));
       if (note) handleSelectNote(note.id);
@@ -825,7 +863,7 @@ export default function NotesPage() {
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)' }}>
               Analogy for
               <select
-                value={isNewNote && newAnalogyTopic !== null ? TOPIC_OPTION : (currentAnalogyTarget ?? '')}
+                value={analogyIsTopic ? TOPIC_OPTION : (currentAnalogyTarget ?? '')}
                 onChange={e => handlePickAnalogyTarget(e.target.value)}
                 disabled={isProcessing || readOnly}
                 style={{
@@ -840,15 +878,15 @@ export default function NotesPage() {
                   </option>
                 )}
                 {analogyTargets.map(n => <option key={n.id} value={n.id}>{n.label}</option>)}
-                {isNewNote && <option value={TOPIC_OPTION}>+ A topic I don&apos;t have a note for…</option>}
+                {(isNewNote || editing) && <option value={TOPIC_OPTION}>+ A topic I don&apos;t have a note for…</option>}
               </select>
             </label>
           )}
-          {currentNoteType === 'ANALOGY' && isNewNote && newAnalogyTopic !== null && (
+          {currentNoteType === 'ANALOGY' && analogyIsTopic && (
             <input
               autoFocus
-              value={newAnalogyTopic}
-              onChange={e => setNewAnalogyTopic(e.target.value)}
+              value={currentAnalogyTopic ?? ''}
+              onChange={e => (isNewNote ? setNewAnalogyTopic(e.target.value) : setDraftAnalogyTopic(e.target.value))}
               placeholder="Topic, e.g. Electricity"
               aria-label="Topic this analogy is about"
               style={{

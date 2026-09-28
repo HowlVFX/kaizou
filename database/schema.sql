@@ -65,7 +65,8 @@ CREATE TABLE admin_refresh_tokens (
     expires_at TIMESTAMPTZ NOT NULL
 );
 
--- Invite-only signup: only emails here may create a learner account.
+-- Management access allowlist: only emails here may sign up for or log in to
+-- the management portal (owners exempt). Learner signup is open to any email.
 CREATE TABLE signup_allowlist (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email VARCHAR(255) UNIQUE NOT NULL,

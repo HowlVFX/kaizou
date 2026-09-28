@@ -304,7 +304,7 @@ export default function BrainPage() {
             onClusterToggle={handleClusterToggle}
             compact={true}
           />
-          <GraphStateOverlay status={graphStatus} error={graphError} isEmpty={nodes.length === 0} onRetry={refreshGraph} onAddNote={() => navigate("/notes")} />
+          <GraphStateOverlay status={graphStatus} error={graphError} isEmpty={nodes.length === 0} onRetry={refreshGraph} onAddNote={() => navigate("/notes", { state: { newNote: true } })} />
 
           {/* Zoom controls — floating bottom-right */}
           <div style={{
@@ -498,7 +498,7 @@ export default function BrainPage() {
           onClusterSelect={handleClusterSelect}
           onClusterToggle={handleClusterToggle}
         />
-        <GraphStateOverlay status={graphStatus} error={graphError} isEmpty={nodes.length === 0} onRetry={refreshGraph} onAddNote={() => navigate("/notes")} />
+        <GraphStateOverlay status={graphStatus} error={graphError} isEmpty={nodes.length === 0} onRetry={refreshGraph} onAddNote={() => navigate("/notes", { state: { newNote: true } })} />
 
         {/* ── Stats card — top left ── */}
         <div style={{
@@ -725,14 +725,14 @@ export default function BrainPage() {
             </div>
 
             {[
-              { key: "notes", label: "Add Note", img: imgNotesIcon, to: "/notes" },
-              { key: "retest", label: "Retest", img: imgTarget, to: "/retest" },
-            ].map(({ key, label, img, to }) => (
+              { key: "notes", label: "Add Note", img: imgNotesIcon, to: "/notes", state: { newNote: true } },
+              { key: "retest", label: "Retest", img: imgTarget, to: "/retest", state: undefined },
+            ].map(({ key, label, img, to, state }) => (
               <div key={key} style={{ position: "relative" }}
                 onMouseEnter={() => setHoveredBtn(key)}
                 onMouseLeave={() => setHoveredBtn(null)}
               >
-                <button onClick={() => navigate(to)} style={{
+                <button onClick={() => navigate(to, state ? { state } : undefined)} style={{
                   ...panel, borderRadius: 20, width: 42, height: 42,
                   display: "flex", alignItems: "center", justifyContent: "center",
                   cursor: "pointer", border: "0.8px solid var(--border)",

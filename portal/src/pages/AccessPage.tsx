@@ -4,7 +4,7 @@ import type { AllowlistEntry, AdminAccount } from '../api/types';
 import { PageTitle, SectionTitle, Loading, ErrorMessage } from '../components/PageState';
 import { DataTable } from '../components/DataTable';
 
-// Access control: manage who can sign up (allowlist — any admin) and, for
+// Access control: manage who may access this portal (allowlist — any admin) and, for
 // owners only, manage moderator admin accounts. Owners are protected server-side.
 export const AccessPage: React.FC = () => {
   const owner = isOwner();
@@ -46,7 +46,7 @@ export const AccessPage: React.FC = () => {
     try {
       await adminApi.addAllowlist(inviteEmail.trim(), inviteNote.trim() || undefined);
       setInviteEmail(''); setInviteNote('');
-      setMsg('Email added to the signup allowlist.');
+      setMsg('Email added to the management allowlist.');
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not add that email.');
@@ -87,12 +87,13 @@ export const AccessPage: React.FC = () => {
       {error && <ErrorMessage message={error} />}
       {msg && <div role="status" style={{ color: '#58CC02', marginBottom: '1rem' }}>{msg}</div>}
 
-      <SectionTitle>Signup allowlist</SectionTitle>
+      <SectionTitle>Management access allowlist</SectionTitle>
       <p style={{ color: '#a0a0a0', fontSize: '0.85rem', marginBottom: '1rem' }}>
-        Only emails on this list can create a learner account. Adding an email here is how you invite someone.
+        Only emails on this list can sign up for or log in to this management portal (owners are exempt).
+        Removing an email revokes that moderator&apos;s portal access. Learner accounts are open to any email.
       </p>
       <form onSubmit={addInvite} style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
-        <input type="email" placeholder="email to invite" value={inviteEmail}
+        <input type="email" placeholder="email to allow" value={inviteEmail}
           onChange={(e) => setInviteEmail(e.target.value)} required style={fieldStyle} />
         <input type="text" placeholder="note (optional)" value={inviteNote}
           onChange={(e) => setInviteNote(e.target.value)} style={fieldStyle} />

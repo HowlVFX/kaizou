@@ -1,7 +1,8 @@
 // Admin (management) auth + control-plane routes. Mounted at ADMIN_API_BASE
 // (a secret, non-obvious path — NOT /api/management), so its existence is not
-// discoverable from the learner app. All routes except /login and /refresh
-// require a valid admin token.
+// discoverable from the learner app. All routes except /signup, /login and
+// /refresh require a valid admin token. Portal signup and login are limited to
+// emails on the allowlist (owners exempt); learner signup is open.
 const express = require('express');
 const bcrypt = require('bcrypt');
 const db = require('../database/db');
@@ -13,8 +14,55 @@ const { verifyAdmin, requireOwner } = require('../middleware/admin-auth');
 const router = express.Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_ADMIN_PASSWORD = 8;
+const NOT_ALLOWLISTED = 'This email is not approved for management access. Ask an owner to add it to the allowlist.';
+
+// Management access is allowlist-gated: only emails on signup_allowlist may
+// sign up for or log in to the portal. Owners are provisioned out-of-band and
+// are exempt, so an owner can never lock themselves out.
+async function isAllowlisted(email) {
+  const r = await db.query('SELECT 1 FROM signup_allowlist WHERE LOWER(email) = $1', [email.toLowerCase()]);
+  return r.rowCount > 0;
+}
+
+async function mayAccessPortal(admin) {
+  return admin.admin_role === 'owner' || isAllowlisted(admin.email);
+}
 
 // --- Auth --------------------------------------------------------------------
+
+// POST /signup {email, password, name?} -> same shape as /login.
+// Only an allowlisted email can create a (moderator) admin account.
+router.post('/signup', async (req, res) => {
+  const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const { password } = req.body || {};
+  const name = typeof req.body.name === 'string' ? req.body.name.trim().slice(0, 100) : null;
+  if (!email || !EMAIL_RE.test(email)) return res.status(400).json({ error: 'A valid email is required' });
+  if (typeof password !== 'string' || password.length < MIN_ADMIN_PASSWORD) {
+    return res.status(400).json({ error: `Password must be at least ${MIN_ADMIN_PASSWORD} characters` });
+  }
+  try {
+    if (!(await isAllowlisted(email))) return res.status(403).json({ error: NOT_ALLOWLISTED });
+
+    const hash = await bcrypt.hash(password, 12);
+    // Self-signup always creates a moderator; owners are created only out-of-band.
+    const result = await db.query(
+      `INSERT INTO admins (email, password_hash, name, admin_role)
+       VALUES ($1, $2, $3, 'moderator')
+       RETURNING id, email, name, admin_role`,
+      [email, hash, name],
+    );
+    const admin = result.rows[0];
+    await db.query('UPDATE signup_allowlist SET used_at = NOW() WHERE LOWER(email) = $1 AND used_at IS NULL', [email]);
+    await db.query('UPDATE admins SET last_login_at = NOW() WHERE id = $1', [admin.id]);
+    const { accessToken, refreshToken } = await issueAdminTokens(admin);
+    res.status(201).json({ admin, accessToken, refreshToken });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'An admin with this email already exists' });
+    console.error('Admin signup error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // POST /login {email, password} -> { admin:{id,email,name,admin_role}, accessToken, refreshToken }
 router.post('/login', async (req, res) => {
@@ -29,6 +77,7 @@ router.post('/login', async (req, res) => {
     const admin = result.rows[0];
     const match = admin ? await bcrypt.compare(password, admin.password_hash) : false;
     if (!admin || !match) return res.status(401).json({ error: 'Invalid email or password' });
+    if (!(await mayAccessPortal(admin))) return res.status(403).json({ error: NOT_ALLOWLISTED });
 
     await db.query('UPDATE admins SET last_login_at = NOW() WHERE id = $1', [admin.id]);
     const { accessToken, refreshToken } = await issueAdminTokens(admin);
@@ -49,6 +98,10 @@ router.post('/refresh', async (req, res) => {
     const rotated = await rotateAdminRefreshToken(refreshToken);
     if (!rotated) return res.status(401).json({ error: 'Invalid or expired refresh token' });
     const { admin, accessToken, refreshToken: newRefresh } = rotated;
+    if (!(await mayAccessPortal(admin))) {
+      await revokeAdminRefreshToken(newRefresh);
+      return res.status(401).json({ error: NOT_ALLOWLISTED });
+    }
     res.json({
       admin: { id: admin.id, email: admin.email, name: admin.name, admin_role: admin.admin_role },
       accessToken, refreshToken: newRefresh,
@@ -103,7 +156,7 @@ router.get('/allowlist', verifyAdmin, async (req, res) => {
   }
 });
 
-// POST /allowlist {email, note?} -> adds an email that may then sign up
+// POST /allowlist {email, note?} -> adds an email that may then sign up for / log in to the portal
 router.post('/allowlist', verifyAdmin, async (req, res) => {
   const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
   const note = typeof req.body.note === 'string' ? req.body.note.trim().slice(0, 200) : null;
@@ -122,11 +175,18 @@ router.post('/allowlist', verifyAdmin, async (req, res) => {
   }
 });
 
-// DELETE /allowlist/:id -> removes an email from the allowlist
+// DELETE /allowlist/:id -> removes an email from the allowlist, revoking that
+// (non-owner) admin's portal access: their refresh tokens are deleted, so the
+// session ends when the current short-lived access token expires.
 router.delete('/allowlist/:id', verifyAdmin, async (req, res) => {
   try {
-    const result = await db.query('DELETE FROM signup_allowlist WHERE id = $1 RETURNING id', [req.params.id]);
+    const result = await db.query('DELETE FROM signup_allowlist WHERE id = $1 RETURNING id, email', [req.params.id]);
     if (result.rowCount === 0) return res.status(404).json({ error: 'Not found' });
+    await db.query(
+      `DELETE FROM admin_refresh_tokens t USING admins a
+       WHERE t.admin_id = a.id AND LOWER(a.email) = LOWER($1) AND a.admin_role <> 'owner'`,
+      [result.rows[0].email],
+    );
     res.json({ message: 'Removed', id: req.params.id });
   } catch (error) {
     console.error('Allowlist remove error:', error);
@@ -166,6 +226,13 @@ router.post('/admins', verifyAdmin, requireOwner, async (req, res) => {
        VALUES ($1, $2, $3, 'moderator')
        RETURNING id, email, name, admin_role, created_at`,
       [email, hash, name],
+    );
+    // Portal login is allowlist-gated, so a moderator created here is also
+    // allowlisted (marked used, since the account already exists).
+    await db.query(
+      `INSERT INTO signup_allowlist (email, added_by, note, used_at) VALUES ($1, $2, 'moderator created by owner', NOW())
+       ON CONFLICT (email) DO UPDATE SET used_at = COALESCE(signup_allowlist.used_at, NOW())`,
+      [email, req.admin.id],
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {

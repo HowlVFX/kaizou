@@ -135,7 +135,7 @@ export default function ProfilePage() {
             ingested={ingestedNotes}
             remaining={notesRemaining}
             target={PROFILE_UNLOCK_NOTES}
-            onAddNote={() => navigate('/notes')}
+            onAddNote={() => navigate('/notes', { state: { newNote: true } })}
             isMobile={isMobile}
           />
         )}

@@ -20,7 +20,7 @@ interface AppContextType extends AppState {
   logout: () => void;
   setTheme: (t: 'dark' | 'light') => void;
   addNote: (note: Note) => Promise<boolean>;
-  updateNoteType: (id: string, noteType: NoteType, analogyTargetId?: string | null) => Promise<void>;
+  updateNoteType: (id: string, noteType: NoteType, analogyTargetId?: string | null, analogyTopic?: string | null) => Promise<void>;
   setNoteSources: (id: string, sources: NoteSource[]) => void;
   submitNoteUpdate: (id: string, fields: { title: string; body: string }) => Promise<void>;
   updateNoteStatus: (id: string, status: Note['status']) => void;
@@ -409,16 +409,29 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [fetchNotes]);
 
   /** Change a note's type / analogy target (saved immediately; re-ingests). */
-  const updateNoteType = useCallback(async (id: string, noteType: NoteType, analogyTargetId: string | null = null) => {
+  const updateNoteType = useCallback(async (
+    id: string,
+    noteType: NoteType,
+    analogyTargetId: string | null = null,
+    analogyTopic: string | null = null,
+  ) => {
+    const isAnalogy = noteType === 'ANALOGY';
     setNotes(prev => prev.map(n => (n.id === id ? {
-      ...n, noteType, analogyTargetId: noteType === 'ANALOGY' ? analogyTargetId : null,
+      ...n, noteType,
+      analogyTargetId: isAnalogy ? analogyTargetId : null,
+      analogyTargetLabel: isAnalogy ? (analogyTargetId ? n.analogyTargetLabel : analogyTopic) : null,
       sources: noteType === 'USER_DEFINED' ? [] : n.sources,
     } : n)));
     // Flush any pending body/title edit first so it isn't lost or reordered.
     flushNoteSaveRef.current(id);
     await api(`/api/notes/${id}`, {
       method: 'PUT',
-      body: { note_type: noteType, analogy_target_concept_id: noteType === 'ANALOGY' ? analogyTargetId : null },
+      body: {
+        note_type: noteType,
+        analogy_target_concept_id: isAnalogy ? analogyTargetId : null,
+        // An analogy about a topic with no note yet (null clears it).
+        analogy_target_label: isAnalogy && !analogyTargetId ? (analogyTopic ?? null) : null,
+      },
     });
     fetchNotes();
   }, [fetchNotes]);

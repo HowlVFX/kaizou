@@ -294,7 +294,6 @@ export default function AuthPage({ mode: initialMode }: { mode: Mode }) {
       if (err instanceof ApiError) {
         if (err.status === 0) msg = 'Could not reach the server. Is the API running?';
         else if (err.status === 401) msg = 'Invalid email or password';
-        else if (err.status === 403) msg = err.message || 'This email is not approved for signup. Ask an administrator for access.';
         else if (err.status === 409) msg = 'An account with this email already exists';
         else msg = err.message || msg;
       }

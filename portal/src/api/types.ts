@@ -16,7 +16,7 @@ export interface AdminAuthResponse {
   refreshToken: string;
 }
 
-// Signup allowlist (invite-only learner signup, managed from the portal).
+// Management allowlist: emails allowed to sign up for / log in to the portal.
 export interface AllowlistEntry {
   id: string;
   email: string;
