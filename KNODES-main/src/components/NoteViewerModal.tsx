@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { api, describeApiError } from '../lib/api';
 
 // "View original note": the note(s) behind a node, read-only. When a note has
@@ -41,7 +42,10 @@ export default function NoteViewerModal({ conceptId, label, onClose, onOpenInNot
 
   const fmt = (d: string | null | undefined) => (d ? new Date(d).toLocaleString() : '');
 
-  return (
+  // Rendered through a portal to <body>: the ConceptExplorer panel that mounts
+  // this modal has a CSS transform, which would otherwise make position:fixed
+  // anchor to the 420px panel instead of the viewport (modal trapped/clipped).
+  return createPortal(
     <>
       <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 400 }} />
       <div role="dialog" aria-modal="true" aria-label={`Note for ${label}`} style={{
@@ -96,6 +100,7 @@ export default function NoteViewerModal({ conceptId, label, onClose, onOpenInNot
           })}
         </div>
       </div>
-    </>
+    </>,
+    document.body,
   );
 }
