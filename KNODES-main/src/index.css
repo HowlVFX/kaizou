@@ -1,13 +1,28 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 @import 'tailwindcss';
 
+/*
+ * Anurati is the display font for the "KAIZOU" wordmark only. The font files
+ * under public/assets/fonts/ are Git LFS-tracked; a fresh clone without the LFS
+ * objects pulled leaves them as tiny pointer files, which the browser cannot
+ * decode ("OTS parsing error: invalid sfntVersion"). The @font-face is kept
+ * disabled by default so the wordmark cleanly falls back to a system font and
+ * no decode error is thrown.
+ *
+ * To enable the real font: run `git lfs pull` (or drop valid Anurati-Regular
+ * .woff2/.woff files) into public/assets/fonts/, then uncomment the block
+ * below. Note the correct path is /assets/fonts/ (the files live there).
+ */
+/*
 @font-face {
   font-family: 'Anurati';
-  src: url('/assets/Anurati-Regular.woff') format('woff');
+  src: url('/assets/fonts/Anurati-Regular.woff2') format('woff2'),
+       url('/assets/fonts/Anurati-Regular.woff') format('woff');
   font-weight: normal;
   font-style: normal;
   font-display: swap;
 }
+*/
 
 :root {
   --green: #58CC02;

@@ -102,8 +102,11 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
       transition: 'transform 0.32s cubic-bezier(0.16,1,0.3,1), opacity 0.25s ease',
     }}>
 
-      {/* ── Header ── */}
-      <div style={{ padding: '18px 20px 0', flexShrink: 0 }}>
+      {/* Scrollable panel: header actions, tabs, and tab content all scroll
+          together so a short viewport never starves the body. The tab bar
+          sticks to the top once you scroll past the actions. */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+      <div style={{ padding: '18px 20px 0' }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 16 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 4 }}>
@@ -273,8 +276,11 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
             onOpenInNotes={() => { setViewingNote(false); updateNote(); }} />
         )}
 
-        {/* Tab bar */}
-        <div style={{ display: 'flex', marginTop: 16, borderBottom: '1px solid var(--border)', gap: 0 }}>
+        {/* Tab bar: sticks to the top of the scroll area once scrolled past. */}
+        <div style={{
+          display: 'flex', marginTop: 16, borderBottom: '1px solid var(--border)', gap: 0,
+          position: 'sticky', top: 0, zIndex: 2, background: 'var(--bg-elevated)',
+        }}>
           {([
             { key: 'overview', label: 'Overview', Icon: FileText },
             { key: 'depth', label: 'Depth', Icon: BarChart },
@@ -294,8 +300,8 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
         </div>
       </div>
 
-      {/* ── Scrollable body ── */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '18px 20px' }}>
+      {/* Tab content (scrolls within the same container as the header) */}
+      <div style={{ padding: '18px 20px' }}>
 
         {tab === 'overview' && (
           <>
@@ -312,6 +318,7 @@ export default function ConceptExplorer({ node, onClose, onRetestClick, onExplai
         {tab === 'evidence' && (
           <EvidenceTab node={node} detail={detail} />
         )}
+      </div>
       </div>
     </div>
   );
