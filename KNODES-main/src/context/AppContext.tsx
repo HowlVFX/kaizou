@@ -45,9 +45,10 @@ const AppContext = createContext<AppContextType | null>(null);
 /* eslint-disable @typescript-eslint/no-explicit-any */
 function mapNoteStatus(n: any): Note['status'] {
   const s = n.status;
-  if (s === 'processing' || s === 'completed' || s === 'failed' || s === 'partial' || s === 'draft') return s;
+  if (s === 'processing' || s === 'completed' || s === 'failed' || s === 'partial' || s === 'draft' || s === 'rejected') return s;
   if (n.ingestion_status === 'READY') return 'completed';
   if (n.ingestion_status === 'FAILED') return 'failed';
+  if (n.ingestion_status === 'REJECTED') return 'rejected';
   if (n.ingestion_status === 'PENDING') return 'processing';
   return 'draft';
 }
@@ -75,6 +76,8 @@ function mapNote(n: any): Note {
     targetConceptId: n.target_concept_id ?? null,
     revisions: Number(n.revisions) || 0,
     sources: Array.isArray(n.sources) ? n.sources.map(mapNoteSource) : [],
+    sourceMatch: n.source_match == null ? null : Number(n.source_match),
+    ingestionRejection: n.ingestion_rejection ?? null,
   };
 }
 

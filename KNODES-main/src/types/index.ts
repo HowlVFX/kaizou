@@ -82,7 +82,11 @@ export interface Note {
   id: string;
   title: string;
   body: string;
-  status: 'draft' | 'processing' | 'completed' | 'partial' | 'failed';
+  status: 'draft' | 'processing' | 'completed' | 'partial' | 'failed' | 'rejected';
+  /** Fraction of this note's claims supported by its source, when rejected. */
+  sourceMatch?: number | null;
+  /** Why ingestion refused this note. */
+  ingestionRejection?: string | null;
   concepts?: string[];
   conceptIds?: string[];
   claims?: number;

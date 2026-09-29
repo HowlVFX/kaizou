@@ -10,15 +10,19 @@ const router = express.Router();
 //   { id, title, body, status, ingestion_status, concepts, created_at, updated_at }
 //
 //   body             <- body_md
-//   ingestion_status <- raw DB enum: PENDING | READY | FAILED
-//   status           <- UI vocabulary: processing | completed | failed
+//   ingestion_status <- raw DB enum: PENDING | READY | FAILED | REJECTED
+//   status           <- UI vocabulary: processing | completed | failed | rejected
+//   source_match     <- fraction of note claims supported by the attached source
+//   ingestion_rejection <- why a REJECTED note was refused (null otherwise)
 //   concepts         <- [{ id, canonical_label }] from the note_concepts join
 //                       (empty until ingestion has linked concepts)
 //
 // Ingestion status is owned by the backend (FastAPI moves it PENDING ->
 // READY/FAILED; a content edit resets it to PENDING). A client-sent `status`
 // (e.g. the UI's local 'draft') is accepted and ignored; it is not stored.
-const STATUS_TO_UI = { PENDING: 'processing', READY: 'completed', FAILED: 'failed' };
+const STATUS_TO_UI = {
+  PENDING: 'processing', READY: 'completed', FAILED: 'failed', REJECTED: 'rejected',
+};
 
 // Concepts are scoped to the note owner's learner_id as well as the join, so a
 // stray cross-learner link can never leak another learner's concept label.
@@ -43,6 +47,7 @@ const SOURCES_SUBQUERY = `
 
 const SELECT_NOTE = `
   SELECT n.id, n.title, n.body_md AS body, n.ingestion_status,
+         n.source_match, n.ingestion_rejection,
          n.note_type, n.analogy_target_concept_id, n.target_concept_id,
          COALESCE((SELECT canonical_label FROM concepts WHERE id = n.analogy_target_concept_id),
                   n.analogy_target_label) AS analogy_target_label,
@@ -69,6 +74,8 @@ function toApiNote(row) {
     body: row.body,
     status: STATUS_TO_UI[row.ingestion_status] || 'processing',
     ingestion_status: row.ingestion_status,
+    source_match: row.source_match == null ? null : Number(row.source_match),
+    ingestion_rejection: row.ingestion_rejection || null,
     note_type: row.note_type || 'SOURCE_BACKED',
     analogy_target_concept_id: row.analogy_target_concept_id || null,
     analogy_target_label: row.analogy_target_label || null,
@@ -385,6 +392,8 @@ router.put('/:id', verifyToken, async (req, res) => {
              ELSE analogy_target_label END,
            ingestion_status = CASE WHEN $5::boolean THEN 'PENDING'::note_status
                                    ELSE ingestion_status END,
+           source_match = CASE WHEN $5::boolean THEN NULL ELSE source_match END,
+           ingestion_rejection = CASE WHEN $5::boolean THEN NULL ELSE ingestion_rejection END,
            updated_at = CASE WHEN $5::boolean THEN CURRENT_TIMESTAMP ELSE updated_at END
          WHERE id = $3 AND learner_id = $4
          RETURNING id, body_md, note_type`,
@@ -533,6 +542,15 @@ router.post('/:id/sources', verifyToken, async (req, res) => {
        RETURNING id, kind, title, url, char_length(content_text) AS chars, created_at`,
       [note.id, kind, title, url, text.slice(0, MAX_SOURCE_CHARS)]
     );
+    // The note may already be queued. Reset that timer so ingestion sees this
+    // source, and re-queue a note that had already finished.
+    await db.query(
+      `UPDATE notes
+       SET ingestion_status = 'PENDING', source_match = NULL, ingestion_rejection = NULL
+       WHERE id = $1`,
+      [note.id]
+    );
+    scheduleIngestion(note.id, req.user.id);
     res.status(201).json({ ...r.rows[0], truncated: text.length > MAX_SOURCE_CHARS });
   } catch (error) {
     console.error('Error adding source:', error);

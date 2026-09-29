@@ -33,13 +33,21 @@ from uuid import uuid4
 import psycopg
 from psycopg.rows import dict_row
 
-from app.grading.coverage import as_vector
+from app.grading.coverage import as_vector, build_similarity_matrix, match_claims
 from app.ingestion.classifier import NoteClassifier, ClassificationResult
 from app.ingestion.embedding import EmbeddingService
 from app.ingestion.extractor import ClaimExtractor, extract_wikilinks, has_analogy_cue
 from app.ingestion.identity import (
     resolve_concept_identity,
     deduplicate_claims,
+)
+from app.ingestion.source_match import (
+    SOURCE_MATCH_THRESHOLD,
+    SOURCE_TEXT_LIMIT,
+    grounding_fraction,
+    is_incorrect_note,
+    rejection_reason,
+    unsupported_contradiction_count,
 )
 from app.graph.linking import find_semantic_neighbours
 from app.graph.prerequisites import build_requires_forward, plan_requires_edges
@@ -184,11 +192,25 @@ class IngestionService:
                         (analogy_target, note_id),
                     )
 
-            # 2. Check if content changed (skip if hash matches). The note type
-            # and analogy target are part of the "content": changing either
-            # must re-ingest even when the body is identical.
+            # 2. Check if content changed (skip if hash matches). The note type,
+            # analogy target, and attached source text are part of the
+            # "content": changing any of them must re-ingest.
+            source_blob = ""
+            if note_type == "SOURCE_BACKED":
+                async with self._conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        "SELECT content_text FROM note_sources "
+                        "WHERE note_id = %s AND btrim(content_text) <> ''",
+                        (note_id,),
+                    )
+                    source_rows = await cur.fetchall()
+                source_blob = "\n".join(
+                    (row.get("content_text") or "").strip()
+                    for row in source_rows
+                    if (row.get("content_text") or "").strip()
+                )
             hash_input = body if not has_note_type else (
-                f"{body}\x00{note_type}\x00{analogy_target or ''}"
+                f"{body}\x00{note_type}\x00{analogy_target or ''}\x00{source_blob}"
             )
             content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
             if note.get("markdown_hash") == content_hash:
@@ -235,6 +257,21 @@ class IngestionService:
                 }
                 for c, emb in zip(claims, claim_embeddings)
             ]
+
+            # 5b. Source-backed notes must agree with their attached source.
+            # Checked before any concept is written. A mismatch returns
+            # normally (note status REJECTED) so the job does not fail.
+            if note_type == "SOURCE_BACKED":
+                mismatch = await self._source_mismatch(note_id, new_claim_dicts)
+                if mismatch is not None:
+                    await self._mark_rejected(note_id, mismatch)
+                    return {
+                        "concept_id": None,
+                        "claims_count": 0,
+                        "status": "REJECTED",
+                        "source_match": mismatch["source_match"],
+                        "reason": mismatch["reason"],
+                    }
 
             # 6. Resolve concept identity
             existing_concepts = await self._load_learner_concepts(learner_id)
@@ -433,6 +470,8 @@ class IngestionService:
                     UPDATE notes
                     SET ingestion_status = 'READY',
                         markdown_hash = %s,
+                        source_match = NULL,
+                        ingestion_rejection = NULL,
                         updated_at = NOW()
                     WHERE id = %s
                     """,
@@ -470,6 +509,92 @@ class IngestionService:
                 )
             await self._conn.commit()
             raise
+
+    # ------------------------------------------------------------------
+    # Source agreement
+    # ------------------------------------------------------------------
+
+    async def _source_mismatch(self, note_id: str, note_claims: list[dict]) -> dict | None:
+        """Return {source_match, reason} when the note does not match its source.
+
+        No attached source text, or no claims to compare, means there is
+        nothing to judge — ingestion continues. A failure of contradiction
+        detection is ignored; grounding still decides.
+        """
+        if not note_claims:
+            return None
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT content_text FROM note_sources "
+                "WHERE note_id = %s AND btrim(content_text) <> ''",
+                (note_id,),
+            )
+            sources = await cur.fetchall()
+        source_text = "\n\n".join(
+            (row.get("content_text") or "").strip() for row in sources
+        ).strip()
+        if not source_text:
+            return None
+
+        source_claims = await self._extractor.extract_claims(source_text[:SOURCE_TEXT_LIMIT])
+        if not source_claims:
+            return None
+
+        source_embeddings = await self._embedding.compute_batch_embeddings(
+            [c.text for c in source_claims]
+        )
+        sim = build_similarity_matrix(
+            [as_vector(emb) for emb in source_embeddings],
+            [c["embedding"] for c in note_claims],
+        )
+        _matched, supported, _pairs = match_claims(sim, SOURCE_MATCH_THRESHOLD)
+        grounding = grounding_fraction(supported)
+
+        contradicted = [False] * len(note_claims)
+        try:
+            from app.nli.service import get_nli_service
+            from app.grading.contradiction import ContradictionDetector
+            from app.config import get_settings
+
+            nli = get_nli_service(conn=self._conn)
+            if nli.enabled:
+                report = await ContradictionDetector(
+                    nli, threshold=get_settings().nli_contradiction_threshold,
+                ).detect(
+                    source_claims=[c.text for c in source_claims],
+                    learner_claims=[c["text"] for c in note_claims],
+                )
+                for pair in report.flagged_pairs:
+                    idx = pair.learner_index
+                    if 0 <= idx < len(contradicted):
+                        contradicted[idx] = True
+        except Exception:
+            logger.warning("Contradiction check skipped for note %s", note_id, exc_info=True)
+
+        bad = unsupported_contradiction_count(supported, contradicted)
+        if not is_incorrect_note(grounding, bad):
+            return None
+        return {
+            "source_match": grounding,
+            "reason": rejection_reason(grounding, bad),
+        }
+
+    async def _mark_rejected(self, note_id: str, mismatch: dict) -> None:
+        """Drop anything this run wrote, then record the refusal. Does not raise."""
+        await self._conn.rollback()
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE notes
+                SET ingestion_status = 'REJECTED',
+                    source_match = %s,
+                    ingestion_rejection = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (mismatch["source_match"], mismatch["reason"], note_id),
+            )
+        await self._conn.commit()
 
     # ------------------------------------------------------------------
     # Helpers

@@ -3,7 +3,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- Enums
-CREATE TYPE note_status AS ENUM ('PENDING', 'READY', 'FAILED');
+CREATE TYPE note_status AS ENUM ('PENDING', 'READY', 'FAILED', 'REJECTED');
 CREATE TYPE concept_track AS ENUM ('SOURCE_BACKED', 'SELF_AUTHORED', 'ANALOGY');
 CREATE TYPE concept_shape AS ENUM ('PROCEDURAL', 'DEFINITION', 'ORDERED_PROCESS', 'CAUSAL_RELATION');
 CREATE TYPE concept_category AS ENUM ('DETERMINISTIC_MECHANISM', 'CONVENTIONAL', 'PROBABILISTIC', 'AXIOMATIC', 'OUT_OF_SCOPE');
@@ -92,6 +92,9 @@ CREATE TABLE notes (
     markdown_hash TEXT,
     language VARCHAR(10) DEFAULT 'en',
     ingestion_status note_status DEFAULT 'PENDING',
+    -- Set when a source-backed note is refused for not matching its source.
+    source_match REAL,
+    ingestion_rejection TEXT,
     note_type note_type NOT NULL DEFAULT 'SOURCE_BACKED',
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP

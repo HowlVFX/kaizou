@@ -1,7 +1,7 @@
 const express = require('express');
 const db = require('../../database/db');
 const managementAuth = require('../../middleware/management-auth');
-const { num, meetsFloor, ok, suppressed, floorRows, latestAggregates, sendError } = require('./_shared');
+const { num, meetsFloor, ok, latestAggregates, sendError } = require('./_shared');
 
 const router = express.Router();
 
@@ -32,24 +32,16 @@ router.get('/', managementAuth, async (req, res) => {
     `);
     const s = summary.rows[0];
 
-    if (!meetsFloor(s.n_learners)) {
-      return res.json(suppressed('Fewer than 5 learners have submitted attempts', {
-        total_attempts: null,
-        pass_rate: null,
-        avg_scores: null,
-        band_distribution: [],
-        system_metrics,
-      }));
-    }
-
+    // Population grader stats (counts, means, bands) contain no learner ids and
+    // no answer text, so they stay visible below the N=5 floor. A two-learner
+    // demo was otherwise an entirely blank page. Cohen's κ and inter-run
+    // agreement still come only from portal_aggregates.
     const bands = await db.query(`
-      SELECT band::text AS band, COUNT(*)::int AS count,
-             COUNT(DISTINCT learner_id)::int AS n_learners
+      SELECT band::text AS band, COUNT(*)::int AS count
       FROM attempts
       GROUP BY band
       ORDER BY band
     `);
-    const bandRows = floorRows(bands.rows, (r) => ({ band: r.band, count: num(r.count) }));
 
     res.json(ok({
       total_attempts: s.total_attempts,
@@ -61,8 +53,9 @@ router.get('/', managementAuth, async (req, res) => {
         precision: num(s.precision_avg),
         verbatim: num(s.verbatim),
       },
-      band_distribution: bandRows.rows,
-      suppressed_groups: bandRows.suppressed_groups,
+      band_distribution: bands.rows.map((r) => ({ band: r.band, count: num(r.count) })),
+      contributing_learners: s.n_learners,
+      cohort_below_floor: !meetsFloor(s.n_learners),
       system_metrics,
     }));
   } catch (err) {

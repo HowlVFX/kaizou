@@ -97,6 +97,7 @@ class FakeDB:
         self.edges: dict[tuple[str, str, str], dict] = {}
         self.memory_states: dict[tuple[str, str], dict] = {}
         self.jobs: list[dict] = []
+        self.note_sources: dict[str, list[str]] = {}
         self.commits = 0
         self.rollbacks = 0
 
@@ -151,6 +152,12 @@ class FakeCursor:
             db.notes[p[0]]["ingestion_status"] = "READY"
         elif s.startswith("UPDATE notes SET ingestion_status = 'FAILED'"):
             db.notes[p[0]]["ingestion_status"] = "FAILED"
+        elif s.startswith("SELECT content_text FROM note_sources"):
+            self._rows = [{"content_text": t} for t in db.note_sources.get(p[0], [])]
+        elif s.startswith("UPDATE notes SET ingestion_status = 'REJECTED'"):
+            db.notes[p[2]].update(
+                ingestion_status="REJECTED", source_match=p[0], ingestion_rejection=p[1],
+            )
         elif s.startswith("SELECT id, canonical_label AS label, label_embedding AS embedding, status::text"):
             self._rows = [
                 {"id": uuid.UUID(c["id"]), "label": c["canonical_label"],
@@ -519,4 +526,53 @@ def test_prerequisites_are_capped_at_the_notes_level():
         out = await ClaimExtractor(client=gen).extract_prerequisites(kid, [], concept_label="Plant food")
         assert out == ["Sunlight", "Sugar"]          # above-level dropped, capped at 2 for a child
         assert "a young child" in gen.kwargs["system"]
+    asyncio.run(run())
+
+
+class _NliOff:
+    enabled = False
+
+
+def test_source_mismatch_rejects_without_writing_a_concept():
+    from unittest.mock import patch
+
+    async def run():
+        db = FakeDB()
+        body = "Water freezes at 50 degrees in normal conditions."
+        source = "The boiling point of water at sea level is 100 degrees Celsius."
+        claim = "Water freezes at 50 degrees."
+        ex = FakeExtractor(
+            {body: [claim], source: ["Water boils at 100 degrees Celsius."]},
+            {},
+        )
+        nid = db.add_note(LEARNER, "Water", body)
+        db.notes[nid]["note_type"] = "SOURCE_BACKED"
+        db.note_sources[nid] = [source]
+        with patch("app.nli.service.get_nli_service", return_value=_NliOff()):
+            res = await make_service(db, ex).ingest_note(nid, LEARNER)
+        assert res["status"] == "REJECTED"
+        assert res["source_match"] < 0.70
+        assert db.concepts == {}
+        assert db.notes[nid]["ingestion_status"] == "REJECTED"
+        assert "supported by the attached source" in db.notes[nid]["ingestion_rejection"]
+    asyncio.run(run())
+
+
+def test_matching_source_is_not_a_mismatch():
+    from unittest.mock import patch
+
+    async def run():
+        db = FakeDB()
+        source = "At sea level, water boils at 100 degrees Celsius."
+        claim = "Water boils at 100 degrees Celsius."
+        ex = FakeExtractor({source: [claim]}, {})
+        emb = FakeEmbedding()
+        nid = db.add_note(LEARNER, "Boiling", "body")
+        db.note_sources[nid] = [source]
+        svc = make_service(db, ex, emb)
+        with patch("app.nli.service.get_nli_service", return_value=_NliOff()):
+            mismatch = await svc._source_mismatch(nid, [{
+                "text": claim, "embedding": emb._vec(claim),
+            }])
+        assert mismatch is None
     asyncio.run(run())

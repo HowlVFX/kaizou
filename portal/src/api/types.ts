@@ -85,6 +85,8 @@ export interface GraderResponse extends PrivacyEnvelope {
     verbatim: number | null;
   } | null;
   band_distribution: { band: string; count: number }[];
+  contributing_learners?: number;
+  cohort_below_floor?: boolean;
   system_metrics: {
     cohens_kappa: AggregateMetric | null;
     inter_run_agreement: AggregateMetric | null;

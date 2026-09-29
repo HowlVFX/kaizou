@@ -147,6 +147,7 @@ export default function NotesPage() {
   // derived from the note's real backend status (see below), never from a timer.
   const [processingNoteId, setProcessingNoteId] = useState<string | null>(null);
   const [pipelineStep, setPipelineStep] = useState(0);
+  const [dismissedRejectionId, setDismissedRejectionId] = useState<string | null>(null);
   const stepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Dirty tracking
@@ -161,9 +162,10 @@ export default function NotesPage() {
   // (AppContext polls PENDING -> READY/FAILED). The stepper reflects that, not a timer.
   const processingNote = processingNoteId ? notes.find(n => n.id === processingNoteId) : null;
   const processingFailed = processingNote?.status === 'failed';
+  const processingRejected = processingNote?.status === 'rejected';
   // "Done" means the backend actually finished, not that the animation ran out.
   const pipelineDone = processingNote?.status === 'completed';
-  const isProcessing = processingNoteId !== null && !pipelineDone && !processingFailed;
+  const isProcessing = processingNoteId !== null && !pipelineDone && !processingFailed && !processingRejected;
 
   const isDirty = selectedNote
     ? selectedNote.body !== (extractedBodies[selectedNote.id] ?? selectedNote.body)
@@ -179,7 +181,7 @@ export default function NotesPage() {
       n.title.toLowerCase().includes(search.toLowerCase()) ||
       (n.concepts ?? []).some(c => c.toLowerCase().includes(search.toLowerCase()));
     if (!matchSearch) return false;
-    if (filterTab === 'attention') return n.status === 'failed' || n.status === 'partial';
+    if (filterTab === 'attention') return n.status === 'failed' || n.status === 'partial' || n.status === 'rejected';
     if (filterTab === 'processing') return n.status === 'processing';
     if (filterTab === 'completed') return n.status === 'completed';
     return true;
@@ -218,6 +220,7 @@ export default function NotesPage() {
     if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
     setProcessingNoteId(noteId);
     setPipelineStep(0);
+    setDismissedRejectionId(null);
     updateNoteStatus(noteId, 'processing');
 
     const HOLD_AT = PIPELINE_STEPS.length - 1; // don't claim "done" on a timer
@@ -239,7 +242,7 @@ export default function NotesPage() {
     if (processingNote.status === 'completed') {
       if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
       setPipelineStep(PIPELINE_STEPS.length);
-    } else if (processingNote.status === 'failed') {
+    } else if (processingNote.status === 'failed' || processingNote.status === 'rejected') {
       if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
     }
   }, [processingNote?.status]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -535,7 +538,8 @@ export default function NotesPage() {
     const typeChanged = draftType !== prevType
       || (draftType === 'ANALOGY' && (draftAnalogyTarget !== prevTarget || nextTopic !== prevTopic));
     const textChanged = draftTitle !== selectedNote.title || draftBody !== selectedNote.body;
-    if (!typeChanged && !textChanged) { setEditing(false); return; }
+    // A rejected note must be able to run again even when the text is unchanged.
+    if (!typeChanged && !textChanged && selectedNote.status !== 'rejected') { setEditing(false); return; }
     setSubmittingUpdate(true);
     setUpdateError('');
     try {
@@ -594,7 +598,13 @@ export default function NotesPage() {
 
   // Show the extraction panel while processing, when done, when a failure needs
   // reporting, or when viewing an already-completed note.
-  const showExtractionPanel = isProcessing || pipelineDone || processingFailed || selectedNote?.status === 'completed';
+  const rejectedNote = selectedNote?.status === 'rejected'
+    ? selectedNote
+    : (processingRejected && processingNote?.id === selectedNoteId ? processingNote : null);
+  const showIncorrectPopup = Boolean(rejectedNote && dismissedRejectionId !== rejectedNote.id);
+
+  const showExtractionPanel = isProcessing || pipelineDone || processingFailed || processingRejected
+    || selectedNote?.status === 'completed' || selectedNote?.status === 'rejected';
 
   return (
     <div style={{ display: 'flex', height: '100%', background: 'var(--bg)', overflow: 'hidden' }}>
@@ -1165,6 +1175,7 @@ export default function NotesPage() {
                   })}
                 </div>
               )}
+              {processingRejected && processingNote && <IncorrectNoteNotice note={processingNote} onEdit={handleStartUpdate} />}
               {processingFailed && <IngestionFailed onRetry={handleReExtract} />}
               {(pipelineDone || (selectedNote?.status === 'completed' && !isProcessing)) && (
                 <ExtractionResults
@@ -1190,7 +1201,7 @@ export default function NotesPage() {
               Knowledge Processing
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              {isProcessing ? 'Structuring your note…' : processingFailed ? 'Processing failed' : pipelineDone ? 'Extraction complete' : 'Latest extraction'}
+              {isProcessing ? 'Structuring your note…' : processingRejected ? "This note doesn't match the source" : processingFailed ? 'Processing failed' : pipelineDone ? 'Extraction complete' : 'Latest extraction'}
             </div>
           </div>
 
@@ -1262,6 +1273,9 @@ export default function NotesPage() {
               </div>
             )}
 
+            {/* Note refused because it does not match its source */}
+            {processingRejected && processingNote && <IncorrectNoteNotice note={processingNote} onEdit={handleStartUpdate} />}
+
             {/* Ingestion failed */}
             {processingFailed && <IngestionFailed onRetry={handleReExtract} />}
 
@@ -1273,6 +1287,14 @@ export default function NotesPage() {
             )}
           </div>
         </div>
+      )}
+
+      {showIncorrectPopup && rejectedNote && (
+        <IncorrectNotePopup
+          note={rejectedNote}
+          onEdit={() => { setDismissedRejectionId(rejectedNote.id); handleStartUpdate(); }}
+          onDismiss={() => setDismissedRejectionId(rejectedNote.id)}
+        />
       )}
 
       {/* ── Source viewer (read-only; sources never edit the note) ── */}
@@ -1300,6 +1322,88 @@ export default function NotesPage() {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function matchPercent(note: Note): number | null {
+  if (note.sourceMatch == null || Number.isNaN(note.sourceMatch)) return null;
+  return Math.round(note.sourceMatch * 100);
+}
+
+function IncorrectNotePopup({ note, onEdit, onDismiss }: { note: Note; onEdit: () => void; onDismiss: () => void }) {
+  const pct = matchPercent(note);
+  return (
+    <>
+      <div onClick={onDismiss} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 500 }} />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="incorrect-note-title"
+        style={{
+          position: 'fixed', top: '18vh', left: '50%', transform: 'translateX(-50%)',
+          width: 'min(440px, 92vw)', background: 'var(--bg-elevated)',
+          border: '1px solid rgba(255,150,0,0.45)', borderRadius: 14,
+          boxShadow: 'var(--shadow)', zIndex: 501, padding: '18px 18px 16px',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+          <AlertTriangle size={18} style={{ color: 'var(--orange)', flexShrink: 0, marginTop: 2 }} />
+          <div style={{ flex: 1 }}>
+            <div id="incorrect-note-title" style={{ fontSize: 15, fontWeight: 700, color: 'var(--text)', marginBottom: 6 }}>
+              Incorrect note
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--text-2)', lineHeight: 1.55 }}>
+              {note.ingestionRejection
+                || (pct != null
+                  ? `Only ${pct}% of this note is supported by the attached source.`
+                  : "This note doesn't match the attached source.")}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 8 }}>
+              Your text is still here. It was not added to your Brain. Edit it so it follows the source, then save again.
+            </div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+          <button
+            onClick={onDismiss}
+            style={{
+              padding: '7px 14px', borderRadius: 8, background: 'var(--bg-input)',
+              color: 'var(--text-2)', border: '1px solid var(--border)', cursor: 'pointer',
+              fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
+            }}
+          >Dismiss</button>
+          <button
+            onClick={onEdit}
+            style={{
+              padding: '7px 14px', borderRadius: 8, background: 'var(--orange)',
+              color: '#fff', border: 'none', cursor: 'pointer',
+              fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
+            }}
+          >Edit note</button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function IncorrectNoteNotice({ note, onEdit }: { note: Note; onEdit: () => void }) {
+  const pct = matchPercent(note);
+  return (
+    <div style={{ padding: '14px 16px', borderRadius: 10, background: 'rgba(255,150,0,0.08)', border: '1px solid rgba(255,150,0,0.35)' }}>
+      <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--orange)', marginBottom: 4 }}>Incorrect note</div>
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, marginBottom: 10 }}>
+        {note.ingestionRejection
+          || (pct != null ? `Only ${pct}% of this note matches the source.` : "This note doesn't match the source.")}
+        {' '}It was not added to your Brain.
+      </div>
+      <button
+        onClick={onEdit}
+        style={{
+          padding: '6px 14px', borderRadius: 7, background: 'var(--orange)', color: '#fff',
+          border: 'none', cursor: 'pointer', fontSize: 11, fontWeight: 700, fontFamily: 'inherit',
+        }}
+      >Edit note</button>
     </div>
   );
 }
@@ -1457,6 +1561,7 @@ function NoteItem({ note, selected, dirty, onSelect, onRename, onDelete }: {
     draft: 'var(--text-dim)',
     partial: 'var(--orange)',
     failed: 'var(--red)',
+    rejected: 'var(--orange)',
   };
 
   return (
@@ -1543,6 +1648,7 @@ function StatusBadge({ status }: { status: Note['status'] }) {
     completed:  { label: 'Extracted',  color: 'var(--green)',     bg: 'rgba(88,204,2,0.1)' },
     partial:    { label: 'Partial',    color: 'var(--orange)',    bg: 'rgba(255,150,0,0.1)' },
     failed:     { label: 'Failed',     color: 'var(--red)',       bg: 'rgba(255,75,75,0.1)' },
+    rejected:   { label: 'Incorrect',  color: 'var(--orange)',    bg: 'rgba(255,150,0,0.1)' },
   };
   const s = map[status];
   return (
